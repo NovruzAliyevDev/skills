@@ -1,5 +1,5 @@
-// The monitor server's API: JSON reads, the polling loops that keep the page current, the incremental
-// reader of a session log, and whether the page is offline.
+// The monitor server's API: JSON reads, the polling loops that keep the page current, the shared
+// incremental readers of session logs, and whether the page is offline.
 
 const RUNS_EVERY_MS = 4000;
 const RUN_EVERY_MS = 2000;
@@ -71,20 +71,49 @@ export async function getFile(selection, task, kind) {
   return response.ok ? (await response.json()).text : null;
 }
 
+// One incremental reader per task log in use, shared by everyone who reads that log: when the drawer
+// shows the desk task, its Activity and the desk's helpers read the log through one poll.
+const readers = new Map();
+
 // Reads a task's session log incrementally while subscribed. `listener` gets batches
-// `{ items, reset, missing }`: on `reset` it drops what it has shown (the log was cut and is read again
-// from its start), then it adds `items`. Returns the unsubscribe call; an answer still on its way after
-// it is dropped.
+// `{ items, reset, missing }`: on `reset` it drops what it has so far (the log was cut and is read again
+// from its start), then it adds `items`. A listener that joins a reader already under way first gets
+// everything read so far, as a reset. Returns the unsubscribe call; the reader stops with its last
+// listener, and an answer still on its way then is dropped.
 export function readFeed(selection, task, listener) {
-  let offset = 0, read = 0, subscribed = true;
-  const poller = poll(async () => {
+  const key = JSON.stringify([selection.project, selection.run, task]);
+  let reader = readers.get(key);
+  if (!reader) {
+    reader = openReader(selection, task);
+    readers.set(key, reader);
+  }
+  reader.listeners.add(listener);
+  if (reader.answered) {
+    queueMicrotask(() => {
+      if (reader.listeners.has(listener)) listener({ items: reader.items.slice(), reset: true, missing: reader.missing });
+    });
+  }
+  return () => {
+    if (!reader.listeners.delete(listener) || reader.listeners.size) return;
+    reader.poller.stop();
+    readers.delete(key);
+  };
+}
+
+function openReader(selection, task) {
+  const reader = { listeners: new Set(), items: [], missing: false, answered: false, poller: null };
+  let offset = 0;
+  reader.poller = poll(async () => {
     const data = await getJson(`/api/feed?${query({ ...selection, task, offset })}`);
-    if (!subscribed) return;
+    if (!reader.listeners.size) return;
     // A log that was cut, or that vanished after it had lines, starts over.
-    const reset = !!data.reset || (!!data.missing && read > 0);
-    read = (reset ? 0 : read) + data.items.length;
+    const reset = !!data.reset || (!!data.missing && reader.items.length > 0);
+    if (reset) reader.items = [];
+    for (const item of data.items) reader.items.push(item);
     offset = data.offset;
-    listener({ items: data.items, reset, missing: !!data.missing });
+    reader.missing = !!data.missing;
+    reader.answered = true;
+    for (const listener of reader.listeners) listener({ items: data.items, reset, missing: reader.missing });
   }, FEED_EVERY_MS);
-  return () => { subscribed = false; poller.stop(); };
+  return reader;
 }

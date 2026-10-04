@@ -307,11 +307,10 @@ function runDirFrom(query) {
 
 const STATIC = {
     '/': ['index.html', 'text/html; charset=utf-8'],
-    '/preview': ['preview.html', 'text/html; charset=utf-8'],
     '/marked.min.js': ['marked.min.js', 'text/javascript; charset=utf-8'],
 };
 
-// Browser modules of the pixel page. The name is checked before anything touches the disk,
+// The page's browser modules. The name is checked before anything touches the disk,
 // so dots, slashes, backslashes and percent-encoded sequences never reach a file path.
 const MODULE_RE = /^\/pixel\/([a-z0-9-]+)\.js$/;
 

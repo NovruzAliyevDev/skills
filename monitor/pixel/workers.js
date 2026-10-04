@@ -1,9 +1,9 @@
-// The scene model: which worker stands where, as plain data. No drawing and no DOM.
+// The scene model: which worker and helper stands where, and what changed since the snapshot before, as
+// plain data. No drawing and no DOM.
 import { lookOf } from './sprites.js';
 
-// Per task state: where its worker stands, what it does there (still frames until the scene animates
-// them) and the marker over it. The runner runs one task at a time, so the desk and the alert corner
-// normally hold one worker each.
+// Per task state: where its worker stands, what it does there and the marker over it. The runner runs
+// one task at a time, so the desk and the alert corner normally hold one worker each.
 const STATES = {
   'pending': { place: 'queue', anim: 'idle', marker: null },
   'running': { place: 'desk', anim: 'type', marker: null },
@@ -18,6 +18,9 @@ const PLACE_NAME = { desk: 'desk', done: 'done zone', alert: 'alert corner' };
 // zone; the other finished tasks fold into the "+N done" counter.
 const LONG_RUN = 12;
 const DONE_SHOWN = 4;
+// At most HELPERS_SHOWN helpers stand around the desk, one per helper spot of the scene; the others are
+// counted in a "+N" marker.
+const HELPERS_SHOWN = 4;
 
 // Most recently finished first: by end time (stamps sort as text), then by task order.
 const byRecency = (a, b) => (b.end || '').localeCompare(a.end || '') || b.index - a.index;
@@ -26,7 +29,7 @@ const byRecency = (a, b) => (b.end || '').localeCompare(a.end || '') || b.index 
 // one worker per task drawn, in task order, and the finished tasks folded away. `slot` counts within the
 // place: queue slot 0 is the next task, nearest the desk. Each worker keeps its task's snapshot for the
 // facts shown about it.
-export function officeOf(run) {
+function officeOf(run) {
   const done = run.tasks.filter(t => t.state === 'done');
   const shown = new Set(run.tasks.length > LONG_RUN ? [...done].sort(byRecency).slice(0, DONE_SHOWN) : done);
   const taken = { queue: 0, desk: 0, done: 0, alert: 0 };
@@ -47,4 +50,98 @@ export function officeOf(run) {
   }
   const preflightError = run.state === 'preflight-failed' ? run.preflight : null;
   return { state: run.state, preflightError, workers, collapsed };
+}
+
+// The task whose subagents stand around the desk as helpers: the running one. No-session and interrupted
+// mean no session works, so a task in either state has none.
+export function helperTaskOf(run) {
+  return run.tasks.find(t => t.state === 'running')?.id ?? null;
+}
+
+// The subagents at work in a task's session, from its session log's feed items (see readFeed). A helper
+// starts with an `agent` item and ends with its `agent-end` item. All of them end with the session's
+// `result` item, and when a new session starts: a task run again appends its new session to the same log.
+export function createHelperList() {
+  let working = new Map();                      // tool-use id -> { id, type, description }, in start order
+  let session = null;
+  return {
+    // A batch `{ items, reset }` from readFeed.
+    apply({ items, reset }) {
+      if (reset) { working = new Map(); session = null; }
+      for (const item of items) {
+        if (item.k === 'agent') working.set(item.id, { id: item.id, type: item.type || 'agent', description: item.t || '' });
+        else if (item.k === 'agent-end') working.delete(item.id);
+        else if (item.k === 'result') working.clear();
+        else if (item.k === 'init') {
+          if (item.sid !== session) working.clear();
+          session = item.sid;
+        }
+      }
+    },
+    // The helpers at work now, in start order.
+    get active() { return [...working.values()]; },
+  };
+}
+
+// One run's office across its snapshots. `update(run, helpers)` takes a snapshot from /api/run and the
+// helper task's helpers as `{ task, list }` (null while its log is unread), and returns the office to
+// draw: the run state, the workers and the folded tasks, the helper task (see helperTaskOf), the helpers
+// drawn around the desk and the others waiting in the "+N" count, and what changed since the call before:
+// - `first`: the run's first snapshot; everyone is placed directly, with no walks and no celebrations.
+// - a worker's `moved`: it changed place or slot, so it walks to its new spot.
+// - a worker's `celebrate`: it has just finished, so it celebrates when it reaches the done zone.
+// - a helper's `arrive`, on the call where it is first drawn: 'walk' in from the door, or 'place' it
+//   directly when it was already at work as the page first read the log of the task at the desk then.
+export function createOffice() {
+  let before = null;                            // task id -> { place, slot, state } as last drawn
+  let firstHelperTask = null;                   // the helper task of the run's first snapshot
+  const read = new Set();                       // the tasks whose helpers have been seen
+  const spots = new Map();                      // helper id -> its spot, kept while it works
+  return {
+    update(run, helpers) {
+      const first = !before;
+      const office = officeOf(run);
+      const helperTask = helperTaskOf(run);
+      if (first) firstHelperTask = helperTask;
+
+      const current = !!(helpers && helperTask && helpers.task === helperTask);
+      const active = current ? helpers.list : [];
+      let arrive = 'walk';
+      if (current && !read.has(helperTask)) {
+        read.add(helperTask);
+        if (helperTask === firstHelperTask) arrive = 'place';
+      }
+      // A helper keeps its spot while it works; a new one takes a free spot, or waits in the "+N" count.
+      const working = new Set(active.map(h => h.id));
+      const drawnBefore = new Set(spots.keys());
+      for (const id of drawnBefore) if (!working.has(id)) spots.delete(id);
+      for (const helper of active) {
+        if (spots.has(helper.id) || spots.size >= HELPERS_SHOWN) continue;
+        const taken = new Set(spots.values());
+        let spot = 0;
+        while (taken.has(spot)) spot++;
+        spots.set(helper.id, spot);
+      }
+      office.helpers = active.filter(h => spots.has(h.id)).map(h => ({
+        ...h, spot: spots.get(h.id), look: lookOf(h.id), arrive: drawnBefore.has(h.id) ? null : arrive,
+      }));
+      office.otherHelpers = active.filter(h => !spots.has(h.id));
+      office.helperTask = helperTask;
+      // The worker at the desk always says how many helpers it has.
+      const desk = office.workers.find(w => w.id === helperTask) || office.workers.find(w => w.place === 'desk' && w.slot === 0);
+      if (desk) desk.label += ` · ${active.length} ${active.length === 1 ? 'helper' : 'helpers'}`;
+
+      for (const worker of office.workers) {
+        const was = before?.get(worker.id);
+        worker.moved = !!was && (was.place !== worker.place || was.slot !== worker.slot);
+        worker.celebrate = !!was && was.state !== 'done' && worker.state === 'done';
+      }
+      before = new Map([
+        ...office.workers.map(w => [w.id, { place: w.place, slot: w.slot, state: w.state }]),
+        ...office.collapsed.map((c, slot) => [c.id, { place: 'collapsed', slot, state: 'done' }]),
+      ]);
+      office.first = first;
+      return office;
+    },
+  };
 }

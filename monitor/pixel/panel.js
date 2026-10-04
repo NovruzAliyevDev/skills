@@ -219,8 +219,9 @@ export function createDrawer(root, { onClose }) {
     setHtml(panels.brief, text === null ? '<p class="empty">No brief file for this task.</p>' : md(text));
   }
 
-  // Opens the drawer on `next`, a task of the run `sel`. A drawer already open keeps its tab.
-  function open(sel, next) {
+  // Opens the drawer on `next`, a task of the run `sel`, on `nextTab`; without one, a drawer already open
+  // keeps its tab.
+  function open(sel, next, nextTab) {
     const wasOpen = !!task;
     if (!wasOpen || selection !== sel || task.id !== next.id) {
       stopFeed?.();
@@ -237,7 +238,7 @@ export function createDrawer(root, { onClose }) {
     task = next;
     renderHead();
     root.hidden = false;
-    show(wasOpen ? tab : 'activity');
+    show(nextTab || (wasOpen ? tab : 'activity'));
     root.focus();
   }
 

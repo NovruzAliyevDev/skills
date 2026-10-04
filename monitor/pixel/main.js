@@ -1,10 +1,10 @@
-// Wiring: the pollers, run selection and the URL hash, the selected run's header, scene, sections and
-// task drawer, notifications and the permission button, the tab title, the offline marker, the theme
-// listener and the keyboard.
-import { onOffline, watchRun, watchRuns } from './api.js';
+// Wiring: the pollers, run selection and the URL hash, the selected run's header, office, sections and
+// task drawer, the running task's helpers, notifications and the permission button, the tab title, the
+// offline marker, the theme listener and the keyboard.
+import { onOffline, readFeed, watchRun, watchRuns } from './api.js';
 import { BAD, STATE_LABEL, createDrawer, esc, onRunChosen, renderCommits, renderProgress, renderRunHeader, renderRunList, runKey } from './panel.js';
 import { resetSprites } from './sprites.js';
-import { officeOf } from './workers.js';
+import { createHelperList, createOffice, helperTaskOf } from './workers.js';
 import { createScene } from './scene.js';
 
 const layout = document.getElementById('layout');
@@ -21,7 +21,9 @@ const notifyButton = document.getElementById('notify-btn');
 let runs = [];
 let selected = null;
 let detail = null;            // the selected run's last snapshot
+let office = null;            // the selected run's office model, which compares its snapshots
 let scene = null;
+let desk = { task: null, helpers: null, stop: null };   // the helper task's log, read for its helpers
 let opener = null;            // what had the focus when the drawer opened; it gets the focus back on close
 let previousRuns = null;      // the run list of the poll before, to notice what changed
 
@@ -38,33 +40,57 @@ const drawer = createDrawer(document.getElementById('drawer'), {
   },
 });
 
-function openTask(id) {
+// `tab` picks the drawer's tab; without it, an open drawer keeps its own.
+function openTask(id, tab) {
   const task = detail?.tasks.find(t => t.id === id);
   if (!task) return;
   if (!drawer.taskId) opener = document.activeElement;
   layout.classList.add('drawer-open');
-  drawer.open(selected, task);
+  drawer.open(selected, task, tab);
   scene.setOpen(id);
 }
 
-// Switching runs rebuilds the scene, so workers of different runs never mix, and closes the drawer.
+// Switching runs rebuilds the office and the scene, so workers of different runs never mix, and closes
+// the drawer.
 function select(run) {
   if (selected && runKey(selected) === runKey(run)) return;
   drawer.close();
+  followDesk(null);
   selected = { project: run.project, run: run.run };
   detail = null;
   history.replaceState(null, '', `#${encodeURIComponent(runKey(selected))}`);
   sceneTitle.innerHTML = `Office <span class="muted">${esc(run.project)} ${esc(run.run)}</span>`;
   scene?.destroy();
+  office = createOffice();
   scene = createScene(sceneHost, { onOpen: openTask });
   renderRunList(runList, runs, runKey(selected));
   runPoll.refresh();
 }
 
+// The helper task's session log is read while it runs, for the helpers around the desk (see
+// helperTaskOf). When the drawer shows the same task, its Activity shares the reader.
+function followDesk(taskId) {
+  if (taskId === desk.task) return;
+  desk.stop?.();
+  desk = { task: taskId, helpers: null, stop: null };
+  if (!taskId) return;
+  const followed = desk, subagents = createHelperList();
+  followed.stop = readFeed(selected, taskId, batch => {
+    subagents.apply(batch);
+    followed.helpers = { task: taskId, list: subagents.active };
+    if (desk === followed && detail) showOffice();
+  });
+}
+
+function showOffice() {
+  scene.update(office.update(detail, desk.helpers));
+}
+
 const runPoll = watchRun(() => selected, next => {
   detail = next;
+  followDesk(helperTaskOf(detail));
   renderRunHeader(runHead, detail, selected);
-  scene.update(officeOf(detail));
+  showOffice();
   drawer.update(detail);
   renderCommits(commits, commitsNote, detail.commits);
   renderProgress(progress, progressNote, detail.progress);

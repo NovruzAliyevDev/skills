@@ -10,398 +10,245 @@
   --bg: #f6f7f9; --panel: #ffffff; --line: #e2e5ea; --text: #1d2330; --muted: #6a7282;
   --accent: #2f6fde; --ok: #1f8a4c; --bad: #c8382f; --warn: #b7791f; --idle: #8a919e;
   --code: #f0f2f5; --hover: #eef2fb; --sel: #e3ebfb;
+  --frame: #3b4252; --shadow: rgba(29, 35, 48, .2);
   --mono: ui-monospace, "Cascadia Code", Consolas, monospace;
+  /* Scene surfaces; sprites read them when their cache is built. */
+  --scene-ink: #2b2533; --scene-wall: #e9e3d6; --scene-wall-trim: #cbbfa6; --scene-ceiling: #d8cfbd;
+  --scene-floor: #dcc6a2; --scene-floor-line: #cdb48c; --scene-wood: #b47c45; --scene-wood-dark: #855631;
+  --scene-metal: #5d6474; --scene-metal-light: #8d95a5; --scene-screen: #79d2ef; --scene-screen-line: #3a9fc4;
+  --scene-sky: #c4e6f8; --scene-cloud: #ffffff; --scene-leaf: #5aa05e; --scene-leaf-dark: #3f7d45; --scene-pot: #bb6a40;
+  --scene-rug: #cfe7d2; --scene-rug-edge: #8fc69c; --scene-alert-floor: #f1d2cc; --scene-hazard: #f0c23e;
+  --scene-trousers: #3c4250;
 }
 @media (prefers-color-scheme: dark) {
   :root {
     --bg: #14171c; --panel: #1b1f26; --line: #2c323c; --text: #e3e7ee; --muted: #9098a6;
     --accent: #6c9cf0; --ok: #46b97a; --bad: #ec6a60; --warn: #e0a64a; --idle: #7c8492;
     --code: #232833; --hover: #222833; --sel: #26324a;
+    --frame: #59627a; --shadow: rgba(0, 0, 0, .45);
+    --scene-ink: #141118; --scene-wall: #353b4b; --scene-wall-trim: #4c5569; --scene-ceiling: #2b303d;
+    --scene-floor: #54473b; --scene-floor-line: #463b31; --scene-wood: #8c5d37; --scene-wood-dark: #613e25;
+    --scene-metal: #4a5162; --scene-metal-light: #737c90; --scene-screen: #4fb4db; --scene-screen-line: #2d81a6;
+    --scene-sky: #1f2b4e; --scene-cloud: #d6deee; --scene-leaf: #4a8b50; --scene-leaf-dark: #33643a; --scene-pot: #9b5636;
+    --scene-rug: #2f4a3b; --scene-rug-edge: #4d7b5d; --scene-alert-floor: #4f2c2c; --scene-hazard: #d9ac2d;
+    --scene-trousers: #5b647c;
   }
 }
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
+/* A page scrollbar coming and going must not change the scene's width, or its scale would flip back and forth. */
+html { scrollbar-gutter: stable; }
 body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 "Segoe UI", system-ui, sans-serif; }
-.layout { display: grid; grid-template-columns: 290px 1fr; min-height: 100vh; }
-aside { border-right: 1px solid var(--line); background: var(--panel); padding: 12px 0; overflow-y: auto; max-height: 100vh; position: sticky; top: 0; }
-aside h1 { font-size: 15px; margin: 0 16px 4px; }
-.root { color: var(--muted); font-size: 12px; margin: 0 16px 10px; word-break: break-all; }
-.notify-btn { margin: 0 16px 12px; }
-.run-item { padding: 8px 16px; cursor: pointer; border-left: 3px solid transparent; }
-.run-item:hover { background: var(--hover); }
-.run-item.selected { background: var(--sel); border-left-color: var(--accent); }
-.run-item .name { font-weight: 600; }
-.run-item .meta { color: var(--muted); font-size: 12px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-main { padding: 16px 20px 40px; min-width: 0; }
-.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; margin-bottom: 14px; }
-.panel h2 { font-size: 14px; margin: 0 0 10px; display: flex; gap: 8px; align-items: center; }
-.head-title { font-size: 18px; font-weight: 650; margin: 0 0 6px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
-.facts { display: flex; flex-wrap: wrap; gap: 4px 18px; color: var(--muted); font-size: 13px; }
-.facts b { color: var(--text); font-weight: 500; }
-.warning { color: var(--warn); font-size: 13px; margin-top: 6px; }
-.badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; font-weight: 600; color: #fff; background: var(--idle); white-space: nowrap; }
+.sr-only { position: absolute; width: 1px; height: 1px; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* Pixel chrome: square corners, 2 px borders, stepped block shadows, monospace uppercase headings and badges. */
+h1, h2, .badge, .sign, .btn, .counter, [role="tab"], .section > summary, .previous > summary, .done-list p, .session-sep {
+  font-family: var(--mono); text-transform: uppercase; letter-spacing: .05em; }
+button { font: inherit; color: inherit; }
+.badge { display: inline-block; padding: 1px 6px; font-size: 11px; font-weight: 700; border: 2px solid rgba(0, 0, 0, .22); white-space: nowrap; }
+.badge, .sign { color: #fff; background: var(--idle); }
 .s-running { background: var(--accent); }
 .s-done { background: var(--ok); }
 .s-failed, .s-stopped, .s-preflight-failed { background: var(--bad); }
 .s-interrupted, .s-no-session { background: var(--warn); }
-table { width: 100%; border-collapse: collapse; }
-th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
-th { color: var(--muted); font-weight: 500; font-size: 12px; }
-td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
-tbody tr { cursor: pointer; }
-tbody tr:hover { background: var(--hover); }
-tbody tr.selected { background: var(--sel); }
-.reason { color: var(--muted); font-size: 12px; }
-.feed { max-height: 60vh; overflow-y: auto; font-size: 13px; }
+.muted { color: var(--muted); }
+.empty { color: var(--muted); font-style: italic; }
+.btn { padding: 3px 10px; font-size: 11px; font-weight: 700; cursor: pointer; background: var(--panel); border: 2px solid var(--frame); box-shadow: 2px 2px 0 var(--shadow); }
+.btn:hover { background: var(--hover); }
+
+.layout { display: grid; grid-template-columns: 290px minmax(0, 1fr); min-height: 100vh; }
+aside { background: var(--panel); border-right: 2px solid var(--frame); padding: 14px 0; overflow-y: auto; max-height: 100vh; position: sticky; top: 0; }
+aside h1 { font-size: 14px; margin: 0 16px 4px; }
+.root { color: var(--muted); font-size: 12px; margin: 0 16px 12px; word-break: break-all; }
+.notify-btn { margin: 0 16px 12px; }
+.runs { display: grid; gap: 6px; padding: 0 12px; }
+.run-item { display: block; width: 100%; text-align: left; padding: 7px 10px; cursor: pointer; background: var(--panel);
+  border: 2px solid var(--line); box-shadow: 2px 2px 0 var(--shadow); }
+.run-item:hover { background: var(--hover); }
+.run-item[aria-current="true"] { background: var(--sel); border-color: var(--accent); box-shadow: 2px 2px 0 var(--shadow), 4px 4px 0 var(--shadow); }
+.run-item .name { display: block; font-weight: 600; overflow-wrap: anywhere; }
+.run-item .meta { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; color: var(--muted); font-size: 12px; margin-top: 2px; }
+
+main { padding: 16px 20px 40px; min-width: 0; }
+.panel { background: var(--panel); border: 2px solid var(--frame); padding: 12px 14px; margin-bottom: 16px;
+  box-shadow: 2px 2px 0 var(--shadow), 4px 4px 0 var(--shadow); }
+.panel h2 { font-size: 13px; margin: 0 0 10px; display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.panel h2 .muted, .section > summary .muted { text-transform: none; letter-spacing: 0; font-weight: 500; }
+.offline { position: sticky; top: 0; z-index: 5; margin-bottom: 16px; padding: 8px 12px; font: 700 12px/1.4 var(--mono); color: #fff;
+  background: var(--bad); border: 2px solid var(--frame); box-shadow: 2px 2px 0 var(--shadow), 4px 4px 0 var(--shadow); }
+.offline:empty { display: none; }
+
+/* The run header. Project and run keep their case: they are names. */
+.panel .run-title { font-size: 15px; margin: 0 0 8px; align-items: center; text-transform: none; letter-spacing: 0; }
+.run-facts { display: flex; flex-wrap: wrap; gap: 4px 18px; color: var(--muted); font-size: 13px; }
+.run-facts + .run-facts { margin-top: 4px; }
+.run-facts b { color: var(--text); font-weight: 600; overflow-wrap: anywhere; }
+.warning { color: var(--warn); font-size: 13px; font-weight: 600; margin-top: 6px; }
+
+/* Collapsible run sections. */
+.section { padding: 0; }
+.section > summary { display: flex; gap: 8px; align-items: baseline; padding: 10px 14px; font-size: 13px; font-weight: 700; cursor: pointer; list-style: none; }
+.section > summary::-webkit-details-marker { display: none; }
+.section > summary::before { content: "+"; }
+.section[open] > summary::before { content: "-"; }
+.section-body { padding: 0 14px 12px; }
+.commit { display: grid; grid-template-columns: 76px 150px minmax(0, 1fr); gap: 8px; padding: 3px 0; font-size: 13px; }
+.commit .hash { font-family: var(--mono); color: var(--accent); }
+.commit .ref { color: var(--muted); font-size: 12px; }
+pre.plain { margin: 0; max-height: 50vh; overflow: auto; padding: 8px 10px; background: var(--code); border: 2px solid var(--line); font: 12px/1.45 var(--mono); }
+
+/* The office: a canvas drawn at world resolution and scaled by an integer factor, with a DOM overlay on top. */
+.scene { overflow-x: auto; }
+.stage { position: relative; margin: 0 auto; }
+.stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; image-rendering: crisp-edges; image-rendering: pixelated; pointer-events: none; }
+.sign { position: absolute; transform: translateX(-50%); padding: 3px 8px; font-size: max(10px, calc(var(--px) * 3.5px)); line-height: 1.2;
+  font-weight: 700; border: 2px solid var(--frame); box-shadow: 2px 2px 0 var(--shadow); white-space: nowrap; }
+/* Name tags and the "+N" counters: small DOM text that grows with the scene, within readable bounds. */
+.tag, .counter, .helpers-more { font: 600 clamp(9px, calc(var(--px) * 3.4px), 13px)/1.2 var(--mono); }
+/* A name tag never cuts its number; the title gets what room is left. */
+.tag { position: absolute; display: grid; grid-template-columns: auto minmax(0, 1fr); column-gap: .4em; min-width: min-content;
+  transform: translate(-50%, -100%); padding: 0 2px;
+  background: var(--panel); color: var(--text); border: 2px solid var(--frame); white-space: nowrap; pointer-events: none; }
+.tag span { overflow: hidden; text-overflow: ellipsis; }
+.tag.open { background: var(--accent); color: #fff; }
+.worker { position: absolute; padding: 0; margin: 0; border: 0; background: transparent; cursor: pointer; }
+/* Helpers have a hover target over each sprite, and a "+N" marker for those not drawn; neither is in the Tab order. */
+.helper { position: absolute; cursor: pointer; }
+.counter, .helpers-more { position: absolute; padding: 1px 5px; font-weight: 700; white-space: nowrap; cursor: pointer;
+  background: var(--panel); color: var(--text); border: 2px solid var(--frame); box-shadow: 2px 2px 0 var(--shadow); }
+.counter:hover { background: var(--hover); }
+.counter.open, .counter[aria-expanded="true"] { background: var(--sel); border-color: var(--accent); }
+/* A pressed pixel button sinks into its shadow. */
+.btn:active, .run-item:active, .counter:active { transform: translate(2px, 2px); box-shadow: none; }
+
+/* Floating boxes over the page: the tooltip and the "+N done" list. */
+.tip, .done-list { position: fixed; background: var(--panel); color: var(--text); border: 2px solid var(--frame);
+  box-shadow: 2px 2px 0 var(--shadow), 4px 4px 0 var(--shadow); }
+.tip { z-index: 40; max-width: min(320px, calc(100vw - 16px)); padding: 6px 9px 7px; font-size: 12px; line-height: 1.4; }
+.tip p { margin: 0 0 4px; }
+.tip p:last-child { margin-bottom: 0; }
+.tip-list { margin: 4px 0 0; padding-left: 16px; }
+.tip-title { font-weight: 600; overflow-wrap: anywhere; }
+.tip-title b, .drawer-title b { font-family: var(--mono); }
+.task-facts { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 1px 10px; margin: 6px 0 0; }
+.task-facts div { display: contents; }
+.task-facts dt { color: var(--muted); }
+.task-facts dd { margin: 0; overflow-wrap: anywhere; }
+.note { margin: 6px 0 0; color: var(--warn); font-weight: 600; }
+.done-list { z-index: 35; width: min(380px, calc(100vw - 16px)); max-height: min(320px, 60vh); overflow-y: auto; padding: 6px; }
+.done-list p { margin: 2px 4px 6px; font-size: 11px; font-weight: 700; color: var(--muted); }
+.done-list ul { display: grid; gap: 2px; margin: 0; padding: 0; list-style: none; }
+.done-list button { display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto; gap: 10px; width: 100%; padding: 4px 6px;
+  text-align: left; font-size: 12px; cursor: pointer; background: transparent; border: 2px solid transparent; }
+.done-list button:hover { background: var(--hover); }
+.done-list button[aria-current="true"] { background: var(--sel); border-color: var(--accent); }
+.done-list b { font-family: var(--mono); }
+.done-list .title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.done-list .num { color: var(--muted); font-variant-numeric: tabular-nums; }
+
+/* The task drawer: a third column on wide screens. Below 1200 px it takes the run list's place, so the
+   office stays in view beside it, and on a phone it covers the screen. */
+.layout.drawer-open { grid-template-columns: 290px minmax(0, 1fr) clamp(340px, 30vw, 560px); }
+.drawer { position: sticky; top: 0; height: 100vh; min-width: 0; display: flex; flex-direction: column;
+  background: var(--panel); border-left: 2px solid var(--frame); }
+.drawer:focus { outline: none; }
+.drawer-head { padding: 12px 14px 10px; }
+.drawer-bar { display: flex; gap: 10px; align-items: flex-start; }
+.drawer-title { flex: 1; margin: 0; font-size: 14px; line-height: 1.5; text-transform: none; letter-spacing: 0; overflow-wrap: anywhere; }
+.drawer-title .badge { vertical-align: 1px; }
+.drawer-close { flex: none; width: 28px; height: 28px; padding: 0; font-size: 16px; line-height: 1; }
+.drawer .task-facts { display: flex; flex-wrap: wrap; gap: 2px 16px; font-size: 13px; }
+.drawer .task-facts div { display: flex; gap: 6px; }
+.tabs { display: flex; gap: 6px; padding: 0 14px; border-bottom: 2px solid var(--frame); }
+.tabs [role="tab"] { margin-bottom: -2px; padding: 4px 10px; font-size: 11px; font-weight: 700; cursor: pointer;
+  color: var(--muted); background: var(--bg); border: 2px solid var(--frame); }
+.tabs [role="tab"][aria-selected="true"] { color: var(--text); background: var(--panel); border-bottom-color: var(--panel); }
+.tab-panel { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 10px 14px 16px; }
+.previous { margin-top: 12px; border-top: 2px solid var(--line); padding-top: 8px; }
+.previous > summary { cursor: pointer; font-size: 12px; font-weight: 700; }
+
+/* Activity, reports and briefs: long text in the system font. */
+.feed { font-size: 13px; }
 .item { padding: 4px 0; border-bottom: 1px dashed var(--line); }
 .item:last-child { border-bottom: 0; }
 .item .ts { color: var(--muted); font-size: 11px; margin-right: 6px; font-family: var(--mono); }
-.tool { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+.tool { font-family: var(--mono); font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
 .tool .name { color: var(--accent); font-weight: 600; }
-.session-sep { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; padding: 8px 0 4px; }
+.session-sep { color: var(--muted); font-size: 11px; font-weight: 700; padding: 8px 0 4px; }
 .result-item { border-left: 3px solid var(--ok); padding-left: 10px; margin: 6px 0; }
 .result-item.error { border-left-color: var(--bad); }
 details.agent { margin: 4px 0 4px 14px; border-left: 2px solid var(--line); padding-left: 10px; }
 details.agent > summary { cursor: pointer; font-size: 12px; color: var(--muted); }
+.md { overflow-wrap: anywhere; }
 .md p { margin: 4px 0; }
-.md pre, pre.plain { background: var(--code); padding: 8px 10px; border-radius: 6px; overflow-x: auto; font-size: 12px; }
-.md code { font-family: var(--mono); font-size: 12px; background: var(--code); padding: 1px 4px; border-radius: 4px; }
+.md pre { background: var(--code); padding: 8px 10px; overflow-x: auto; font-size: 12px; }
+.md code { font-family: var(--mono); font-size: 12px; background: var(--code); padding: 1px 4px; }
 .md pre code { padding: 0; background: none; }
-.md table { margin: 6px 0; }
-.md h1, .md h2, .md h3 { font-size: 15px; margin: 12px 0 6px; }
-.empty { color: var(--muted); font-style: italic; }
-details.section > summary { cursor: pointer; font-weight: 600; font-size: 14px; }
-.commit { font-size: 13px; padding: 3px 0; display: grid; grid-template-columns: 76px 150px 1fr; gap: 8px; }
-.commit .hash { font-family: var(--mono); color: var(--accent); }
-.commit .ref { color: var(--muted); font-size: 12px; }
-button { font: inherit; font-size: 12px; padding: 3px 10px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel); color: var(--text); cursor: pointer; }
-button:hover { background: var(--hover); }
-.muted { color: var(--muted); }
+.md table { border-collapse: collapse; margin: 6px 0; }
+.md th, .md td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+.md th { color: var(--muted); font-weight: 500; font-size: 12px; }
+.md h1, .md h2, .md h3 { font: 600 15px/1.3 "Segoe UI", system-ui, sans-serif; text-transform: none; letter-spacing: 0; margin: 12px 0 6px; }
+.md img { max-width: 100%; }
+
+@media (max-width: 1199px) {
+  .layout.drawer-open { grid-template-columns: minmax(0, 1fr) clamp(340px, 40vw, 440px); }
+  .layout.drawer-open > aside { display: none; }
+}
 @media (max-width: 760px) {
-  .layout { grid-template-columns: 1fr; }
-  aside { position: static; max-height: none; border-right: 0; border-bottom: 1px solid var(--line); }
+  .layout, .layout.drawer-open { grid-template-columns: minmax(0, 1fr); }
+  aside, .layout.drawer-open > aside { display: block; position: static; max-height: none; border-right: 0; border-bottom: 2px solid var(--frame); }
   main { padding: 12px 16px 32px; }
-  .commit { grid-template-columns: 70px 1fr; }
+  .scene-panel { padding: 10px 0; }
+  .scene-panel h2 { margin: 0 12px 10px; }
+  .commit { grid-template-columns: 70px minmax(0, 1fr); }
   .commit .date { display: none; }
+  .drawer { position: fixed; inset: 0; z-index: 30; height: auto; border-left: 0; }
 }
 </style>
+<script type="module" src="/pixel/main.js"></script>
 </head>
 <body>
-<div class="layout">
+<div class="layout" id="layout">
   <aside>
     <h1>Task queues</h1>
     <div class="root" id="root"></div>
-    <button class="notify-btn" id="notify-btn" hidden>Enable notifications</button>
-    <div id="runs"></div>
+    <button type="button" class="btn notify-btn" id="notify-btn" hidden>Enable notifications</button>
+    <nav class="runs" id="runs" aria-label="Runs"></nav>
   </aside>
-  <main id="main"><p class="empty">Select a run.</p></main>
-</div>
-<script>
-'use strict';
-const STATE_LABEL = {
-  'pending': 'pending', 'running': 'running', 'done': 'DONE', 'failed': 'FAILED', 'stopped': 'STOPPED',
-  'interrupted': 'interrupted', 'no-session': 'runner has no session', 'not-started': 'not started',
-  'preflight-failed': 'preflight failed',
-};
-const BAD = new Set(['failed', 'stopped', 'interrupted', 'no-session', 'preflight-failed']);
-
-const ui = { runs: [], selected: null, detail: null, task: null, feed: null, reportKey: null, previousRuns: null };
-
-marked.use({
-  renderer: { html(token) { return esc(typeof token === 'string' ? token : token.text); } },
-  walkTokens(t) { if ((t.type === 'link' || t.type === 'image') && /^\s*(javascript|data|vbscript):/i.test(t.href || '')) t.href = '#'; },
-});
-
-function esc(s) { return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
-function md(text) { return `<div class="md">${marked.parse(text || '')}</div>`; }
-function badge(state) { return `<span class="badge s-${esc(state)}">${esc(STATE_LABEL[state] || state)}</span>`; }
-function parseLocal(stamp) { if (!stamp) return null; const [d, t] = stamp.split(' '); const [y, mo, da] = d.split('-').map(Number); const [h, mi, s] = t.split(':').map(Number); return new Date(y, mo - 1, da, h, mi, s); }
-function hm(stamp) { return stamp ? stamp.slice(11, 16) : ''; }
-function dur(ms) { if (ms == null || ms < 0) return ''; const m = Math.floor(ms / 60000), h = Math.floor(m / 60); return h ? `${h}h ${m % 60}m` : `${m}m`; }
-function ago(ms) { if (!ms) return ''; const s = Math.round((Date.now() - ms) / 1000); return s < 60 ? `${s}s ago` : s < 3600 ? `${Math.floor(s / 60)}m ago` : `${Math.floor(s / 3600)}h ago`; }
-function money(v) { return v ? `$${v.toFixed(2)}` : ''; }
-function key(r) { return `${r.project}/${r.run}`; }
-async function getJson(url) { const r = await fetch(url, { cache: 'no-store' }); if (!r.ok) throw new Error(`${r.status} ${url}`); return r.json(); }
-function q(params) { return new URLSearchParams(params).toString(); }
-
-// --- Run list and notifications ---
-
-async function loadRuns() {
-  const data = await getJson('/api/runs');
-  document.getElementById('root').textContent = data.root;
-  ui.runs = data.runs;
-  notifyChanges(data.runs);
-  if (!ui.selected && data.runs.length) {
-    const fromHash = decodeURIComponent(location.hash.slice(1));
-    const pick = data.runs.find(r => key(r) === fromHash) || data.runs.find(r => r.state === 'running') || data.runs[0];
-    select(pick.project, pick.run);
-  }
-  renderRuns();
-}
-
-function renderRuns() {
-  document.getElementById('runs').innerHTML = ui.runs.map(r => {
-    const done = r.counts.done || 0;
-    const sel = ui.selected && key(ui.selected) === key(r) ? ' selected' : '';
-    const warn = r.missingBriefs.length ? ` <span title="missing briefs: ${esc(r.missingBriefs.join(', '))}">⚠</span>` : '';
-    return `<div class="run-item${sel}" data-key="${esc(key(r))}">
-      <div class="name">${esc(r.project)} <span class="muted">${esc(r.run)}</span>${warn}</div>
-      <div class="meta">${badge(r.state)}<span>${done}/${r.total} done</span><span>${money(r.cost)}</span></div>
-    </div>`;
-  }).join('') || '<p class="empty" style="margin:0 16px">No runs found.</p>';
-}
-
-document.getElementById('runs').addEventListener('click', e => {
-  const item = e.target.closest('.run-item');
-  if (!item) return;
-  const [project, run] = item.dataset.key.split('/');
-  select(project, run);
-});
-
-function notifyChanges(runs) {
-  const now = new Map(runs.map(r => [key(r), r]));
-  if (ui.previousRuns) {
-    for (const [k, r] of now) {
-      const before = ui.previousRuns.get(k);
-      if (!before) continue;
-      if ((r.counts.done || 0) > (before.counts.done || 0) && r.state !== 'done') notify(`Task done (${r.counts.done}/${r.total})`, k);
-      if (r.state !== before.state && r.state === 'done') notify(`Queue finished: all ${r.total} tasks DONE`, k);
-      if (r.state !== before.state && BAD.has(r.state)) notify(`Queue ${STATE_LABEL[r.state]}`, k);
-    }
-  }
-  ui.previousRuns = now;
-}
-
-function notify(title, body) {
-  if ('Notification' in window && Notification.permission === 'granted') new Notification(title, { body });
-}
-
-const notifyBtn = document.getElementById('notify-btn');
-if ('Notification' in window && Notification.permission === 'default') {
-  notifyBtn.hidden = false;
-  notifyBtn.onclick = () => Notification.requestPermission().then(() => { notifyBtn.hidden = Notification.permission !== 'default'; });
-}
-
-// --- Selected run ---
-
-function select(project, run) {
-  ui.selected = { project, run };
-  ui.detail = null; ui.task = null; ui.feed = null; ui.reportKey = null; ui.pinned = false;
-  history.replaceState(null, '', `#${encodeURIComponent(`${project}/${run}`)}`);
-  document.getElementById('main').innerHTML = `<div class="panel" id="head"></div>
-    <div class="panel"><h2>Tasks</h2><div id="tasks"></div></div>
-    <div class="panel"><h2 id="feed-title">Activity</h2><div class="feed" id="feed"></div></div>
-    <div class="panel"><h2 id="report-title">Report</h2><div id="report"></div></div>
-    <div class="panel"><h2>Commits during the run</h2><div id="commits"></div></div>
-    <div class="panel"><details class="section" id="brief-section"><summary>Brief</summary><div id="brief"></div></details></div>
-    <div class="panel"><details class="section"><summary>progress.log</summary><pre class="plain" id="progress"></pre></details></div>`;
-  document.getElementById('brief-section').addEventListener('toggle', loadBrief);
-  document.getElementById('tasks').addEventListener('click', e => {
-    const row = e.target.closest('tr[data-id]');
-    if (row) selectTask(row.dataset.id);
-  });
-  renderRuns();
-  loadRun();
-}
-
-async function loadRun() {
-  if (!ui.selected) return;
-  const sel = ui.selected;
-  const detail = await getJson(`/api/run?${q(sel)}`);
-  if (ui.selected !== sel) return;
-  ui.detail = detail;
-  // Follow the active task until the user picks one.
-  if (!ui.pinned) {
-    const running = detail.tasks.find(t => ['running', 'interrupted', 'no-session'].includes(t.state));
-    const started = [...detail.tasks].reverse().find(t => t.state !== 'pending');
-    const follow = (running || started || detail.tasks[0] || {}).id || null;
-    if (follow !== ui.task) {
-      ui.task = follow; ui.feed = null; ui.reportKey = null;
-      document.getElementById('brief').innerHTML = '';
-      loadBrief();
-    }
-  }
-  renderHead(); renderTasks(); renderCommits(); renderProgress(); updateTitle();
-  await Promise.all([loadFeed(), loadReport()]);
-}
-
-function renderHead() {
-  const d = ui.detail, s = d.settings, r = d.runner;
-  const cost = d.tasks.reduce((sum, t) => sum + (t.cost || 0), 0);
-  const end = d.finishedAt ? parseLocal(d.finishedAt) : new Date();
-  const started = parseLocal(d.startedAt);
-  let process = 'process check pending';
-  if (r.known) process = r.alive ? `runner pid ${r.pid}${r.session ? ', session alive' : ', no session process'}` : 'no runner process';
-  const missing = d.tasks.filter(t => !t.hasBrief).map(t => t.id);
-  document.getElementById('head').innerHTML = `
-    <div class="head-title">${esc(ui.selected.project)} <span class="muted">${esc(ui.selected.run)}</span> ${badge(d.state)}</div>
-    <div class="facts">
-      <span>model <b>${esc(s.model || 'default')}</b></span><span>effort <b>${esc(s.effort || 'default')}</b></span>
-      <span>mode <b>${esc(s.permissionMode)}</b></span><span>workDir <b>${esc(s.workDir)}</b></span>
-      ${started ? `<span>started <b>${esc(d.startedAt)}</b></span><span>elapsed <b>${dur(end - started)}</b></span>` : ''}
-      ${cost ? `<span>cost <b>${money(cost)}</b></span>` : ''}
-      <span>${esc(process)} <span class="muted">(${ago(d.livenessAt) || 'n/a'})</span></span>
+  <main>
+    <div class="offline" id="offline" role="status"></div>
+    <section class="panel" id="head" aria-label="Run"><p class="empty">Select a run.</p></section>
+    <section class="panel scene-panel" aria-labelledby="scene-title">
+      <h2 id="scene-title">Office</h2>
+      <div class="scene" id="scene"></div>
+    </section>
+    <details class="panel section">
+      <summary>Commits during the run <span class="muted" id="commits-note"></span></summary>
+      <div class="section-body" id="commits"></div>
+    </details>
+    <details class="panel section">
+      <summary>progress.log <span class="muted" id="progress-note"></span></summary>
+      <div class="section-body"><pre class="plain" id="progress"></pre></div>
+    </details>
+  </main>
+  <section class="drawer" id="drawer" role="dialog" aria-labelledby="drawer-title" tabindex="-1" hidden>
+    <div class="drawer-head">
+      <div class="drawer-bar">
+        <h2 class="drawer-title" id="drawer-title"></h2>
+        <button type="button" class="btn drawer-close" aria-label="Close">&times;</button>
+      </div>
+      <div class="drawer-facts"></div>
     </div>
-    ${d.preflight ? `<div class="facts" style="margin-top:4px"><span>preflight: <b>${esc(d.preflight)}</b></span></div>` : ''}
-    ${missing.length ? `<div class="warning">⚠ Missing briefs: ${esc(missing.join(', '))}</div>` : ''}`;
-}
-
-function renderTasks() {
-  const rows = ui.detail.tasks.map(t => {
-    const start = parseLocal(t.start), end = t.end ? parseLocal(t.end) : (t.state === 'running' ? new Date() : null);
-    const activity = t.state === 'running' || t.state === 'no-session' ? ago(t.lastActivity) : '';
-    return `<tr data-id="${esc(t.id)}" class="${t.id === ui.task ? 'selected' : ''}">
-      <td class="num">${t.index}</td>
-      <td>${esc(t.title)}${t.reason ? `<div class="reason">${esc(t.reason)}</div>` : ''}${t.hasPrevious ? '<div class="reason">earlier attempt failed (previous report kept)</div>' : ''}</td>
-      <td>${badge(t.state)}</td>
-      <td class="num">${hm(t.start)}</td><td class="num">${hm(t.end)}</td>
-      <td class="num">${start && end ? dur(end - start) : ''}</td>
-      <td class="num">${money(t.cost)}</td>
-      <td class="num muted">${esc(activity)}</td></tr>`;
-  }).join('');
-  document.getElementById('tasks').innerHTML = `<table><thead><tr><th>#</th><th>Task</th><th>State</th><th>Start</th><th>End</th><th>Duration</th><th>Cost</th><th>Last activity</th></tr></thead><tbody>${rows}</tbody></table>`;
-}
-
-function renderCommits() {
-  const c = ui.detail.commits, el = document.getElementById('commits');
-  if (!c) { el.innerHTML = '<p class="empty">The run has not started.</p>'; return; }
-  if (c.error) { el.innerHTML = `<p class="empty">git log failed: ${esc(c.error)}</p>`; return; }
-  el.innerHTML = c.commits.length ? c.commits.map(x => `<div class="commit"><span class="hash">${esc(x.hash)}</span>
-    <span class="date muted">${esc(x.date)}</span><span>${esc(x.subject)} <span class="ref">${esc(x.ref)} · ${esc(x.author)}</span></span></div>`).join('')
-    : '<p class="empty">No commits in the run window.</p>';
-}
-
-function renderProgress() {
-  document.getElementById('progress').textContent = ui.detail.progress.map(l => `${l.time}  ${l.message}`).join('\n') || '(empty)';
-}
-
-function updateTitle() {
-  const d = ui.detail;
-  const done = d.tasks.filter(t => t.state === 'done').length;
-  const icon = d.state === 'done' ? '✓' : BAD.has(d.state) ? '✗' : d.state === 'running' ? '▶' : '·';
-  const label = BAD.has(d.state) ? ` ${STATE_LABEL[d.state]}` : '';
-  document.title = `${icon} ${done}/${d.tasks.length}${label} · ${ui.selected.project}`;
-}
-
-function selectTask(id) {
-  ui.pinned = true;
-  if (ui.task === id) return;
-  ui.task = id; ui.feed = null; ui.reportKey = null;
-  document.getElementById('brief').innerHTML = '';
-  renderTasks(); loadFeed(); loadReport();
-  if (document.getElementById('brief-section').open) loadBrief();
-}
-
-// --- Activity feed ---
-
-async function loadFeed() {
-  const task = ui.detail && ui.detail.tasks.find(t => t.id === ui.task);
-  const el = document.getElementById('feed');
-  if (!task) return;
-  document.getElementById('feed-title').innerHTML = `Activity <span class="muted">· ${esc(task.id)} ${esc(task.title)}</span>`;
-  if (!ui.feed || ui.feed.task !== task.id) {
-    ui.feed = { task: task.id, offset: 0, groups: new Map() };
-    el.innerHTML = '';
-  }
-  const feed = ui.feed;
-  if (feed.loading) return;
-  feed.loading = true;
-  try {
-    const data = await getJson(`/api/feed?${q({ ...ui.selected, task: task.id, offset: feed.offset })}`);
-    if (ui.feed !== feed) return;
-    if (data.reset) { feed.offset = 0; feed.groups.clear(); el.innerHTML = ''; return; }
-    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
-    for (const item of data.items) appendItem(el, feed, item);
-    feed.offset = data.offset;
-    if (!el.childElementCount) el.innerHTML = `<p class="empty">${data.missing ? 'No session log yet.' : 'Nothing to show yet.'}</p>`;
-    else if (data.items.length && atBottom) el.scrollTop = el.scrollHeight;
-  } finally { feed.loading = false; }
-}
-
-function appendItem(el, feed, item) {
-  const empty = el.querySelector(':scope > .empty');
-  if (empty) empty.remove();
-  const time = item.ts ? new Date(item.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '';
-  const ts = time ? `<span class="ts">${time}</span>` : '';
-  let html = '';
-  switch (item.k) {
-    case 'session': html = `<div class="session-sep">Session · ${esc(item.t)}</div>`; break;
-    case 'init': html = `<div class="session-sep">${esc(item.t)}</div>`; break;
-    case 'text': html = `<div class="item">${ts}${md(item.t)}</div>`; break;
-    case 'tool': html = `<div class="item tool">${ts}<span class="name">${esc(item.name)}</span> ${esc(item.t)}</div>`; break;
-    case 'result': html = `<div class="result-item${item.error ? ' error' : ''}"><b>${item.error ? 'Session ended with an error' : 'Session finished'}</b>
-      <span class="muted">· ${item.turns ?? '?'} turns · ${dur(item.ms)} · ${money(item.cost)}</span>${md(item.t)}</div>`; break;
-    case 'agent': {
-      const g = feed.groups.get(item.id);
-      if (g) g.querySelector('summary').textContent = `Subagent (${item.type || 'agent'}): ${item.t}`;
-      return;
-    }
-    case 'agent-end': {
-      const g = feed.groups.get(item.id);
-      if (g) g.querySelector('summary').textContent += ` · ${item.status}`;
-      return;
-    }
-    case 'raw': html = `<div class="item tool">${esc(item.t)}</div>`; break;
-    default: return;
-  }
-  let target = el;
-  if (item.sub) {
-    target = feed.groups.get(item.sub);
-    if (!target) target = makeGroup(el, feed, item.sub, 'Subagent');
-    target = target.querySelector('.body');
-  }
-  target.insertAdjacentHTML('beforeend', html);
-  if (item.k === 'tool' && (item.name === 'Agent' || item.name === 'Task') && !item.sub) makeGroup(el, feed, item.id, `Subagent: ${item.t}`);
-}
-
-function makeGroup(el, feed, id, label) {
-  const g = document.createElement('details');
-  g.className = 'agent';
-  g.innerHTML = `<summary>${esc(label)}</summary><div class="body"></div>`;
-  el.appendChild(g);
-  feed.groups.set(id, g);
-  return g;
-}
-
-// --- Report and brief ---
-
-async function loadReport() {
-  const task = ui.detail && ui.detail.tasks.find(t => t.id === ui.task);
-  if (!task) return;
-  const reportKey = `${task.id}|${task.resultMtime}|${task.hasPrevious}`;
-  if (ui.reportKey === reportKey) return;
-  ui.reportKey = reportKey;
-  const el = document.getElementById('report');
-  document.getElementById('report-title').innerHTML = `Report <span class="muted">· ${esc(task.id)}</span>`;
-  let html = '';
-  if (task.resultMtime) {
-    const r = await fetch(`/api/file?${q({ ...ui.selected, task: task.id, kind: 'result' })}`).then(x => x.ok ? x.json() : null);
-    html = r ? md(r.text) : '<p class="empty">The report could not be read.</p>';
-  } else html = '<p class="empty">No report yet.</p>';
-  if (task.hasPrevious) html += `<details class="section" style="margin-top:10px"><summary>Earlier attempt's report</summary><div data-previous></div></details>`;
-  if (ui.task !== task.id) return;
-  el.innerHTML = html;
-  const prev = el.querySelector('details');
-  if (prev) prev.addEventListener('toggle', async () => {
-    const box = prev.querySelector('[data-previous]');
-    if (!prev.open || box.childElementCount) return;
-    const r = await fetch(`/api/file?${q({ ...ui.selected, task: task.id, kind: 'previous' })}`).then(x => x.ok ? x.json() : null);
-    box.innerHTML = r ? md(r.text) : '<p class="empty">Missing.</p>';
-  });
-}
-
-async function loadBrief() {
-  const section = document.getElementById('brief-section');
-  if (!section.open || !ui.task) return;
-  const r = await fetch(`/api/file?${q({ ...ui.selected, task: ui.task, kind: 'brief' })}`).then(x => x.ok ? x.json() : null);
-  document.getElementById('brief').innerHTML = r ? md(r.text) : '<p class="empty">No brief file for this task.</p>';
-}
-
-// --- Polling ---
-
-function safe(fn) { return () => fn().catch(err => console.warn(err)); }
-safe(loadRuns)();
-setInterval(safe(loadRuns), 4000);
-setInterval(safe(loadRun), 2000);
-</script>
+    <div class="tabs" role="tablist" aria-label="Task">
+      <button type="button" role="tab" id="tab-activity" data-tab="activity" aria-controls="panel-activity" aria-selected="true">Activity</button>
+      <button type="button" role="tab" id="tab-report" data-tab="report" aria-controls="panel-report" aria-selected="false" tabindex="-1">Report</button>
+      <button type="button" role="tab" id="tab-brief" data-tab="brief" aria-controls="panel-brief" aria-selected="false" tabindex="-1">Brief</button>
+    </div>
+    <div class="tab-panel feed" id="panel-activity" role="tabpanel" aria-labelledby="tab-activity" tabindex="0"></div>
+    <div class="tab-panel" id="panel-report" role="tabpanel" aria-labelledby="tab-report" tabindex="0" hidden></div>
+    <div class="tab-panel" id="panel-brief" role="tabpanel" aria-labelledby="tab-brief" tabindex="0" hidden></div>
+  </section>
+</div>
 </body>
 </html>

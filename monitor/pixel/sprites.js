@@ -3,8 +3,9 @@
 // theme changes.
 
 // Workers are 16x16, painted in layers: the body, then a hair style, then the eyes of a frame. A layer's
-// '.' leaves what is under it. Keys: o outline, s skin, S mouth, e eyes, h hair, c shirt, p trousers,
-// k shoes.
+// '.' leaves what is under it; a frame may then swap whole rows (legs, arms) or squash the body. Keys:
+// o outline, s skin, S mouth, e eyes, h hair, c shirt, p trousers, k shoes. Frames face right; a sprite
+// asked for mirrored faces left.
 const _ = '................';
 const BODY = [
   _,
@@ -81,9 +82,71 @@ const HAIR = {
 };
 const EYES = {
   open: [_, _, _, _, _, _, _, '......e..e......'],
+  ahead: [_, _, _, _, _, _, _, '.......e..e.....'],   // looking the way it walks
+  blink: [_, _, _, _, _, _, _, '.....ee..ee.....'],
   shut: [_, _, _, _, _, _, _, _, '.....ee..ee.....'],
 };
-const FRAME_EYES = { stand: 'open', sleep: 'shut' };
+// Rows 14-15 while walking: a stride, then the legs passing each other.
+const STRIDE = ['..opppo..opppo..', '.okko......okko.'];
+const PASSING = ['....oppppppo....', '....okkookko....'];
+// Arms raised beside the head (rows 5-10), over a torso without hands (rows 11-13).
+const ARMS_UP = [
+  _, _, _, _, _,
+  '.o............o.',
+  'oso..........oso',
+  'oso..........oso',
+  'oco..........oco',
+  '.oco........oco.',
+  '..oco......oco..',
+];
+const TORSO = ['...occcccccco...', '...occcccccco...', '...occcccccco...'];
+// stand, blink and bob idle; type at the desk with the hands sprite; sleep and sleep-bob breathe; walk1
+// and walk2 walk; cheer has the arms up, to celebrate or to call for help.
+const WORKER_FRAMES = {
+  'stand': { eyes: 'open' },
+  'blink': { eyes: 'blink' },
+  'bob': { eyes: 'open', squash: true },
+  'sleep': { eyes: 'shut' },
+  'sleep-bob': { eyes: 'shut', squash: true },
+  'walk1': { eyes: 'ahead', legs: STRIDE },
+  'walk2': { eyes: 'ahead', legs: PASSING },
+  'cheer': { eyes: 'open', arms: true },
+};
+
+// The typing hands on the keyboard, one hand lower than the other in turn. Key: s skin.
+const HANDS = [
+  ['..........ss..', '..ss......ss..', '..ss..........'],
+  ['..ss..........', '..ss......ss..', '..........ss..'],
+];
+
+// Helpers, the desk task's subagents, are 10x12 in a cap of the accent colour. Keys as for workers,
+// plus a for the cap.
+const HELPER = [
+  '..oooooo..',
+  '.oaaaaaao.',
+  'oaaaaaaaao',
+  '.osssssso.',
+  '.osesseso.',
+  '.ossSSsso.',
+  '..oooooo..',
+  '.occcccco.',
+  'osccccccso',
+  '.occcccco.',
+  '.oppooppo.',
+  '.okkookko.',
+];
+const HELPER_FRAMES = {
+  'stand': {},
+  'bob': { squash: true },
+  'walk1': { eyes: '.ossesseo.', legs: ['oppo..oppo', 'okko..okko'] },
+  'walk2': { eyes: '.ossesseo.', legs: ['..oppppo..', '..okkkko..'] },
+};
+
+// Confetti pieces, in colours that read on the light and the dark floor alike.
+const CONFETTI = [
+  { color: '#e8505b', rows: ['xx'] }, { color: '#f6c445', rows: ['x', 'x'] }, { color: '#3fb27f', rows: ['xx'] },
+  { color: '#4a8fe7', rows: ['x'] }, { color: '#a86ce0', rows: ['x', 'x'] }, { color: '#ff8f3f', rows: ['xx'] },
+];
 
 // A worker's look comes from these palettes, chosen to read on the light and the dark floor alike.
 const SKINS = [
@@ -98,6 +161,29 @@ const STYLES = Object.keys(HAIR);
 const doorRow = inner => `od${inner}do`;
 const doorPanel = [doorRow(`ww${'d'.repeat(14)}ww`), ...Array(10).fill(doorRow(`wwd${'w'.repeat(12)}dww`)), doorRow(`ww${'d'.repeat(14)}ww`)];
 const windowRow = (left = 'b'.repeat(13), right = 'b'.repeat(13)) => `of${left}ff${right}fo`;
+// A monitor showing three lines of text: while someone types, the text scrolls between two screens.
+const monitorRows = lines => [
+  'oooooooooooooooo',
+  'ommmmmmmmmmmmmmo',
+  'ombbbbbbbbbbbbmo',
+  ...lines.flatMap(line => [`omb${line}mo`, 'ombbbbbbbbbbbbmo']),
+  'ommmmmmmmmmmmmmo',
+  'oooooooooooooooo',
+  '......oMMo......',
+  '.....oMMMMo.....',
+  '....oooooooo....',
+];
+const MONITOR_COLORS = { o: '--scene-ink', m: '--scene-metal', M: '--scene-metal-light', b: '--scene-screen', L: '--scene-screen-line' };
+const BEACON_ROWS = [
+  '...oooo...',
+  '..orrrro..',
+  '.orrwwrro.',
+  '.orrwrrro.',
+  '.orrrrrro.',
+  'oooooooooo',
+  'ommmmmmmmo',
+  'oooooooooo',
+];
 
 const SCENE = {
   desk: {
@@ -118,25 +204,8 @@ const SCENE = {
       `.oo${'.'.repeat(38)}oo.`,
     ],
   },
-  monitor: {
-    colors: { o: '--scene-ink', m: '--scene-metal', M: '--scene-metal-light', b: '--scene-screen', L: '--scene-screen-line' },
-    rows: [
-      'oooooooooooooooo',
-      'ommmmmmmmmmmmmmo',
-      'ombbbbbbbbbbbbmo',
-      'ombLLLLbbbbbbbmo',
-      'ombbbbbbbbbbbbmo',
-      'ombLLbLLLLbbbbmo',
-      'ombbbbbbbbbbbbmo',
-      'ombbLLLbbbbbbbmo',
-      'ombbbbbbbbbbbbmo',
-      'ommmmmmmmmmmmmmo',
-      'oooooooooooooooo',
-      '......oMMo......',
-      '.....oMMMMo.....',
-      '....oooooooo....',
-    ],
-  },
+  monitor: { colors: MONITOR_COLORS, rows: monitorRows(['LLLLbbbbbbb', 'LLbLLLLbbbb', 'bLLLbbbbbbb']) },
+  'monitor-scrolled': { colors: MONITOR_COLORS, rows: monitorRows(['LLbLLLLbbbb', 'bLLLbbbbbbb', 'LLLLLbLLbbb']) },
   keyboard: {
     colors: { o: '--scene-ink', K: '--scene-metal-light' },
     rows: ['oooooooooooooo', 'oKKKKKKKKKKKKo', 'oooooooooooooo'],
@@ -207,19 +276,9 @@ const SCENE = {
       '...oooooo...',
     ],
   },
-  beacon: {
-    colors: { o: '--scene-ink', r: '--bad', w: '#ffffff', m: '--scene-metal' },
-    rows: [
-      '...oooo...',
-      '..orrrro..',
-      '.orrwwrro.',
-      '.orrwrrro.',
-      '.orrrrrro.',
-      'oooooooooo',
-      'ommmmmmmmo',
-      'oooooooooo',
-    ],
-  },
+  // The alert corner's beacon: lit while someone stands there, flashing unless motion is reduced.
+  beacon: { colors: { o: '--scene-ink', r: '--bad', w: '#ffffff', m: '--scene-metal' }, rows: BEACON_ROWS },
+  'beacon-off': { colors: { o: '--scene-ink', r: '--scene-metal', w: '--scene-metal-light', m: '--scene-metal' }, rows: BEACON_ROWS },
   check: {
     colors: { g: '--ok', w: '#ffffff' },
     rows: [
@@ -332,14 +391,59 @@ export function lookOf(id) {
   return { ...look, key: [look.skin.s, look.hair, look.style, look.shirt].join(' ') };
 }
 
-// `frame` is stand or sleep. Outline, eyes, shoes and trousers follow the theme; the look does not.
-export function workerSprite(look, frame) {
-  return cached(`worker|${look.key}|${frame}`, () => {
-    const ink = color('--scene-ink');
-    const colors = { o: ink, e: ink, k: ink, p: color('--scene-trousers'), s: look.skin.s, S: look.skin.S, h: look.hair, c: look.shirt };
-    const name = `worker ${look.style} ${frame}`;
-    return paint(name, stack(name, BODY, HAIR[look.style], EYES[FRAME_EYES[frame]]), key => colors[key]);
+// `base` with `rows` put in from row `at` on.
+function withRows(base, at, rows) {
+  return base.map((row, y) => (y >= at && y < at + rows.length ? rows[y - at] : row));
+}
+
+// The body one pixel lower over the same feet: the bob of an idle or a breathing figure.
+function squash(rows) {
+  return ['.'.repeat(rows[0].length), ...rows.slice(0, -2), rows[rows.length - 1]];
+}
+
+const mirrored = rows => rows.map(row => [...row].reverse().join(''));
+
+// Outline, eyes, shoes and trousers follow the theme; the look does not.
+function figureColors(look) {
+  const ink = color('--scene-ink');
+  return { o: ink, e: ink, k: ink, p: color('--scene-trousers'), s: look.skin.s, S: look.skin.S, h: look.hair, c: look.shirt };
+}
+
+// `frame` names one of WORKER_FRAMES; `mirror` turns the worker to face left.
+export function workerSprite(look, frame, mirror = false) {
+  return cached(`worker|${look.key}|${frame}|${mirror}`, () => {
+    const name = `worker ${look.style} ${frame}`, def = WORKER_FRAMES[frame];
+    let rows = stack(name, BODY, HAIR[look.style], EYES[def.eyes]);
+    if (def.legs) rows = withRows(rows, 14, def.legs);
+    if (def.arms) rows = withRows(stack(name, rows, ARMS_UP), 11, TORSO);
+    if (def.squash) rows = squash(rows);
+    const colors = figureColors(look);
+    return paint(name, mirror ? mirrored(rows) : rows, key => colors[key]);
   });
+}
+
+// A helper wears the skin and the shirt of `look` (see lookOf). `frame` names one of HELPER_FRAMES.
+export function helperSprite(look, frame, mirror = false) {
+  return cached(`helper|${look.key}|${frame}|${mirror}`, () => {
+    const def = HELPER_FRAMES[frame];
+    let rows = HELPER;
+    if (def.eyes) rows = withRows(rows, 4, [def.eyes]);
+    if (def.legs) rows = withRows(rows, 10, def.legs);
+    if (def.squash) rows = squash(rows);
+    const colors = { ...figureColors(look), a: color('--accent') };
+    return paint(`helper ${frame}`, mirror ? mirrored(rows) : rows, key => colors[key]);
+  });
+}
+
+// The desk worker's hands on the keyboard; `frame` is 0 or 1.
+export function handsSprite(look, frame) {
+  return cached(`hands|${look.key}|${frame}`, () => paint('hands', HANDS[frame], () => look.skin.s));
+}
+
+// The `piece`-th piece of confetti; the pieces repeat.
+export function confettiSprite(piece) {
+  const kind = piece % CONFETTI.length, def = CONFETTI[kind];
+  return cached(`confetti|${kind}`, () => paint('confetti', def.rows, () => def.color));
 }
 
 export function sceneSprite(name) {
