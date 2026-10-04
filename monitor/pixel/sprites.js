@@ -1,48 +1,98 @@
 // The art. A sprite is a text matrix: one character per pixel, '.' transparent, any other character a
-// palette key. Each sprite is painted once into an offscreen canvas and cached.
+// palette key. Each sprite is painted once per palette into an offscreen canvas, and cached until the
+// theme changes.
 
-// Workers: 16x16. Keys: o outline, h hair, s skin, S mouth, e eyes, c shirt, p trousers, k shoes.
-const WORKER = {
-  stand: [
-    '................',
-    '.....oooooo.....',
-    '....ohhhhhho....',
-    '...ohhhhhhhho...',
-    '..ohhhhhhhhhho..',
-    '..ohhhsssshhho..',
-    '..ohssssssssho..',
-    '..osssessessso..',
-    '..osssssssssso..',
-    '...osssSSssso...',
-    '....oooooooo....',
-    '...occcccccco...',
-    '..occcccccccco..',
-    '..osoccccccoso..',
-    '...opppoopppo...',
-    '...okko..okko...',
+// Workers are 16x16, painted in layers: the body, then a hair style, then the eyes of a frame. A layer's
+// '.' leaves what is under it. Keys: o outline, s skin, S mouth, e eyes, h hair, c shirt, p trousers,
+// k shoes.
+const _ = '................';
+const BODY = [
+  _,
+  '.....oooooo.....',
+  '....osssssso....',
+  '...osssssssso...',
+  '..osssssssssso..',
+  '..osssssssssso..',
+  '..osssssssssso..',
+  '..osssssssssso..',
+  '..osssssssssso..',
+  '...osssSSssso...',
+  '....oooooooo....',
+  '...occcccccco...',
+  '..occcccccccco..',
+  '..osoccccccoso..',
+  '...opppoopppo...',
+  '...okko..okko...',
+];
+const HAIR = {
+  short: [
+    _, _,
+    '.....hhhhhh.....',
+    '....hhhhhhhh....',
+    '...hhhhhhhhhh...',
+    '...hhh....hhh...',
+    '...h........h...',
   ],
-  sleep: [
-    '................',
-    '.....oooooo.....',
-    '....ohhhhhho....',
+  long: [
+    _, _,
+    '.....hhhhhh.....',
+    '....hhhhhhhh....',
+    '...hhhhhhhhhh...',
+    '.ohhhhh..hhhhho.',
+    '.ohhh......hhho.',
+    '.ohh........hho.',
+    '.ohh........hho.',
+    '.ohh........hho.',
+    '.ohh........hho.',
+    '.ohho......ohho.',
+    '..oo........oo..',
+  ],
+  spiky: [
+    '.....o.oo.o.....',
+    '....ohohhoho....',
     '...ohhhhhhhho...',
-    '..ohhhhhhhhhho..',
-    '..ohhhsssshhho..',
-    '..ohssssssssho..',
-    '..osssssssssso..',
-    '..osseesseesso..',
-    '...osssSSssso...',
-    '....oooooooo....',
-    '...occcccccco...',
-    '..occcccccccco..',
-    '..osoccccccoso..',
-    '...opppoopppo...',
-    '...okko..okko...',
+    '...ohhhhhhhho...',
+    '...hhhhhhhhhh...',
+    '...hh......hh...',
+  ],
+  bun: [
+    '......oooo......',
+    '.....ohhhho.....',
+    '.....hhhhhh.....',
+    '....hhhhhhhh....',
+    '...hhhhhhhhhh...',
+    '...hh......hh...',
+    '...h........h...',
+  ],
+  fringe: [
+    _, _,
+    '.....hhhhhh.....',
+    '....hhhhhhhh....',
+    '...hhhhhhhhhh...',
+    '...hhhhhhh.hh...',
+    '...hhhh.....h...',
+  ],
+  buzz: [
+    _, _,
+    '.....hhhhhh.....',
+    '....hhhhhhhh....',
+    '...h........h...',
   ],
 };
+const EYES = {
+  open: [_, _, _, _, _, _, _, '......e..e......'],
+  shut: [_, _, _, _, _, _, _, _, '.....ee..ee.....'],
+};
+const FRAME_EYES = { stand: 'open', sleep: 'shut' };
 
-// The one look every worker has for now.
-const LOOK = { o: '#2b2533', h: '#5b3a29', s: '#f2c7a0', S: '#b9765c', e: '#2b2533', c: '#4c7fd6', p: '#3c4250', k: '#2b2533' };
+// A worker's look comes from these palettes, chosen to read on the light and the dark floor alike.
+const SKINS = [
+  { s: '#f7d9bd', S: '#c98f73' }, { s: '#f2c7a0', S: '#b9765c' }, { s: '#e0a97e', S: '#a5654a' },
+  { s: '#c1855a', S: '#874f35' }, { s: '#93603d', S: '#5e3825' }, { s: '#6e472c', S: '#422819' },
+];
+const HAIRS = ['#2e2523', '#a9adb5', '#7a4b2a', '#b5793d', '#e2c271', '#b9502d', '#4f3123'];
+const SHIRTS = ['#4c7fd6', '#2e9d8f', '#8a5cc8', '#e0883a', '#d8649a', '#6e9a3c', '#c9a227', '#5d6f96'];
+const STYLES = Object.keys(HAIR);
 
 // Furniture and markers: `colors` maps each key to a colour token (a CSS custom property) or a colour.
 const doorRow = inner => `od${inner}do`;
@@ -244,8 +294,52 @@ function cached(cacheKey, build) {
   return canvas;
 }
 
-export function workerSprite(frame) {
-  return cached(`worker|${frame}`, () => paint(frame, WORKER[frame], key => LOOK[key]));
+// Drops every sprite and colour token read so far: the next draw paints them in the current theme.
+export function resetSprites() {
+  cache.clear();
+  tokens.clear();
+}
+
+// Paints `layers` over `base`, all text matrices of the same size.
+function stack(name, base, ...layers) {
+  const rows = base.map(row => [...row]);
+  for (const layer of layers) {
+    layer.forEach((row, y) => {
+      if (row.length !== rows[y].length) throw new Error(`sprite ${name}: layer row ${y} is ${row.length} wide, not ${rows[y].length}`);
+      for (let x = 0; x < row.length; x++) if (row[x] !== '.') rows[y][x] = row[x];
+    });
+  }
+  return rows.map(row => row.join(''));
+}
+
+// FNV-1a over the text, then a final mix, so ids one character apart differ in every part of the look.
+// The seed was picked so that task numbers next to each other get different shirts.
+const LOOK_SEED = 17120;
+
+function hash(text) {
+  let h = (0x811c9dc5 ^ LOOK_SEED) >>> 0;
+  for (let i = 0; i < text.length; i++) h = Math.imul(h ^ text.charCodeAt(i), 0x01000193);
+  h = Math.imul(h ^ (h >>> 16), 0x85ebca6b);
+  h = Math.imul(h ^ (h >>> 13), 0xc2b2ae35);
+  return (h ^ (h >>> 16)) >>> 0;
+}
+
+// A worker's look depends on its task id alone, so a given task number looks the same in every run.
+export function lookOf(id) {
+  let h = hash(String(id));
+  const pick = list => { const item = list[h % list.length]; h = Math.floor(h / list.length); return item; };
+  const look = { skin: pick(SKINS), hair: pick(HAIRS), style: pick(STYLES), shirt: pick(SHIRTS) };
+  return { ...look, key: [look.skin.s, look.hair, look.style, look.shirt].join(' ') };
+}
+
+// `frame` is stand or sleep. Outline, eyes, shoes and trousers follow the theme; the look does not.
+export function workerSprite(look, frame) {
+  return cached(`worker|${look.key}|${frame}`, () => {
+    const ink = color('--scene-ink');
+    const colors = { o: ink, e: ink, k: ink, p: color('--scene-trousers'), s: look.skin.s, S: look.skin.S, h: look.hair, c: look.shirt };
+    const name = `worker ${look.style} ${frame}`;
+    return paint(name, stack(name, BODY, HAIR[look.style], EYES[FRAME_EYES[frame]]), key => colors[key]);
+  });
 }
 
 export function sceneSprite(name) {
