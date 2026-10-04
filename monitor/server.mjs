@@ -307,8 +307,20 @@ function runDirFrom(query) {
 
 const STATIC = {
     '/': ['index.html', 'text/html; charset=utf-8'],
+    '/preview': ['preview.html', 'text/html; charset=utf-8'],
     '/marked.min.js': ['marked.min.js', 'text/javascript; charset=utf-8'],
 };
+
+// Browser modules of the pixel page. The name is checked before anything touches the disk,
+// so dots, slashes, backslashes and percent-encoded sequences never reach a file path.
+const MODULE_RE = /^\/pixel\/([a-z0-9-]+)\.js$/;
+
+function moduleFile(pathname) {
+    const name = MODULE_RE.exec(pathname)?.[1];
+    if (!name) return null;
+    const file = path.join(HERE, 'pixel', `${name}.js`);
+    return statOrNull(file)?.isFile() ? file : null;
+}
 
 async function handle(req, res) {
     const url = new URL(req.url, URL_BASE);
@@ -319,6 +331,10 @@ async function handle(req, res) {
 
     const asset = STATIC[url.pathname];
     if (asset) return send(res, 200, fs.readFileSync(path.join(HERE, asset[0])), asset[1]);
+    if (url.pathname.startsWith('/pixel/')) {
+        const file = moduleFile(url.pathname);
+        return file ? send(res, 200, fs.readFileSync(file), 'text/javascript; charset=utf-8') : send(res, 404, { error: 'not found' });
+    }
 
     if (url.pathname === '/api/health') return send(res, 200, { ok: true, root: ROOT });
 

@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Task Queue Monitor</title>
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --line: #e2e5ea; --text: #1d2330; --muted: #6a7282;
+  --accent: #2f6fde; --ok: #1f8a4c; --bad: #c8382f; --warn: #b7791f; --idle: #8a919e;
+  --code: #f0f2f5; --hover: #eef2fb; --sel: #e3ebfb;
+  --frame: #3b4252; --shadow: rgba(29, 35, 48, .2);
+  --mono: ui-monospace, "Cascadia Code", Consolas, monospace;
+  /* Scene surfaces; sprites read them when their cache is built. */
+  --scene-ink: #2b2533; --scene-wall: #e9e3d6; --scene-wall-trim: #cbbfa6; --scene-ceiling: #d8cfbd;
+  --scene-floor: #dcc6a2; --scene-floor-line: #cdb48c; --scene-wood: #b47c45; --scene-wood-dark: #855631;
+  --scene-metal: #5d6474; --scene-metal-light: #8d95a5; --scene-screen: #79d2ef; --scene-screen-line: #3a9fc4;
+  --scene-sky: #c4e6f8; --scene-cloud: #ffffff; --scene-leaf: #5aa05e; --scene-leaf-dark: #3f7d45; --scene-pot: #bb6a40;
+  --scene-rug: #cfe7d2; --scene-rug-edge: #8fc69c; --scene-alert-floor: #f1d2cc; --scene-hazard: #f0c23e;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14171c; --panel: #1b1f26; --line: #2c323c; --text: #e3e7ee; --muted: #9098a6;
+    --accent: #6c9cf0; --ok: #46b97a; --bad: #ec6a60; --warn: #e0a64a; --idle: #7c8492;
+    --code: #232833; --hover: #222833; --sel: #26324a;
+    --frame: #59627a; --shadow: rgba(0, 0, 0, .45);
+  }
+}
+* { box-sizing: border-box; }
+/* A page scrollbar coming and going must not change the scene's width, or its scale would flip back and forth. */
+html { scrollbar-gutter: stable; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 "Segoe UI", system-ui, sans-serif; }
+.sr-only { position: absolute; width: 1px; height: 1px; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+
+/* Pixel chrome: square corners, 2 px borders, stepped block shadows, monospace uppercase headings and badges. */
+h1, h2, .badge, .sign { font-family: var(--mono); text-transform: uppercase; letter-spacing: .05em; }
+button { font: inherit; color: inherit; }
+.badge { display: inline-block; padding: 1px 6px; font-size: 11px; font-weight: 700; border: 2px solid rgba(0, 0, 0, .22); white-space: nowrap; }
+.badge, .sign { color: #fff; background: var(--idle); }
+.s-running { background: var(--accent); }
+.s-done { background: var(--ok); }
+.s-failed, .s-stopped, .s-preflight-failed { background: var(--bad); }
+.s-interrupted, .s-no-session { background: var(--warn); }
+.muted { color: var(--muted); }
+.empty { color: var(--muted); font-style: italic; }
+
+.layout { display: grid; grid-template-columns: 290px 1fr; min-height: 100vh; }
+aside { background: var(--panel); border-right: 2px solid var(--frame); padding: 14px 0; overflow-y: auto; max-height: 100vh; position: sticky; top: 0; }
+aside h1 { font-size: 14px; margin: 0 16px 4px; }
+.root { color: var(--muted); font-size: 12px; margin: 0 16px 12px; word-break: break-all; }
+.runs { display: grid; gap: 6px; padding: 0 12px; }
+.run-item { display: block; width: 100%; text-align: left; padding: 7px 10px; cursor: pointer; background: var(--panel);
+  border: 2px solid var(--line); box-shadow: 2px 2px 0 var(--shadow); }
+.run-item:hover { background: var(--hover); }
+.run-item[aria-current="true"] { background: var(--sel); border-color: var(--accent); box-shadow: 2px 2px 0 var(--shadow), 4px 4px 0 var(--shadow); }
+.run-item:active { transform: translate(2px, 2px); box-shadow: none; }
+.run-item:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.run-item .name { display: block; font-weight: 600; overflow-wrap: anywhere; }
+.run-item .meta { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; color: var(--muted); font-size: 12px; margin-top: 2px; }
+
+main { padding: 16px 20px 40px; min-width: 0; }
+.panel { background: var(--panel); border: 2px solid var(--frame); padding: 12px 14px; margin-bottom: 16px;
+  box-shadow: 2px 2px 0 var(--shadow), 4px 4px 0 var(--shadow); }
+.panel h2 { font-size: 13px; margin: 0 0 10px; display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.panel h2 .muted { text-transform: none; letter-spacing: 0; font-weight: 500; }
+
+/* The office: a canvas drawn at world resolution and scaled by an integer factor, with a DOM overlay on top. */
+.scene { overflow-x: auto; }
+.stage { position: relative; margin: 0 auto; }
+.stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; image-rendering: crisp-edges; image-rendering: pixelated; pointer-events: none; }
+.sign { position: absolute; transform: translateX(-50%); padding: 3px 8px; font-size: max(10px, calc(var(--px) * 3.5px)); line-height: 1.2;
+  font-weight: 700; border: 2px solid var(--frame); box-shadow: 2px 2px 0 var(--shadow); white-space: nowrap; }
+/* A name tag never cuts its number; the title gets what room is left. */
+.tag { position: absolute; display: grid; grid-template-columns: auto minmax(0, 1fr); column-gap: .4em; min-width: min-content;
+  transform: translate(-50%, -100%); padding: 0 2px; font: 600 clamp(9px, calc(var(--px) * 3.4px), 13px)/1.2 var(--mono);
+  background: var(--panel); color: var(--text); border: 2px solid var(--frame); white-space: nowrap; pointer-events: none; }
+.tag span { overflow: hidden; text-overflow: ellipsis; }
+.worker { position: absolute; padding: 0; margin: 0; border: 0; background: transparent; cursor: default; }
+.worker:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+@media (max-width: 760px) {
+  .layout { grid-template-columns: 1fr; }
+  aside { position: static; max-height: none; border-right: 0; border-bottom: 2px solid var(--frame); }
+  main { padding: 12px 16px 32px; }
+  .scene-panel { padding: 10px 0; }
+  .scene-panel h2 { margin: 0 12px 10px; }
+}
+</style>
+<script type="module" src="/pixel/main.js"></script>
+</head>
+<body>
+<div class="layout">
+  <aside>
+    <h1>Task queues</h1>
+    <div class="root" id="root"></div>
+    <nav class="runs" id="runs" aria-label="Runs"></nav>
+  </aside>
+  <main>
+    <section class="panel scene-panel" aria-labelledby="scene-title">
+      <h2 id="scene-title">Office</h2>
+      <div class="scene" id="scene"><p class="empty">Select a run.</p></div>
+    </section>
+  </main>
+</div>
+</body>
+</html>
