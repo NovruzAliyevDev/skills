@@ -1,0 +1,407 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Task Queue Monitor</title>
+<script src="/marked.min.js"></script>
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --line: #e2e5ea; --text: #1d2330; --muted: #6a7282;
+  --accent: #2f6fde; --ok: #1f8a4c; --bad: #c8382f; --warn: #b7791f; --idle: #8a919e;
+  --code: #f0f2f5; --hover: #eef2fb; --sel: #e3ebfb;
+  --mono: ui-monospace, "Cascadia Code", Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14171c; --panel: #1b1f26; --line: #2c323c; --text: #e3e7ee; --muted: #9098a6;
+    --accent: #6c9cf0; --ok: #46b97a; --bad: #ec6a60; --warn: #e0a64a; --idle: #7c8492;
+    --code: #232833; --hover: #222833; --sel: #26324a;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 "Segoe UI", system-ui, sans-serif; }
+.layout { display: grid; grid-template-columns: 290px 1fr; min-height: 100vh; }
+aside { border-right: 1px solid var(--line); background: var(--panel); padding: 12px 0; overflow-y: auto; max-height: 100vh; position: sticky; top: 0; }
+aside h1 { font-size: 15px; margin: 0 16px 4px; }
+.root { color: var(--muted); font-size: 12px; margin: 0 16px 10px; word-break: break-all; }
+.notify-btn { margin: 0 16px 12px; }
+.run-item { padding: 8px 16px; cursor: pointer; border-left: 3px solid transparent; }
+.run-item:hover { background: var(--hover); }
+.run-item.selected { background: var(--sel); border-left-color: var(--accent); }
+.run-item .name { font-weight: 600; }
+.run-item .meta { color: var(--muted); font-size: 12px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+main { padding: 16px 20px 40px; min-width: 0; }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; margin-bottom: 14px; }
+.panel h2 { font-size: 14px; margin: 0 0 10px; display: flex; gap: 8px; align-items: center; }
+.head-title { font-size: 18px; font-weight: 650; margin: 0 0 6px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.facts { display: flex; flex-wrap: wrap; gap: 4px 18px; color: var(--muted); font-size: 13px; }
+.facts b { color: var(--text); font-weight: 500; }
+.warning { color: var(--warn); font-size: 13px; margin-top: 6px; }
+.badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; font-weight: 600; color: #fff; background: var(--idle); white-space: nowrap; }
+.s-running { background: var(--accent); }
+.s-done { background: var(--ok); }
+.s-failed, .s-stopped, .s-preflight-failed { background: var(--bad); }
+.s-interrupted, .s-no-session { background: var(--warn); }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 500; font-size: 12px; }
+td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
+tbody tr { cursor: pointer; }
+tbody tr:hover { background: var(--hover); }
+tbody tr.selected { background: var(--sel); }
+.reason { color: var(--muted); font-size: 12px; }
+.feed { max-height: 60vh; overflow-y: auto; font-size: 13px; }
+.item { padding: 4px 0; border-bottom: 1px dashed var(--line); }
+.item:last-child { border-bottom: 0; }
+.item .ts { color: var(--muted); font-size: 11px; margin-right: 6px; font-family: var(--mono); }
+.tool { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+.tool .name { color: var(--accent); font-weight: 600; }
+.session-sep { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; padding: 8px 0 4px; }
+.result-item { border-left: 3px solid var(--ok); padding-left: 10px; margin: 6px 0; }
+.result-item.error { border-left-color: var(--bad); }
+details.agent { margin: 4px 0 4px 14px; border-left: 2px solid var(--line); padding-left: 10px; }
+details.agent > summary { cursor: pointer; font-size: 12px; color: var(--muted); }
+.md p { margin: 4px 0; }
+.md pre, pre.plain { background: var(--code); padding: 8px 10px; border-radius: 6px; overflow-x: auto; font-size: 12px; }
+.md code { font-family: var(--mono); font-size: 12px; background: var(--code); padding: 1px 4px; border-radius: 4px; }
+.md pre code { padding: 0; background: none; }
+.md table { margin: 6px 0; }
+.md h1, .md h2, .md h3 { font-size: 15px; margin: 12px 0 6px; }
+.empty { color: var(--muted); font-style: italic; }
+details.section > summary { cursor: pointer; font-weight: 600; font-size: 14px; }
+.commit { font-size: 13px; padding: 3px 0; display: grid; grid-template-columns: 76px 150px 1fr; gap: 8px; }
+.commit .hash { font-family: var(--mono); color: var(--accent); }
+.commit .ref { color: var(--muted); font-size: 12px; }
+button { font: inherit; font-size: 12px; padding: 3px 10px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel); color: var(--text); cursor: pointer; }
+button:hover { background: var(--hover); }
+.muted { color: var(--muted); }
+@media (max-width: 760px) {
+  .layout { grid-template-columns: 1fr; }
+  aside { position: static; max-height: none; border-right: 0; border-bottom: 1px solid var(--line); }
+  main { padding: 12px 16px 32px; }
+  .commit { grid-template-columns: 70px 1fr; }
+  .commit .date { display: none; }
+}
+</style>
+</head>
+<body>
+<div class="layout">
+  <aside>
+    <h1>Task queues</h1>
+    <div class="root" id="root"></div>
+    <button class="notify-btn" id="notify-btn" hidden>Enable notifications</button>
+    <div id="runs"></div>
+  </aside>
+  <main id="main"><p class="empty">Select a run.</p></main>
+</div>
+<script>
+'use strict';
+const STATE_LABEL = {
+  'pending': 'pending', 'running': 'running', 'done': 'DONE', 'failed': 'FAILED', 'stopped': 'STOPPED',
+  'interrupted': 'interrupted', 'no-session': 'runner has no session', 'not-started': 'not started',
+  'preflight-failed': 'preflight failed',
+};
+const BAD = new Set(['failed', 'stopped', 'interrupted', 'no-session', 'preflight-failed']);
+
+const ui = { runs: [], selected: null, detail: null, task: null, feed: null, reportKey: null, previousRuns: null };
+
+marked.use({
+  renderer: { html(token) { return esc(typeof token === 'string' ? token : token.text); } },
+  walkTokens(t) { if ((t.type === 'link' || t.type === 'image') && /^\s*(javascript|data|vbscript):/i.test(t.href || '')) t.href = '#'; },
+});
+
+function esc(s) { return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
+function md(text) { return `<div class="md">${marked.parse(text || '')}</div>`; }
+function badge(state) { return `<span class="badge s-${esc(state)}">${esc(STATE_LABEL[state] || state)}</span>`; }
+function parseLocal(stamp) { if (!stamp) return null; const [d, t] = stamp.split(' '); const [y, mo, da] = d.split('-').map(Number); const [h, mi, s] = t.split(':').map(Number); return new Date(y, mo - 1, da, h, mi, s); }
+function hm(stamp) { return stamp ? stamp.slice(11, 16) : ''; }
+function dur(ms) { if (ms == null || ms < 0) return ''; const m = Math.floor(ms / 60000), h = Math.floor(m / 60); return h ? `${h}h ${m % 60}m` : `${m}m`; }
+function ago(ms) { if (!ms) return ''; const s = Math.round((Date.now() - ms) / 1000); return s < 60 ? `${s}s ago` : s < 3600 ? `${Math.floor(s / 60)}m ago` : `${Math.floor(s / 3600)}h ago`; }
+function money(v) { return v ? `$${v.toFixed(2)}` : ''; }
+function key(r) { return `${r.project}/${r.run}`; }
+async function getJson(url) { const r = await fetch(url, { cache: 'no-store' }); if (!r.ok) throw new Error(`${r.status} ${url}`); return r.json(); }
+function q(params) { return new URLSearchParams(params).toString(); }
+
+// --- Run list and notifications ---
+
+async function loadRuns() {
+  const data = await getJson('/api/runs');
+  document.getElementById('root').textContent = data.root;
+  ui.runs = data.runs;
+  notifyChanges(data.runs);
+  if (!ui.selected && data.runs.length) {
+    const fromHash = decodeURIComponent(location.hash.slice(1));
+    const pick = data.runs.find(r => key(r) === fromHash) || data.runs.find(r => r.state === 'running') || data.runs[0];
+    select(pick.project, pick.run);
+  }
+  renderRuns();
+}
+
+function renderRuns() {
+  document.getElementById('runs').innerHTML = ui.runs.map(r => {
+    const done = r.counts.done || 0;
+    const sel = ui.selected && key(ui.selected) === key(r) ? ' selected' : '';
+    const warn = r.missingBriefs.length ? ` <span title="missing briefs: ${esc(r.missingBriefs.join(', '))}">⚠</span>` : '';
+    return `<div class="run-item${sel}" data-key="${esc(key(r))}">
+      <div class="name">${esc(r.project)} <span class="muted">${esc(r.run)}</span>${warn}</div>
+      <div class="meta">${badge(r.state)}<span>${done}/${r.total} done</span><span>${money(r.cost)}</span></div>
+    </div>`;
+  }).join('') || '<p class="empty" style="margin:0 16px">No runs found.</p>';
+}
+
+document.getElementById('runs').addEventListener('click', e => {
+  const item = e.target.closest('.run-item');
+  if (!item) return;
+  const [project, run] = item.dataset.key.split('/');
+  select(project, run);
+});
+
+function notifyChanges(runs) {
+  const now = new Map(runs.map(r => [key(r), r]));
+  if (ui.previousRuns) {
+    for (const [k, r] of now) {
+      const before = ui.previousRuns.get(k);
+      if (!before) continue;
+      if ((r.counts.done || 0) > (before.counts.done || 0) && r.state !== 'done') notify(`Task done (${r.counts.done}/${r.total})`, k);
+      if (r.state !== before.state && r.state === 'done') notify(`Queue finished: all ${r.total} tasks DONE`, k);
+      if (r.state !== before.state && BAD.has(r.state)) notify(`Queue ${STATE_LABEL[r.state]}`, k);
+    }
+  }
+  ui.previousRuns = now;
+}
+
+function notify(title, body) {
+  if ('Notification' in window && Notification.permission === 'granted') new Notification(title, { body });
+}
+
+const notifyBtn = document.getElementById('notify-btn');
+if ('Notification' in window && Notification.permission === 'default') {
+  notifyBtn.hidden = false;
+  notifyBtn.onclick = () => Notification.requestPermission().then(() => { notifyBtn.hidden = Notification.permission !== 'default'; });
+}
+
+// --- Selected run ---
+
+function select(project, run) {
+  ui.selected = { project, run };
+  ui.detail = null; ui.task = null; ui.feed = null; ui.reportKey = null; ui.pinned = false;
+  history.replaceState(null, '', `#${encodeURIComponent(`${project}/${run}`)}`);
+  document.getElementById('main').innerHTML = `<div class="panel" id="head"></div>
+    <div class="panel"><h2>Tasks</h2><div id="tasks"></div></div>
+    <div class="panel"><h2 id="feed-title">Activity</h2><div class="feed" id="feed"></div></div>
+    <div class="panel"><h2 id="report-title">Report</h2><div id="report"></div></div>
+    <div class="panel"><h2>Commits during the run</h2><div id="commits"></div></div>
+    <div class="panel"><details class="section" id="brief-section"><summary>Brief</summary><div id="brief"></div></details></div>
+    <div class="panel"><details class="section"><summary>progress.log</summary><pre class="plain" id="progress"></pre></details></div>`;
+  document.getElementById('brief-section').addEventListener('toggle', loadBrief);
+  document.getElementById('tasks').addEventListener('click', e => {
+    const row = e.target.closest('tr[data-id]');
+    if (row) selectTask(row.dataset.id);
+  });
+  renderRuns();
+  loadRun();
+}
+
+async function loadRun() {
+  if (!ui.selected) return;
+  const sel = ui.selected;
+  const detail = await getJson(`/api/run?${q(sel)}`);
+  if (ui.selected !== sel) return;
+  ui.detail = detail;
+  // Follow the active task until the user picks one.
+  if (!ui.pinned) {
+    const running = detail.tasks.find(t => ['running', 'interrupted', 'no-session'].includes(t.state));
+    const started = [...detail.tasks].reverse().find(t => t.state !== 'pending');
+    const follow = (running || started || detail.tasks[0] || {}).id || null;
+    if (follow !== ui.task) {
+      ui.task = follow; ui.feed = null; ui.reportKey = null;
+      document.getElementById('brief').innerHTML = '';
+      loadBrief();
+    }
+  }
+  renderHead(); renderTasks(); renderCommits(); renderProgress(); updateTitle();
+  await Promise.all([loadFeed(), loadReport()]);
+}
+
+function renderHead() {
+  const d = ui.detail, s = d.settings, r = d.runner;
+  const cost = d.tasks.reduce((sum, t) => sum + (t.cost || 0), 0);
+  const end = d.finishedAt ? parseLocal(d.finishedAt) : new Date();
+  const started = parseLocal(d.startedAt);
+  let process = 'process check pending';
+  if (r.known) process = r.alive ? `runner pid ${r.pid}${r.session ? ', session alive' : ', no session process'}` : 'no runner process';
+  const missing = d.tasks.filter(t => !t.hasBrief).map(t => t.id);
+  document.getElementById('head').innerHTML = `
+    <div class="head-title">${esc(ui.selected.project)} <span class="muted">${esc(ui.selected.run)}</span> ${badge(d.state)}</div>
+    <div class="facts">
+      <span>model <b>${esc(s.model || 'default')}</b></span><span>effort <b>${esc(s.effort || 'default')}</b></span>
+      <span>mode <b>${esc(s.permissionMode)}</b></span><span>workDir <b>${esc(s.workDir)}</b></span>
+      ${started ? `<span>started <b>${esc(d.startedAt)}</b></span><span>elapsed <b>${dur(end - started)}</b></span>` : ''}
+      ${cost ? `<span>cost <b>${money(cost)}</b></span>` : ''}
+      <span>${esc(process)} <span class="muted">(${ago(d.livenessAt) || 'n/a'})</span></span>
+    </div>
+    ${d.preflight ? `<div class="facts" style="margin-top:4px"><span>preflight: <b>${esc(d.preflight)}</b></span></div>` : ''}
+    ${missing.length ? `<div class="warning">⚠ Missing briefs: ${esc(missing.join(', '))}</div>` : ''}`;
+}
+
+function renderTasks() {
+  const rows = ui.detail.tasks.map(t => {
+    const start = parseLocal(t.start), end = t.end ? parseLocal(t.end) : (t.state === 'running' ? new Date() : null);
+    const activity = t.state === 'running' || t.state === 'no-session' ? ago(t.lastActivity) : '';
+    return `<tr data-id="${esc(t.id)}" class="${t.id === ui.task ? 'selected' : ''}">
+      <td class="num">${t.index}</td>
+      <td>${esc(t.title)}${t.reason ? `<div class="reason">${esc(t.reason)}</div>` : ''}${t.hasPrevious ? '<div class="reason">earlier attempt failed (previous report kept)</div>' : ''}</td>
+      <td>${badge(t.state)}</td>
+      <td class="num">${hm(t.start)}</td><td class="num">${hm(t.end)}</td>
+      <td class="num">${start && end ? dur(end - start) : ''}</td>
+      <td class="num">${money(t.cost)}</td>
+      <td class="num muted">${esc(activity)}</td></tr>`;
+  }).join('');
+  document.getElementById('tasks').innerHTML = `<table><thead><tr><th>#</th><th>Task</th><th>State</th><th>Start</th><th>End</th><th>Duration</th><th>Cost</th><th>Last activity</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+function renderCommits() {
+  const c = ui.detail.commits, el = document.getElementById('commits');
+  if (!c) { el.innerHTML = '<p class="empty">The run has not started.</p>'; return; }
+  if (c.error) { el.innerHTML = `<p class="empty">git log failed: ${esc(c.error)}</p>`; return; }
+  el.innerHTML = c.commits.length ? c.commits.map(x => `<div class="commit"><span class="hash">${esc(x.hash)}</span>
+    <span class="date muted">${esc(x.date)}</span><span>${esc(x.subject)} <span class="ref">${esc(x.ref)} · ${esc(x.author)}</span></span></div>`).join('')
+    : '<p class="empty">No commits in the run window.</p>';
+}
+
+function renderProgress() {
+  document.getElementById('progress').textContent = ui.detail.progress.map(l => `${l.time}  ${l.message}`).join('\n') || '(empty)';
+}
+
+function updateTitle() {
+  const d = ui.detail;
+  const done = d.tasks.filter(t => t.state === 'done').length;
+  const icon = d.state === 'done' ? '✓' : BAD.has(d.state) ? '✗' : d.state === 'running' ? '▶' : '·';
+  const label = BAD.has(d.state) ? ` ${STATE_LABEL[d.state]}` : '';
+  document.title = `${icon} ${done}/${d.tasks.length}${label} · ${ui.selected.project}`;
+}
+
+function selectTask(id) {
+  ui.pinned = true;
+  if (ui.task === id) return;
+  ui.task = id; ui.feed = null; ui.reportKey = null;
+  document.getElementById('brief').innerHTML = '';
+  renderTasks(); loadFeed(); loadReport();
+  if (document.getElementById('brief-section').open) loadBrief();
+}
+
+// --- Activity feed ---
+
+async function loadFeed() {
+  const task = ui.detail && ui.detail.tasks.find(t => t.id === ui.task);
+  const el = document.getElementById('feed');
+  if (!task) return;
+  document.getElementById('feed-title').innerHTML = `Activity <span class="muted">· ${esc(task.id)} ${esc(task.title)}</span>`;
+  if (!ui.feed || ui.feed.task !== task.id) {
+    ui.feed = { task: task.id, offset: 0, groups: new Map() };
+    el.innerHTML = '';
+  }
+  const feed = ui.feed;
+  if (feed.loading) return;
+  feed.loading = true;
+  try {
+    const data = await getJson(`/api/feed?${q({ ...ui.selected, task: task.id, offset: feed.offset })}`);
+    if (ui.feed !== feed) return;
+    if (data.reset) { feed.offset = 0; feed.groups.clear(); el.innerHTML = ''; return; }
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+    for (const item of data.items) appendItem(el, feed, item);
+    feed.offset = data.offset;
+    if (!el.childElementCount) el.innerHTML = `<p class="empty">${data.missing ? 'No session log yet.' : 'Nothing to show yet.'}</p>`;
+    else if (data.items.length && atBottom) el.scrollTop = el.scrollHeight;
+  } finally { feed.loading = false; }
+}
+
+function appendItem(el, feed, item) {
+  const empty = el.querySelector(':scope > .empty');
+  if (empty) empty.remove();
+  const time = item.ts ? new Date(item.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '';
+  const ts = time ? `<span class="ts">${time}</span>` : '';
+  let html = '';
+  switch (item.k) {
+    case 'session': html = `<div class="session-sep">Session · ${esc(item.t)}</div>`; break;
+    case 'init': html = `<div class="session-sep">${esc(item.t)}</div>`; break;
+    case 'text': html = `<div class="item">${ts}${md(item.t)}</div>`; break;
+    case 'tool': html = `<div class="item tool">${ts}<span class="name">${esc(item.name)}</span> ${esc(item.t)}</div>`; break;
+    case 'result': html = `<div class="result-item${item.error ? ' error' : ''}"><b>${item.error ? 'Session ended with an error' : 'Session finished'}</b>
+      <span class="muted">· ${item.turns ?? '?'} turns · ${dur(item.ms)} · ${money(item.cost)}</span>${md(item.t)}</div>`; break;
+    case 'agent': {
+      const g = feed.groups.get(item.id);
+      if (g) g.querySelector('summary').textContent = `Subagent (${item.type || 'agent'}): ${item.t}`;
+      return;
+    }
+    case 'agent-end': {
+      const g = feed.groups.get(item.id);
+      if (g) g.querySelector('summary').textContent += ` · ${item.status}`;
+      return;
+    }
+    case 'raw': html = `<div class="item tool">${esc(item.t)}</div>`; break;
+    default: return;
+  }
+  let target = el;
+  if (item.sub) {
+    target = feed.groups.get(item.sub);
+    if (!target) target = makeGroup(el, feed, item.sub, 'Subagent');
+    target = target.querySelector('.body');
+  }
+  target.insertAdjacentHTML('beforeend', html);
+  if (item.k === 'tool' && (item.name === 'Agent' || item.name === 'Task') && !item.sub) makeGroup(el, feed, item.id, `Subagent: ${item.t}`);
+}
+
+function makeGroup(el, feed, id, label) {
+  const g = document.createElement('details');
+  g.className = 'agent';
+  g.innerHTML = `<summary>${esc(label)}</summary><div class="body"></div>`;
+  el.appendChild(g);
+  feed.groups.set(id, g);
+  return g;
+}
+
+// --- Report and brief ---
+
+async function loadReport() {
+  const task = ui.detail && ui.detail.tasks.find(t => t.id === ui.task);
+  if (!task) return;
+  const reportKey = `${task.id}|${task.resultMtime}|${task.hasPrevious}`;
+  if (ui.reportKey === reportKey) return;
+  ui.reportKey = reportKey;
+  const el = document.getElementById('report');
+  document.getElementById('report-title').innerHTML = `Report <span class="muted">· ${esc(task.id)}</span>`;
+  let html = '';
+  if (task.resultMtime) {
+    const r = await fetch(`/api/file?${q({ ...ui.selected, task: task.id, kind: 'result' })}`).then(x => x.ok ? x.json() : null);
+    html = r ? md(r.text) : '<p class="empty">The report could not be read.</p>';
+  } else html = '<p class="empty">No report yet.</p>';
+  if (task.hasPrevious) html += `<details class="section" style="margin-top:10px"><summary>Earlier attempt's report</summary><div data-previous></div></details>`;
+  if (ui.task !== task.id) return;
+  el.innerHTML = html;
+  const prev = el.querySelector('details');
+  if (prev) prev.addEventListener('toggle', async () => {
+    const box = prev.querySelector('[data-previous]');
+    if (!prev.open || box.childElementCount) return;
+    const r = await fetch(`/api/file?${q({ ...ui.selected, task: task.id, kind: 'previous' })}`).then(x => x.ok ? x.json() : null);
+    box.innerHTML = r ? md(r.text) : '<p class="empty">Missing.</p>';
+  });
+}
+
+async function loadBrief() {
+  const section = document.getElementById('brief-section');
+  if (!section.open || !ui.task) return;
+  const r = await fetch(`/api/file?${q({ ...ui.selected, task: ui.task, kind: 'brief' })}`).then(x => x.ok ? x.json() : null);
+  document.getElementById('brief').innerHTML = r ? md(r.text) : '<p class="empty">No brief file for this task.</p>';
+}
+
+// --- Polling ---
+
+function safe(fn) { return () => fn().catch(err => console.warn(err)); }
+safe(loadRuns)();
+setInterval(safe(loadRuns), 4000);
+setInterval(safe(loadRun), 2000);
+</script>
+</body>
+</html>
