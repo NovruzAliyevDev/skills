@@ -4,6 +4,7 @@
 # A session that ends without writing its report is resumed once to finish it.
 # Tasks that queue.json puts in a parallel group run at the same time, each in its own git worktree
 # and branch; when all of them are DONE, their branches are merged into the queue's branch in task order.
+# A merge that conflicts is resolved by a session of its own, the conflict session.
 # Windows PowerShell 5.1 compatible.
 
 # -ParallelTask is set by the runner itself: it starts one copy of this file per task of a parallel group.
@@ -131,6 +132,11 @@ function Test-Branch($task) {
 # What git status reports in a directory: nothing when everything there is committed.
 function Get-Uncommitted([string]$dir) { return @(Run-Git $dir @('status', '--porcelain')) }
 
+function Test-Merging {
+    Run-Git $queue.workDir @('rev-parse', '--verify', '--quiet', 'MERGE_HEAD') | Out-Null
+    return $script:gitExit -eq 0
+}
+
 # A parallel task that reported DONE but left changes uncommitted in its worktree is not done:
 # the merge would drop them. Once its branch is merged and gone, the worktree no longer counts.
 function Test-Done($task) {
@@ -202,6 +208,58 @@ function Invoke-Session([string]$label, [string]$text, [string[]]$cliArgs, [stri
     }
 }
 
+# The arguments of a session's call: a new session with that name, or with $resumeId the
+# continuation of an existing one.
+function Session-Args([string[]]$dirArgs, [string]$name, [string]$resumeId) {
+    $cliArgs = @('-p')
+    if ($resumeId) { $cliArgs += @('--resume', $resumeId) }
+    $cliArgs += @('--output-format', 'stream-json', '--verbose',
+                  '--permission-mode', $queue.permissionMode, '--permission-prompts', 'none') + $dirArgs
+    if (-not $resumeId) { $cliArgs += @('--name', $name) }
+    return $cliArgs + (Model-Args)
+}
+
+function Get-WriteTime([string]$path) {
+    if (Test-Path $path) { return (Get-Item $path).LastWriteTimeUtc }
+    return $null
+}
+
+# Runs a session to its report: the call, and the single resume when it ends without one. Returns
+# what kept it from a DONE report, or $null. A report that was already there counts only once the
+# session has written it again.
+function Run-Session([string]$label, [string]$prompt, [string[]]$cliArgs, [string[]]$dirArgs, [string]$logFile, [string]$resultFile, [string]$dir, [bool]$quiet) {
+    $writtenBefore = Get-WriteTime $resultFile
+    $exitCode = Invoke-Session $label $prompt $cliArgs $logFile $dir $quiet
+    $status = Read-Status $resultFile
+    if ($writtenBefore -and (Get-WriteTime $resultFile) -eq $writtenBefore) { $status = $null }
+
+    # A session that ended cleanly without a report stopped too early, for example by ending its
+    # turn to wait for something. Resume it once to finish the task and write the report.
+    if ($exitCode -eq 0 -and -not $script:isError -and $status -notin 'DONE', 'FAILED' -and $script:sessionId) {
+        Say "$label - no report yet, resuming the session once" 'Yellow'
+        $resumePrompt = @"
+Your session ended before you wrote $resultFile, so the task is not finished. This session is headless: it ends with your final answer, and nothing wakes it up again; whatever was still running when it ended has stopped.
+
+Finish the task now. Run again, in the foreground, whatever had not completed, then write $resultFile as your last step. Its first line is exactly DONE or FAILED. After it: what you did, how you verified it, and anything the next task or the user must know.
+"@
+        $exitCode = Invoke-Session $label $resumePrompt (Session-Args $dirArgs '' $script:sessionId) $logFile $dir $quiet
+        $status = Read-Status $resultFile
+        if ($writtenBefore -and (Get-WriteTime $resultFile) -eq $writtenBefore) { $status = $null }
+    }
+
+    if ($exitCode -ne 0 -or $script:isError -or $status -ne 'DONE') {
+        return "exit code $exitCode, error flag $($script:isError), report status '$status'"
+    }
+    return $null
+}
+
+# How a finished session is named in its DONE line.
+function Session-Note {
+    $costNote = ''
+    if ($script:cost) { $costNote = ", cost `$$([math]::Round([double]$script:cost, 2))" }
+    return "session $($script:sessionId)$costNote"
+}
+
 # Runs one task: its session, the single resume when the session ends without a report, and the
 # verdict. Writes the task's progress lines and returns whether the task is DONE. A parallel task
 # runs in its worktree, quietly, and must leave nothing uncommitted there.
@@ -266,37 +324,12 @@ Before you finish, write $resultFile. Its first line is exactly DONE or FAILED. 
     # session also needs the main checkout, where the repository's untracked files are.
     $dirArgs = @('--add-dir', $root)
     if ($group) { $dirArgs += @('--add-dir', $queue.workDir) }
-    $cliArgs = @('-p', '--output-format', 'stream-json', '--verbose',
-                 '--permission-mode', $queue.permissionMode, '--permission-prompts', 'none') +
-               $dirArgs + @('--name', $sessionName) + (Model-Args)
 
     Say "$label - starting" 'Cyan'
     $script:sessionId = $null
     $script:cost = $null
-    $exitCode = Invoke-Session $label $prompt $cliArgs $logFile $sessionDir ([bool]$group)
-    $status = Read-Status $resultFile
-
-    # A session that ended cleanly without a report stopped too early, for example by ending its
-    # turn to wait for something. Resume it once to finish the task and write the report.
-    if ($exitCode -eq 0 -and -not $script:isError -and $status -notin 'DONE', 'FAILED' -and $script:sessionId) {
-        Say "$label - no report yet, resuming the session once" 'Yellow'
-        $resumePrompt = @"
-Your session ended before you wrote $resultFile, so the task is not finished. This session is headless: it ends with your final answer, and nothing wakes it up again; whatever was still running when it ended has stopped.
-
-Finish the task now. Run again, in the foreground, whatever had not completed, then write $resultFile as your last step. Its first line is exactly DONE or FAILED. After it: what you did, how you verified it, and anything the next task or the user must know.
-"@
-        $resumeArgs = @('-p', '--resume', $script:sessionId, '--output-format', 'stream-json', '--verbose',
-                        '--permission-mode', $queue.permissionMode, '--permission-prompts', 'none') +
-                      $dirArgs + (Model-Args)
-        $exitCode = Invoke-Session $label $resumePrompt $resumeArgs $logFile $sessionDir ([bool]$group)
-        $status = Read-Status $resultFile
-    }
-
-    $reason = $null
-    if ($exitCode -ne 0 -or $script:isError -or $status -ne 'DONE') {
-        $reason = "exit code $exitCode, error flag $($script:isError), report status '$status'"
-    }
-    elseif ($group) {
+    $reason = Run-Session $label $prompt (Session-Args $dirArgs $sessionName) $dirArgs $logFile $resultFile $sessionDir ([bool]$group)
+    if (-not $reason -and $group) {
         $uncommitted = @(Get-Uncommitted (Worktree-Of $task)).Count
         if ($uncommitted) { $reason = "report status 'DONE', but $uncommitted uncommitted change(s) left in the worktree" }
     }
@@ -308,9 +341,7 @@ Finish the task now. Run again, in the foreground, whatever had not completed, t
         return $false
     }
 
-    $costNote = ''
-    if ($script:cost) { $costNote = ", cost `$$([math]::Round([double]$script:cost, 2))" }
-    Say "$label - DONE (session $($script:sessionId)$costNote)" 'Green'
+    Say "$label - DONE ($(Session-Note))" 'Green'
     return $true
 }
 
@@ -324,6 +355,96 @@ if ($ParallelTask) {
     }
     if ($done) { exit 0 }
     exit 1
+}
+
+# Has the group's conflict session resolve the conflict that merging a task's branch ran into; the
+# merge is in progress in the main checkout. A group has one conflict session, $script:conflictSession,
+# and a later conflict of the group resumes it. Returns $null when the merge is committed and the
+# main checkout clean; otherwise undoes a merge still in progress and returns why the merge step stops.
+function Resolve-Conflict($group, $task) {
+    $label = "Group $($group.label) - conflict session"
+    $branch = Branch-Of $task
+    $named = "task $($position["$($task.id)"] + 1) ('$($task.title)')"
+    $resultFile = Join-Path $resultsDir "merge-$($group.label).md"
+    $previousFile = Join-Path $resultsDir "merge-$($group.label).previous.md"
+    $logFile = Join-Path $logsDir "merge-$($group.label).jsonl"
+    $dirArgs = @('--add-dir', $root)
+    $headless = "This session is headless: it ends with your final answer, and nothing wakes it up again. Background commands are turned off, so run every command in the foreground and wait for it; give slow ones, such as a full test suite, a timeout of up to $bashMaxMinutes minutes."
+
+    if ($script:conflictSession) {
+        $prompt = @"
+The queue went on merging the group, and the next branch conflicts too: $branch, the branch of $named. Its merge is in progress in your working directory.
+
+Resolve this conflict as you did the earlier one: keep what every task intended, run the tests of what you touched, then commit the merge and leave nothing uncommitted. If it needs a decision only the user can make, or something blocks you, stop there instead of guessing and report FAILED.
+
+$headless
+
+Before you finish, write $resultFile again, so that it covers this conflict and the earlier ones. Its first line is exactly DONE or FAILED.
+"@
+        $cliArgs = Session-Args $dirArgs '' $script:conflictSession
+    }
+    else {
+        $retryNote = ''
+        if (Test-Path $resultFile) { Move-Item -Force $resultFile $previousFile }
+        if (Test-Path $previousFile) {
+            $retryNote = "`nThe report of an earlier conflict session for this group is $previousFile."
+        }
+        $members = @($group.ids | ForEach-Object { $tasks[$position[$_]] })
+        $beside = @($members | ForEach-Object { "task $($position["$($_.id)"] + 1) ('$($_.title)')" }) -join ', '
+        $briefs = @($members | ForEach-Object { '  ' + (Join-Path $root "tasks\$($_.id).md") }) -join "`n"
+        $reports = @($members | ForEach-Object { '  ' + (Result-Of $_) }) -join "`n"
+        $queueBranch = @(Run-Git $queue.workDir @('symbolic-ref', '--short', 'HEAD'))[0]
+        $sessionName = "$($queue.project) - Merge $($group.label)" -replace '"', "'"
+        $prompt = @"
+You are the conflict session of an unattended queue. Nobody is watching this session and nobody can answer a question. The session is already named '$sessionName'.
+
+The queue ran $beside at the same time, each in its own git worktree and branch, and is now merging their branches into $queueBranch, in task order. Merging $branch, the branch of $named, ran into a conflict. That merge is in progress in your working directory.
+
+What each task was asked to do:
+$briefs
+What each task reports it did:
+$reports$retryNote
+
+Resolve the conflict so that what every task intended is kept, following this repository's own instructions (CLAUDE.md and what it points to). Run the tests of what you touched, then commit the merge and leave nothing uncommitted. If the conflict needs a decision only the user can make, or something blocks you, stop there instead of guessing and report FAILED: the queue then undoes the merge and keeps every branch.
+
+$headless
+
+Before you finish, write $resultFile. Its first line is exactly DONE or FAILED. After it: which files conflicted, how you resolved each and why, how you verified it, and anything the next task or the user must know.
+"@
+        $cliArgs = Session-Args $dirArgs $sessionName
+    }
+
+    Say "$label - starting" 'Cyan'
+    $script:sessionId = $script:conflictSession
+    $script:cost = $null
+    # A merge left in progress would stop every later run, so a failure of the runner itself is a
+    # stop like any other: the merge is undone below.
+    try { $failure = Run-Session $label $prompt $cliArgs $dirArgs $logFile $resultFile $queue.workDir $false }
+    catch { $failure = "the runner failed: $($_.Exception.Message)" }
+    $script:conflictSession = $script:sessionId
+    if (-not $failure) {
+        Run-Git $queue.workDir @('merge-base', '--is-ancestor', $branch, 'HEAD') | Out-Null
+        $isMerged = $script:gitExit -eq 0
+        $uncommitted = @(Get-Uncommitted $queue.workDir).Count
+        if (Test-Merging) { $failure = "report status 'DONE', but the merge is still in progress" }
+        elseif (-not $isMerged) { $failure = "report status 'DONE', but branch $branch is not merged" }
+        elseif ($uncommitted) { $failure = "report status 'DONE', but $uncommitted uncommitted change(s) left in the main checkout" }
+    }
+    if (-not $failure) {
+        Say "$label - DONE ($(Session-Note))" 'Green'
+        return $null
+    }
+
+    Say "$label - STOPPED ($failure)" 'Red'
+    if (Test-Path $resultFile) { Say "Report: $resultFile" 'Red' }
+    Say "Log: $logFile" 'Red'
+    $ending = 'no merge was left to undo'
+    if (Test-Merging) {
+        $aborted = Run-Git $queue.workDir @('merge', '--abort')
+        if ($script:gitExit -eq 0) { $ending = 'the merge was undone' }
+        else { $ending = "the merge could not be undone: $(@($aborted)[-1])" }
+    }
+    return "conflict merging task $($task.id), branch $branch; $ending"
 }
 
 # Runs a parallel group: every task that is not done yet in its own worktree and branch, at most
@@ -341,6 +462,9 @@ function Run-Group($group) {
     # the main checkout: uncommitted work there would be missing from the first and in the way of
     # the second.
     Assert-QueueBranch
+    if (Test-Merging) {
+        Stop-Queue "Group $($group.label) - STOPPED (the main checkout $($queue.workDir) has a merge in progress; commit it or run git merge --abort)"
+    }
     if (@(Get-Uncommitted $queue.workDir).Count) {
         Stop-Queue "Group $($group.label) - STOPPED (the main checkout $($queue.workDir) has uncommitted or untracked files; commit or remove them)"
     }
@@ -383,21 +507,25 @@ function Run-Group($group) {
     # The merge step. A task is merged when its branch is gone.
     Say "Group $($group.label) - merging" 'Cyan'
     $unmerged = @($members | Where-Object { Test-Branch $_ })
+    $script:conflictSession = $null
     foreach ($task in $unmerged) {
         $branch = Branch-Of $task
         $worktree = Worktree-Of $task
         $merged = Run-Git $queue.workDir @('merge', '--no-edit', $branch)
+        $reason = $null
         if ($script:gitExit -ne 0) {
             $reason = "git merge of task $($task.id), branch $branch, failed: $(@($merged)[-1])"
-            Run-Git $queue.workDir @('rev-parse', '--verify', '--quiet', 'MERGE_HEAD') | Out-Null
-            if ($script:gitExit -eq 0) {
-                Run-Git $queue.workDir @('merge', '--abort') | Out-Null
-                $reason = "conflict merging task $($task.id), branch $branch; the merge was undone"
+            if (Test-Merging) {
+                Say "Group $($group.label) - conflict merging $($task.id) (branch $branch)" 'Yellow'
+                $reason = Resolve-Conflict $group $task
             }
+        }
+        if ($reason) {
             Say "Group $($group.label) - merge STOPPED ($reason)" 'Red'
             foreach ($kept in $unmerged) {
                 if (Test-Branch $kept) { Say "Kept: task $($kept.id), branch $(Branch-Of $kept), worktree $(Worktree-Of $kept)" 'Red' }
             }
+            if ($script:conflictSession) { Say "Open the conflict session: cd `"$($queue.workDir)`"; claude --resume $($script:conflictSession)" 'Yellow' }
             Say 'Fix the cause, then run this file again: finished tasks are skipped and the merge is tried again.' 'Yellow'
             exit 1
         }
