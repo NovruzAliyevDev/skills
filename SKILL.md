@@ -6,7 +6,7 @@ disable-model-invocation: true
 
 Talk to the user in their language. Everything written to disk is English, except task text the user wrote themselves, which is copied as written.
 
-Each task runs in a **fresh session**: it sees the repository, its `CLAUDE.md` and the task file, and nothing of this conversation. The runner (`runner.ps1` beside this file) runs the tasks in order and stops at the first one whose report does not start with `DONE`.
+Each task runs in a **fresh session**: it sees the repository, its `CLAUDE.md` and the task file, and nothing of this conversation. The runner (`runner.ps1` beside this file) runs the tasks in order and stops at the first one whose report does not start with `DONE`. Its sessions cannot run background commands, which would die when a headless session ends, and a session that ends without writing a report is resumed once to write it.
 
 ## 1. Collect the tasks
 
