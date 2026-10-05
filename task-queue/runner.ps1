@@ -2,7 +2,12 @@
 # Reads queue.json beside this file. Stops at the first task that does not report DONE;
 # running this file again skips the finished tasks and resumes at that one.
 # A session that ends without writing its report is resumed once to finish it.
+# Tasks that queue.json puts in a parallel group run at the same time, each in its own git worktree
+# and branch; when all of them are DONE, their branches are merged into the queue's branch in task order.
 # Windows PowerShell 5.1 compatible.
+
+# -ParallelTask is set by the runner itself: it starts one copy of this file per task of a parallel group.
+param([string]$ParallelTask)
 
 $ErrorActionPreference = 'Stop'
 $utf8 = New-Object System.Text.UTF8Encoding $false
@@ -26,12 +31,13 @@ foreach ($dir in $resultsDir, $logsDir) { New-Item -ItemType Directory -Force $d
 $progressLog = Join-Path $root 'progress.log'
 
 # Add-Content opens the file without sharing reads, so a monitor reading the file at that
-# moment would make the write fail and stop the queue. Append with ReadWrite sharing instead.
+# moment would make the write fail and stop the queue. Append with Read sharing instead: readers
+# are let in, and the sessions of a parallel group, which write here too, take turns.
 function Append-Line([string]$path, [string]$text) {
     $bytes = $utf8.GetBytes($text + "`r`n")
     for ($attempt = 1; ; $attempt++) {
         try {
-            $stream = [System.IO.FileStream]::new($path, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
+            $stream = [System.IO.FileStream]::new($path, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
             try { $stream.Write($bytes, 0, $bytes.Length) } finally { $stream.Dispose() }
             return
         }
@@ -67,9 +73,87 @@ function Read-Status([string]$path) {
     return "$first".Trim()
 }
 
-$total = @($queue.tasks).Count
-$host.UI.RawUI.WindowTitle = "Task queue: $($queue.project) ($total tasks)"
-Say "Queue $root - $total tasks, project $($queue.project), permission mode $($queue.permissionMode)" 'Cyan'
+$tasks = @($queue.tasks)
+$total = $tasks.Count
+
+# Runs git in a directory and returns its output lines; the exit code is left in $script:gitExit.
+# Git reports progress on stderr, which must not stop the script.
+function Run-Git([string]$dir, [string[]]$gitArgs) {
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $lines = @(& git.exe -C $dir @gitArgs 2>&1 | ForEach-Object { "$_" })
+        $script:gitExit = $LASTEXITCODE
+        return $lines
+    }
+    finally { $ErrorActionPreference = $previous }
+}
+
+# The parallel groups of queue.json: $groupOf leads from a task id to its group, which is
+# @{ label = '<first id>-<last id>'; ids = its task ids in queue order }.
+$groupOf = @{}
+$maxParallel = 5
+$queueProblem = $null
+$position = @{}
+for ($i = 0; $i -lt $total; $i++) { $position["$($tasks[$i].id)"] = $i }
+if ($null -ne $queue.parallel) {
+    foreach ($entry in $queue.parallel) {
+        $ids = @($entry | ForEach-Object { "$_" })
+        $named = "the group '$($ids -join ', ')'"
+        $unknown = @($ids | Where-Object { -not $position.ContainsKey($_) })
+        $taken = @($ids | Where-Object { $groupOf.ContainsKey($_) })
+        if ($entry -isnot [array] -or $ids.Count -lt 2) { $queueProblem = "$named needs at least two task ids"; break }
+        if ($unknown.Count) { $queueProblem = "$named names task '$($unknown[0])', which is not in the queue"; break }
+        if ($taken.Count) { $queueProblem = "$named names task '$($taken[0])', which is already in another group"; break }
+        if (@($ids | Select-Object -Unique).Count -ne $ids.Count) { $queueProblem = "$named names a task twice"; break }
+        $ids = @($ids | Sort-Object { $position[$_] })
+        if ($position[$ids[-1]] - $position[$ids[0]] -ne $ids.Count - 1) { $queueProblem = "the tasks of $named are not consecutive in the queue"; break }
+        $group = @{ label = "$($ids[0])-$($ids[-1])"; ids = $ids }
+        foreach ($id in $ids) { $groupOf[$id] = $group }
+    }
+}
+$hasGroups = $groupOf.Count -gt 0
+if ($hasGroups -and $null -ne $queue.maxParallel -and -not $queueProblem) {
+    if ("$($queue.maxParallel)" -match '^[1-9]\d*$') { $maxParallel = [int]"$($queue.maxParallel)" }
+    else { $queueProblem = "maxParallel '$($queue.maxParallel)' is not a whole number from 1 up" }
+}
+
+function Label-Of($task) { return "[$($position["$($task.id)"] + 1)/$total] $($task.title)" }
+function Result-Of($task) { return Join-Path $resultsDir "$($task.id).md" }
+function Branch-Of($task) { return "queue/$(Split-Path -Leaf $root)/$($task.id)" }
+function Worktree-Of($task) { return Join-Path $root "wt\$($task.id)" }
+
+function Test-Branch($task) {
+    Run-Git $queue.workDir @('rev-parse', '--verify', '--quiet', "refs/heads/$(Branch-Of $task)") | Out-Null
+    return $script:gitExit -eq 0
+}
+
+# What git status reports in a directory: nothing when everything there is committed.
+function Get-Uncommitted([string]$dir) { return @(Run-Git $dir @('status', '--porcelain')) }
+
+# A parallel task that reported DONE but left changes uncommitted in its worktree is not done:
+# the merge would drop them. Once its branch is merged and gone, the worktree no longer counts.
+function Test-Done($task) {
+    if ((Read-Status (Result-Of $task)) -ne 'DONE') { return $false }
+    if ($groupOf.ContainsKey("$($task.id)")) {
+        $worktree = Worktree-Of $task
+        if ((Test-Path $worktree) -and (Test-Branch $task) -and @(Get-Uncommitted $worktree).Count) { return $false }
+    }
+    return $true
+}
+
+function Stop-Queue([string]$message) {
+    Say $message 'Red'
+    Say 'Fix the cause, then run this file again: finished tasks are skipped.' 'Yellow'
+    exit 1
+}
+
+function Assert-QueueBranch {
+    $inside = @(Run-Git $queue.workDir @('rev-parse', '--is-inside-work-tree'))
+    if ($script:gitExit -ne 0 -or $inside[0] -ne 'true') { Stop-Queue "Parallel groups need a git repository, and $($queue.workDir) is not one." }
+    Run-Git $queue.workDir @('symbolic-ref', '--quiet', 'HEAD') | Out-Null
+    if ($script:gitExit -ne 0) { Stop-Queue "Parallel groups need a branch checked out in $($queue.workDir), and none is." }
+}
 
 function Model-Args {
     $extra = @()
@@ -78,19 +162,20 @@ function Model-Args {
     return $extra
 }
 
-# Runs one claude call with the text on stdin, showing its messages and tool calls and appending
-# every event to the task's log. Sets $script:sessionId, $script:isError and $script:cost and
-# returns the exit code. A resumed session's result reports the session's whole cost so far.
-function Invoke-Session([string]$label, [string]$text, [string[]]$cliArgs, [string]$logFile) {
+# Runs one claude call in a directory with the text on stdin, showing its messages and tool calls
+# (not for a quiet session) and appending every event to the task's log. Sets $script:sessionId,
+# $script:isError and $script:cost and returns the exit code. A resumed session's result reports the
+# session's whole cost so far.
+function Invoke-Session([string]$label, [string]$text, [string[]]$cliArgs, [string]$logFile, [string]$dir, [bool]$quiet) {
     $script:isError = $true
     $script:sawSessionId = $false
-    Push-Location $queue.workDir
+    Push-Location $dir
     try {
         $text | & claude @cliArgs | ForEach-Object {
             $line = "$_"
             Append-Line $logFile $line
             $evt = $null
-            try { $evt = $line | ConvertFrom-Json } catch { Write-Host $line -ForegroundColor DarkYellow; return }
+            try { $evt = $line | ConvertFrom-Json } catch { if (-not $quiet) { Write-Host $line -ForegroundColor DarkYellow }; return }
             if ($evt.session_id -and -not $script:sawSessionId) {
                 $script:sawSessionId = $true
                 if ($evt.session_id -ne $script:sessionId) {
@@ -99,6 +184,7 @@ function Invoke-Session([string]$label, [string]$text, [string[]]$cliArgs, [stri
                 }
             }
             if ($evt.type -eq 'assistant') {
+                if ($quiet) { return }
                 foreach ($block in $evt.message.content) {
                     if ($block.type -eq 'text' -and $block.text) { Write-Host $block.text }
                     elseif ($block.type -eq 'tool_use') { Write-Host "  > $($block.name) $(Describe $block.input)" -ForegroundColor DarkCyan }
@@ -115,6 +201,225 @@ function Invoke-Session([string]$label, [string]$text, [string[]]$cliArgs, [stri
         Pop-Location
     }
 }
+
+# Runs one task: its session, the single resume when the session ends without a report, and the
+# verdict. Writes the task's progress lines and returns whether the task is DONE. A parallel task
+# runs in its worktree, quietly, and must leave nothing uncommitted there.
+function Run-Task($task) {
+    $index = $position["$($task.id)"] + 1
+    $label = Label-Of $task
+    $taskFile = Join-Path $root "tasks\$($task.id).md"
+    $resultFile = Result-Of $task
+    $previousFile = Join-Path $resultsDir "$($task.id).previous.md"
+    $logFile = Join-Path $logsDir "$($task.id).jsonl"
+    $group = $groupOf["$($task.id)"]
+    $sessionDir = $queue.workDir
+    if ($group) {
+        # The same folder of the repository as the queue's working directory, inside the worktree.
+        $sessionDir = Worktree-Of $task
+        $inRepository = "$(@(Run-Git $queue.workDir @('rev-parse', '--show-prefix'))[0])".Trim('/').Replace('/', '\')
+        if ($inRepository) { $sessionDir = Join-Path $sessionDir $inRepository }
+    }
+
+    $retryNote = ''
+    if (Test-Path $resultFile) {
+        Move-Item -Force $resultFile $previousFile
+    }
+    if (Test-Path $previousFile) {
+        $retryNote = "`nAn earlier attempt at this task stopped without finishing; its report is $previousFile. Its partial work may still be in the working tree - check before you start."
+    }
+
+    $commitNote = ''
+    if ($hasGroups) {
+        $commitNote = "`n`nThis queue runs some of its tasks in parallel, each in its own git worktree, and that only works from committed work. Commit your work before you finish, following this repository's own commit rules. Work left uncommitted stops the queue."
+    }
+    $parallelNote = ''
+    if ($group) {
+        $beside = @($group.ids | Where-Object { $_ -ne "$($task.id)" } | ForEach-Object { "task $($position[$_] + 1) ('$($tasks[$position[$_]].title)')" }) -join ', '
+        $parallelNote = @"
+
+
+You run at the same time as $beside. They are working right now, each in its own worktree, and you cannot see their changes. Do not wait for their reports and do not rely on them; the reports of the tasks before yours are complete.
+
+Your working directory is a fresh git worktree of the repository, on its own branch, $(Branch-Of $task); stay on that branch. A fresh worktree has no build outputs and no installed dependencies, so a missing build does not mean the repository is broken. Prepare what your task needs (restore packages, install dependencies) and no more.
+
+The main checkout is $($queue.workDir). Files the repository does not track (tickets, notes, local settings) exist only there: read them there and update them there. Do not change tracked files in the main checkout: every change to a tracked file belongs in your worktree. When all parallel tasks are done, your branch is merged and your worktree is removed, so work left uncommitted in the worktree is lost.
+"@
+    }
+
+    $sessionName = "$($queue.project) - $($task.title)" -replace '"', "'"
+    $prompt = @"
+You are task $index of $total in an unattended queue. Nobody is watching this session and nobody can answer a question. The session is already named '$sessionName'.
+
+Your task is in: $taskFile
+Reports from earlier tasks in this queue are in: $resultsDir$retryNote$parallelNote
+
+Do the task completely, following this repository's own instructions (CLAUDE.md and what it points to). Where the task leaves a choice open, take the sensible default and record it in your report. If you reach a decision only the user can make, or something blocks you, stop there instead of guessing.$commitNote
+
+This session is headless: it ends with your final answer, and nothing wakes it up again. Background commands are turned off, so run every command in the foreground and wait for it; give slow ones, such as a full test suite, a timeout of up to $bashMaxMinutes minutes.
+
+Before you finish, write $resultFile. Its first line is exactly DONE or FAILED. After it: what you did, how you verified it, and anything the next task or the user must know.
+"@
+
+    # --add-dir: the task file and the reports live outside the working directory, and an
+    # unattended session cannot approve access to anything outside its directories. A parallel
+    # session also needs the main checkout, where the repository's untracked files are.
+    $dirArgs = @('--add-dir', $root)
+    if ($group) { $dirArgs += @('--add-dir', $queue.workDir) }
+    $cliArgs = @('-p', '--output-format', 'stream-json', '--verbose',
+                 '--permission-mode', $queue.permissionMode, '--permission-prompts', 'none') +
+               $dirArgs + @('--name', $sessionName) + (Model-Args)
+
+    Say "$label - starting" 'Cyan'
+    $script:sessionId = $null
+    $script:cost = $null
+    $exitCode = Invoke-Session $label $prompt $cliArgs $logFile $sessionDir ([bool]$group)
+    $status = Read-Status $resultFile
+
+    # A session that ended cleanly without a report stopped too early, for example by ending its
+    # turn to wait for something. Resume it once to finish the task and write the report.
+    if ($exitCode -eq 0 -and -not $script:isError -and $status -notin 'DONE', 'FAILED' -and $script:sessionId) {
+        Say "$label - no report yet, resuming the session once" 'Yellow'
+        $resumePrompt = @"
+Your session ended before you wrote $resultFile, so the task is not finished. This session is headless: it ends with your final answer, and nothing wakes it up again; whatever was still running when it ended has stopped.
+
+Finish the task now. Run again, in the foreground, whatever had not completed, then write $resultFile as your last step. Its first line is exactly DONE or FAILED. After it: what you did, how you verified it, and anything the next task or the user must know.
+"@
+        $resumeArgs = @('-p', '--resume', $script:sessionId, '--output-format', 'stream-json', '--verbose',
+                        '--permission-mode', $queue.permissionMode, '--permission-prompts', 'none') +
+                      $dirArgs + (Model-Args)
+        $exitCode = Invoke-Session $label $resumePrompt $resumeArgs $logFile $sessionDir ([bool]$group)
+        $status = Read-Status $resultFile
+    }
+
+    $reason = $null
+    if ($exitCode -ne 0 -or $script:isError -or $status -ne 'DONE') {
+        $reason = "exit code $exitCode, error flag $($script:isError), report status '$status'"
+    }
+    elseif ($group) {
+        $uncommitted = @(Get-Uncommitted (Worktree-Of $task)).Count
+        if ($uncommitted) { $reason = "report status 'DONE', but $uncommitted uncommitted change(s) left in the worktree" }
+    }
+    if ($reason) {
+        Say "$label - STOPPED ($reason)" 'Red'
+        if (Test-Path $resultFile) { Say "Report: $resultFile" 'Red' }
+        Say "Log: $logFile" 'Red'
+        if ($script:sessionId) { Say "Open the session: cd `"$sessionDir`"; claude --resume $($script:sessionId)" 'Yellow' }
+        return $false
+    }
+
+    $costNote = ''
+    if ($script:cost) { $costNote = ", cost `$$([math]::Round([double]$script:cost, 2))" }
+    Say "$label - DONE (session $($script:sessionId)$costNote)" 'Green'
+    return $true
+}
+
+# One session of a parallel group: the runner started this copy of the file for it.
+if ($ParallelTask) {
+    $task = $tasks[$position[$ParallelTask]]
+    try { $done = Run-Task $task }
+    catch {
+        Say "$(Label-Of $task) - STOPPED (the runner failed: $($_.Exception.Message))" 'Red'
+        exit 1
+    }
+    if ($done) { exit 0 }
+    exit 1
+}
+
+# Runs a parallel group: every task that is not done yet in its own worktree and branch, at most
+# $maxParallel at a time, then the merge step. Returns when the group is done and merged, and
+# stops the queue otherwise.
+function Run-Group($group) {
+    $members = @($group.ids | ForEach-Object { $tasks[$position[$_]] })
+    $todo = @($members | Where-Object { -not (Test-Done $_) })
+    foreach ($task in $members) {
+        if ($todo -notcontains $task) { Say "$(Label-Of $task) - already DONE, skipped" 'DarkGray' }
+    }
+    if (-not $todo.Count -and -not @($members | Where-Object { Test-Branch $_ }).Count) { return }
+
+    # The group's worktrees start from the main checkout's commit and its branches are merged into
+    # the main checkout: uncommitted work there would be missing from the first and in the way of
+    # the second.
+    Assert-QueueBranch
+    if (@(Get-Uncommitted $queue.workDir).Count) {
+        Stop-Queue "Group $($group.label) - STOPPED (the main checkout $($queue.workDir) has uncommitted or untracked files; commit or remove them)"
+    }
+
+    if ($todo.Count) {
+        Say "Group $($group.label) - starting (tasks $($group.ids -join ', '))" 'Cyan'
+        Run-Git $queue.workDir @('worktree', 'prune') | Out-Null
+        foreach ($task in $todo) {
+            $worktree = Worktree-Of $task
+            if (Test-Path $worktree) { continue }
+            if (Test-Branch $task) { $added = Run-Git $queue.workDir @('worktree', 'add', $worktree, (Branch-Of $task)) }
+            else { $added = Run-Git $queue.workDir @('worktree', 'add', '-b', (Branch-Of $task), $worktree, 'HEAD') }
+            if ($script:gitExit -ne 0) {
+                Stop-Queue "Group $($group.label) - STOPPED (no worktree for task $($task.id): $(@($added)[-1]))"
+            }
+        }
+
+        $waiting = New-Object System.Collections.Queue (, $todo)
+        $running = @()
+        while ($waiting.Count -or $running.Count) {
+            while ($waiting.Count -and $running.Count -lt $maxParallel) {
+                $start = New-Object System.Diagnostics.ProcessStartInfo
+                $start.FileName = (Get-Process -Id $PID).Path
+                $start.Arguments = "-NoProfile -File `"$PSCommandPath`" -ParallelTask `"$($waiting.Dequeue().id)`""
+                $start.UseShellExecute = $false
+                $running += [System.Diagnostics.Process]::Start($start)
+            }
+            Start-Sleep -Milliseconds 200
+            $running = @($running | Where-Object { -not $_.HasExited })
+        }
+
+        $notDone = @($members | Where-Object { -not (Test-Done $_) } | ForEach-Object { $_.id })
+        if ($notDone.Count) {
+            Say "Group $($group.label) - STOPPED (not DONE: $($notDone -join ', '); nothing was merged)" 'Red'
+            Say 'Fix the cause, then run this file again: finished tasks are skipped and the stopped ones continue in their worktrees.' 'Yellow'
+            exit 1
+        }
+    }
+
+    # The merge step. A task is merged when its branch is gone.
+    Say "Group $($group.label) - merging" 'Cyan'
+    $unmerged = @($members | Where-Object { Test-Branch $_ })
+    foreach ($task in $unmerged) {
+        $branch = Branch-Of $task
+        $worktree = Worktree-Of $task
+        $merged = Run-Git $queue.workDir @('merge', '--no-edit', $branch)
+        if ($script:gitExit -ne 0) {
+            $reason = "git merge of task $($task.id), branch $branch, failed: $(@($merged)[-1])"
+            Run-Git $queue.workDir @('rev-parse', '--verify', '--quiet', 'MERGE_HEAD') | Out-Null
+            if ($script:gitExit -eq 0) {
+                Run-Git $queue.workDir @('merge', '--abort') | Out-Null
+                $reason = "conflict merging task $($task.id), branch $branch; the merge was undone"
+            }
+            Say "Group $($group.label) - merge STOPPED ($reason)" 'Red'
+            foreach ($kept in $unmerged) {
+                if (Test-Branch $kept) { Say "Kept: task $($kept.id), branch $(Branch-Of $kept), worktree $(Worktree-Of $kept)" 'Red' }
+            }
+            Say 'Fix the cause, then run this file again: finished tasks are skipped and the merge is tried again.' 'Yellow'
+            exit 1
+        }
+        # A file held open can keep git from deleting the folder. The work is merged either way, so
+        # the queue goes on and the leftovers are named.
+        if (Test-Path $worktree) { Run-Git $queue.workDir @('worktree', 'remove', '--force', $worktree) | Out-Null }
+        Run-Git $queue.workDir @('worktree', 'prune') | Out-Null
+        Run-Git $queue.workDir @('branch', '-d', $branch) | Out-Null
+        if (Test-Path $worktree) {
+            Say "Group $($group.label) - could not remove the worktree $worktree; remove it by hand" 'Yellow'
+        }
+        Say "Group $($group.label) - merged $($task.id) (branch $branch)" 'Green'
+    }
+    Say "Group $($group.label) - merge DONE" 'Green'
+    $worktrees = Join-Path $root 'wt'
+    if ((Test-Path $worktrees) -and -not @(Get-ChildItem -Force $worktrees).Count) { Remove-Item -Force $worktrees }
+}
+
+$host.UI.RawUI.WindowTitle = "Task queue: $($queue.project) ($total tasks)"
+Say "Queue $root - $total tasks, project $($queue.project), permission mode $($queue.permissionMode)" 'Cyan'
+if ($queueProblem) { Stop-Queue "queue.json: $queueProblem." }
+if ($hasGroups) { Assert-QueueBranch }
 
 # A model without the requested mode (Haiku has no auto mode) silently starts in 'default',
 # where an unattended session is denied every write. Check once before spending a task on it.
@@ -138,83 +443,22 @@ if ($script:actualMode -ne $queue.permissionMode) {
 }
 Say "Preflight: model $($script:actualModel), permission mode $($script:actualMode)" 'DarkGray'
 
-$index = 0
-foreach ($task in $queue.tasks) {
-    $index++
-    $label = "[$index/$total] $($task.title)"
-    $taskFile = Join-Path $root "tasks\$($task.id).md"
-    $resultFile = Join-Path $resultsDir "$($task.id).md"
-    $previousFile = Join-Path $resultsDir "$($task.id).previous.md"
-    $logFile = Join-Path $logsDir "$($task.id).jsonl"
-
-    if ((Read-Status $resultFile) -eq 'DONE') {
-        Say "$label - already DONE, skipped" 'DarkGray'
+for ($i = 0; $i -lt $total; $i++) {
+    $task = $tasks[$i]
+    $group = $groupOf["$($task.id)"]
+    if ($group) {
+        Run-Group $group
+        $i += $group.ids.Count - 1
         continue
     }
-
-    $retryNote = ''
-    if (Test-Path $resultFile) {
-        Move-Item -Force $resultFile $previousFile
+    if (Test-Done $task) {
+        Say "$(Label-Of $task) - already DONE, skipped" 'DarkGray'
+        continue
     }
-    if (Test-Path $previousFile) {
-        $retryNote = "`nAn earlier attempt at this task stopped without finishing; its report is $previousFile. Its partial work may still be in the working tree - check before you start."
-    }
-
-    $sessionName = "$($queue.project) - $($task.title)" -replace '"', "'"
-    $prompt = @"
-You are task $index of $total in an unattended queue. Nobody is watching this session and nobody can answer a question. The session is already named '$sessionName'.
-
-Your task is in: $taskFile
-Reports from earlier tasks in this queue are in: $resultsDir$retryNote
-
-Do the task completely, following this repository's own instructions (CLAUDE.md and what it points to). Where the task leaves a choice open, take the sensible default and record it in your report. If you reach a decision only the user can make, or something blocks you, stop there instead of guessing.
-
-This session is headless: it ends with your final answer, and nothing wakes it up again. Background commands are turned off, so run every command in the foreground and wait for it; give slow ones, such as a full test suite, a timeout of up to $bashMaxMinutes minutes.
-
-Before you finish, write $resultFile. Its first line is exactly DONE or FAILED. After it: what you did, how you verified it, and anything the next task or the user must know.
-"@
-
-    # --add-dir: the task file and the reports live outside the working directory, and an
-    # unattended session cannot approve access to anything outside its directories.
-    $cliArgs = @('-p', '--output-format', 'stream-json', '--verbose',
-                 '--permission-mode', $queue.permissionMode, '--permission-prompts', 'none',
-                 '--add-dir', $root, '--name', $sessionName) + (Model-Args)
-
-    Say "$label - starting" 'Cyan'
-    $script:sessionId = $null
-    $script:cost = $null
-    $exitCode = Invoke-Session $label $prompt $cliArgs $logFile
-    $status = Read-Status $resultFile
-
-    # A session that ended cleanly without a report stopped too early, for example by ending its
-    # turn to wait for something. Resume it once to finish the task and write the report.
-    if ($exitCode -eq 0 -and -not $script:isError -and $status -notin 'DONE', 'FAILED' -and $script:sessionId) {
-        Say "$label - no report yet, resuming the session once" 'Yellow'
-        $resumePrompt = @"
-Your session ended before you wrote $resultFile, so the task is not finished. This session is headless: it ends with your final answer, and nothing wakes it up again; whatever was still running when it ended has stopped.
-
-Finish the task now. Run again, in the foreground, whatever had not completed, then write $resultFile as your last step. Its first line is exactly DONE or FAILED. After it: what you did, how you verified it, and anything the next task or the user must know.
-"@
-        $resumeArgs = @('-p', '--resume', $script:sessionId, '--output-format', 'stream-json', '--verbose',
-                        '--permission-mode', $queue.permissionMode, '--permission-prompts', 'none',
-                        '--add-dir', $root) + (Model-Args)
-        $exitCode = Invoke-Session $label $resumePrompt $resumeArgs $logFile
-        $status = Read-Status $resultFile
-    }
-
-    if ($exitCode -ne 0 -or $script:isError -or $status -ne 'DONE') {
-        $reason = "exit code $exitCode, error flag $($script:isError), report status '$status'"
-        Say "$label - STOPPED ($reason)" 'Red'
-        if (Test-Path $resultFile) { Say "Report: $resultFile" 'Red' }
-        Say "Log: $logFile" 'Red'
-        if ($script:sessionId) { Say "Open the session: cd `"$($queue.workDir)`"; claude --resume $($script:sessionId)" 'Yellow' }
+    if (-not (Run-Task $task)) {
         Say "Fix the cause, then run this file again: finished tasks are skipped and this one starts over." 'Yellow'
         exit 1
     }
-
-    $costNote = ''
-    if ($script:cost) { $costNote = ", cost `$$([math]::Round([double]$script:cost, 2))" }
-    Say "$label - DONE (session $($script:sessionId)$costNote)" 'Green'
 }
 
 Say "All $total tasks DONE. Reports: $resultsDir" 'Green'
