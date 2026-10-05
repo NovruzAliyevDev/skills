@@ -3,4 +3,5 @@
 # "!/<name>/" line.
 /*
 !/.gitignore
+!/delegate/
 !/task-queue/
