@@ -3,5 +3,6 @@
 # "!/<name>/" line.
 /*
 !/.gitignore
+!/README.md
 !/delegate/
 !/task-queue/
