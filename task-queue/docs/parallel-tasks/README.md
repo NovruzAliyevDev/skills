@@ -54,7 +54,7 @@ The session of a parallel task runs in a child process of the runner, whose comm
 
 ## Status
 
-Tickets 01 to 04 are done. Ticket 05 is done except its last item, the real check with real sessions on a scratch repository, which costs money and has not been run yet. The `Status:` lines and checkboxes inside the ticket files are as they were written and were not updated.
+Tickets 01 to 05 are done, the real check included (below). The `Status:` lines and checkboxes inside the ticket files are as they were written and were not updated.
 
 ## Check tooling
 
@@ -80,3 +80,12 @@ The monitor checks for groups are `check-parallel.mjs` in the fixtures folder, w
 - The conflict session is a worker named "M Merge 01-02": at a desk with its helpers while it runs, asleep when its process is gone, in the done zone or the alert corner after. Its drawer has Activity and Report (with the earlier attempt's), no Brief, and a "Conflict merging" fact.
 - A notification fires for every merge conflict.
 - The fake runner plays the merge step and the conflict session (`merging`, `merge <n>`, `merge-done`, `conflict <n>`, `resolve`, `refuse`, `rerun`), in the scenarios `merge`, `conflict`, `conflict-refused` and `conflict-killed`; `check-parallel.mjs` checks them.
+
+## Real check (ticket 05)
+
+Run on 2026-10-06 with real sessions (model `sonnet`, mode `auto`), following the skill's steps 4 and 5 by hand: run folders under `%USERPROFILE%\.claude-queues`, the runner launched in its own window, the monitor on port 4747, watched in Claude's built-in browser pane and recorded from `/api/run` every 3 s. Two scratch repositories, each a tiny Node.js library with `node --test` tests and a `CLAUDE.md` with commit rules, each a queue of three tasks with `[[1,2]]`:
+
+- **Clean merge** (`RealCheckClean`): 01 adds `multiply` to `src/math.js`, 02 adds `farewell` to `src/greet.js`, 03 lists every function in the README. The first launch stopped within seconds: both parallel sessions were refused by the account's usage limit (`exit code 1, error flag True, report status ''`). The monitor showed both workers in the alert corner, the merge sign `waiting` and the run stopped. Running `run.ps1` again after the limit lifted continued both tasks in their worktrees: both DONE, the merge step merged both branches (one fast-forward, one merge commit), then 03 ran and listed all four functions. Run DONE, $0.32. The merge step took under 3 s, so the recording went from `waiting` straight to `merged [01,02]`.
+- **Conflict** (`RealCheckConflict`): 01 adds `farewell` and 02 adds `shout`, both at the end of `src/greet.js` and of its test file, 03 lists every function. 01 merged, 02 conflicted: the monitor showed the merge sign `resolving`, the conflict session "M Merge 01-02" at the desk, and the tab title at 2/3 (the conflict session not counted). Activating the merge sign opened its drawer with Activity and Report only, the "Conflict merging: task 02" fact, and the live feed. The conflict session kept both functions and both tests, ran the tests (4 passing) and committed the merge; it walked to the done zone, the sign read `merged`, 03 ran, and the run ended DONE at 3/3, $0.49 (conflict session $0.12). The run list counted one conflict.
+
+In both repositories the worktrees, the `wt` folder and the queue branches were gone afterwards, the history held the two task commits, the merge commit and the README commit, and the tests passed. Notifications were not checked in the pane, as before.
