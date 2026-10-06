@@ -99,14 +99,33 @@ function ensureLiveness() {
     if (Date.now() - liveness.at > LIVENESS_MS) refreshLiveness();
 }
 
+// The runner runs each task of a parallel group in a child process, `run.ps1 ... -ParallelTask "<id>"`.
+const PARALLEL_TASK_RE = /-ParallelTask\s+"?([A-Za-z0-9_-]+)"?/i;
+
+// The run's runner process, and which tasks have a session process alive: a session of the runner itself
+// belongs to the sequential task it runs (`main`), one of a parallel task's child process to that task
+// (`tasks`). `tasks` lists the parallel tasks whose child process lives, each with whether its session does.
+// Only the first four fields are answered by the API.
 function runnerOf(runDir) {
     if (!liveness.at) return { known: false };
     const script = path.join(runDir, 'run.ps1').toLowerCase();
-    const runner = liveness.processes.find(p => /^(powershell|pwsh)\.exe$/i.test(p.Name) && (p.CommandLine || '').toLowerCase().includes(script));
+    const scripts = liveness.processes.filter(p => /^(powershell|pwsh)\.exe$/i.test(p.Name) && (p.CommandLine || '').toLowerCase().includes(script));
+    const runner = scripts.find(p => !PARALLEL_TASK_RE.test(p.CommandLine));
     if (!runner) return { known: true, alive: false };
-    const session = liveness.processes.some(p => /^claude\.exe$/i.test(p.Name) && p.ParentProcessId === runner.ProcessId);
-    return { known: true, alive: true, session, pid: runner.ProcessId };
+    const sessionOf = parent => liveness.processes.some(p => /^claude\.exe$/i.test(p.Name) && p.ParentProcessId === parent);
+    const main = sessionOf(runner.ProcessId);
+    const tasks = new Map();
+    for (const child of scripts) {
+        if (child.ParentProcessId !== runner.ProcessId) continue;
+        const id = PARALLEL_TASK_RE.exec(child.CommandLine)?.[1];
+        if (id) tasks.set(id, tasks.get(id) || sessionOf(child.ProcessId));
+    }
+    const session = main || [...tasks.values()].some(Boolean);
+    return { known: true, alive: true, session, pid: runner.ProcessId, main, tasks };
 }
+
+// The runner facts /api/run answers, as before groups; the per-task facts show in the task states.
+const publicRunner = ({ known, alive, session, pid }) => ({ known, alive, session, pid });
 
 // --- progress.log -> run and task states. ---
 
@@ -129,10 +148,27 @@ function parseProgress(text) {
     return lines;
 }
 
+// The parallel groups of queue.json, as the runner reads them: task ids in queue order, the group named
+// `<first id>-<last id>`. A group naming a task the queue lacks is left out; the runner refuses such a
+// queue before any task starts.
+function groupsOf(queue) {
+    if (!Array.isArray(queue.parallel)) return [];
+    const position = new Map((queue.tasks || []).map((t, i) => [t.id, i]));
+    return queue.parallel
+        .filter(g => Array.isArray(g) && g.length > 1 && g.every(id => position.has(id)))
+        .map(g => [...g].sort((a, b) => position.get(a) - position.get(b)))
+        .map(g => ({ id: `${g[0]}-${g[g.length - 1]}`, tasks: g }));
+}
+
+const GROUP_START_RE = /^Group (\S+) - starting \(/;
+
 function deriveRun(runDir, queue, lines, runner) {
+    const groups = groupsOf(queue);
+    const groupOf = new Map(groups.flatMap(g => g.tasks.map(id => [id, g.id])));
     const tasks = (queue.tasks || []).map((t, i) => ({
         index: i + 1, id: t.id, title: t.title, state: 'pending',
         start: null, end: null, sessionId: null, cost: null, reason: null,
+        ...(groups.length ? { group: groupOf.get(t.id) ?? null } : {}),
     }));
     let runState = lines.length ? 'running' : 'not-started';
     let startedAt = lines.length ? lines[0].time : null;
@@ -143,6 +179,13 @@ function deriveRun(runDir, queue, lines, runner) {
         if (message.startsWith('Preflight: asked')) { runState = 'preflight-failed'; preflight = message; continue; }
         if (message.startsWith('All ') && message.includes(' tasks DONE')) { runState = 'done'; continue; }
         if (message.startsWith('Fix the cause')) { runState = 'stopped'; continue; }
+        // A re-run starts a group again: a task of it still open from an earlier, killed run waits for its
+        // child process (maybe for a free slot) and writes its starting line again when it gets one.
+        const groupStart = GROUP_START_RE.exec(message);
+        if (groupStart) {
+            for (const t of tasks) if (t.group === groupStart[1] && t.state === 'running') Object.assign(t, { state: 'pending', start: null });
+            continue;
+        }
         const m = LABEL_RE.exec(message);
         if (!m) continue;
         const task = tasks[Number(m[1]) - 1];
@@ -158,16 +201,24 @@ function deriveRun(runDir, queue, lines, runner) {
         else if (what.startsWith('already DONE')) { if (task.state !== 'done') task.state = 'done'; }
     }
 
-    // A task that started but has no final line is running only while its runner and session live.
-    // A process snapshot taken before the last log line can't judge it (the runner may have just started).
-    const open = tasks.find(t => t.state === 'running');
+    // A task that started but has no final line is running only while its runner and session live: for a
+    // parallel task, its own child process of the runner and that process's session. Each task is judged
+    // on its own; the run is no-session only when no running task has a session. A process snapshot taken
+    // before the last log line can't judge it (the runner, or a task's process, may have just started).
+    const open = tasks.filter(t => t.state === 'running');
     const lastLineAt = lines.length ? parseLocal(lines[lines.length - 1].time) : 0;
-    if (runState === 'running' && liveness.at > lastLineAt + 5000) {
-        if (runner.known && !runner.alive) runState = 'interrupted';
-        else if (runner.known && runner.alive && open && !runner.session) runState = 'no-session';
+    if (runState === 'running' && liveness.at > lastLineAt + 5000 && runner.known) {
+        if (!runner.alive) runState = 'interrupted';
+        else if (open.length) {
+            for (const t of open) {
+                if (!groupOf.has(t.id)) t.state = runner.main ? 'running' : 'no-session';
+                else if (!runner.tasks.has(t.id)) t.state = 'interrupted';
+                else t.state = runner.tasks.get(t.id) ? 'running' : 'no-session';
+            }
+            if (!open.some(t => t.state === 'running')) runState = 'no-session';
+        }
     }
-    if (open && runState !== 'running' && runState !== 'no-session') open.state = 'interrupted';
-    if (open && runState === 'no-session') open.state = 'no-session';
+    if (runState !== 'running' && runState !== 'no-session') for (const t of open) t.state = 'interrupted';
 
     for (const t of tasks) {
         const result = statOrNull(path.join(runDir, 'results', `${t.id}.md`));
@@ -180,7 +231,7 @@ function deriveRun(runDir, queue, lines, runner) {
         t.lastActivity = log ? log.mtimeMs : null;
     }
     const finishedAt = ['done', 'stopped', 'preflight-failed', 'interrupted'].includes(runState) && lines.length ? lines[lines.length - 1].time : null;
-    return { state: runState, startedAt, finishedAt, preflight, tasks };
+    return { state: runState, startedAt, finishedAt, preflight, tasks, ...(groups.length ? { groups } : {}) };
 }
 
 function listRuns() {
@@ -354,7 +405,7 @@ async function handle(req, res) {
             commits = await commitsFor(queue.workDir, detail.startedAt, detail.finishedAt, `${runDir}|${detail.finishedAt}`);
         }
         const settings = { workDir: queue.workDir, permissionMode: queue.permissionMode, model: queue.model, effort: queue.effort };
-        return send(res, 200, { ...detail, settings, runner, livenessAt: liveness.at, commits, progress: lines });
+        return send(res, 200, { ...detail, settings, runner: publicRunner(runner), livenessAt: liveness.at, commits, progress: lines });
     }
 
     const taskId = url.searchParams.get('task');

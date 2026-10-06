@@ -54,10 +54,19 @@ The session of a parallel task runs in a child process of the runner, whose comm
 
 ## Status
 
-Tickets 01 and 02 are done. The `Status:` lines and checkboxes inside the ticket files are as they were written and were not updated.
+Tickets 01, 02 and 04 are done. The `Status:` lines and checkboxes inside the ticket files are as they were written and were not updated.
 
 ## Check tooling
 
 The runner and monitor checks run against tooling kept outside the repository, in `%TEMP%\task-queue-monitor-fixtures` (its own README documents it). That is deliberate: no fixtures or test suites are committed. The folder is temporary and may be gone; if so, rebuild it from the "Testing Decisions" of this spec and of the pixel-monitor spec.
 
 The runner checks are in its `runner-check` folder: `check-runner.ps1` (the six scenarios from before groups) and `check-parallel.ps1` (groups, worktrees, merges, conflict sessions, stops and re-runs, against throwaway git repositories). Both use the stub `claude` there and cost nothing.
+
+The monitor checks for groups are `check-parallel.mjs` in the fixtures folder, with the fake runner's group scenarios (`group`, `group-fail`, `group-five`, `group-process`): the fake runner starts each task of a group in a child process `run.ps1 ... -ParallelTask "<id>"` with its own stand-in session, as the real runner does. `check-states.mjs` and `check-http.mjs` still cover the runs without groups.
+
+## Monitor: what ticket 04 added
+
+- `/api/run` answers, for a run whose `queue.json` has groups, `groups` (`[{ id: "09-10", tasks: ["09", "10"] }]`) and each task's `group` (its group's id, or null). A run without groups answers exactly as before.
+- The server tells the runner from its `-ParallelTask` child processes: a session of the runner belongs to the sequential task, a session of a child to that child's task. A running parallel task is no-session when its child lives without a session, and interrupted when its child is gone; the run is no-session only when no running task has a session. The runner's `session` field says whether any session lives.
+- The scene gives every task at a desk its own desk, in a column under the first one, with its own helpers and "+N" marker; a task keeps its desk while it stays at one. The alert corner holds two workers a row and pushes the done zone down when it needs more. A group's tasks have a band under their feet in the queue line, a plaque on their desk and a name tag framed in the group's colour; their accessible names end with `group <id>` (before the helper count at a desk).
+- One notification per finished task, also when several finish between two polls.

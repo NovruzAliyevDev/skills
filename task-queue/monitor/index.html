@@ -19,6 +19,8 @@
   --scene-sky: #c4e6f8; --scene-cloud: #ffffff; --scene-leaf: #5aa05e; --scene-leaf-dark: #3f7d45; --scene-pot: #bb6a40;
   --scene-rug: #cfe7d2; --scene-rug-edge: #8fc69c; --scene-alert-floor: #f1d2cc; --scene-hazard: #f0c23e;
   --scene-trousers: #3c4250;
+  /* Parallel groups' marks, one colour per group in the run's order. */
+  --scene-group-0: #8a4fd6; --scene-group-1: #d4691c; --scene-group-2: #148f96; --scene-group-3: #c2347f;
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -32,6 +34,7 @@
     --scene-sky: #1f2b4e; --scene-cloud: #d6deee; --scene-leaf: #4a8b50; --scene-leaf-dark: #33643a; --scene-pot: #9b5636;
     --scene-rug: #2f4a3b; --scene-rug-edge: #4d7b5d; --scene-alert-floor: #4f2c2c; --scene-hazard: #d9ac2d;
     --scene-trousers: #5b647c;
+    --scene-group-0: #b08cf0; --scene-group-1: #f0a057; --scene-group-2: #4fc8cf; --scene-group-3: #ec7ab8;
   }
 }
 * { box-sizing: border-box; }
@@ -112,6 +115,8 @@ pre.plain { margin: 0; max-height: 50vh; overflow: auto; padding: 8px 10px; back
   background: var(--panel); color: var(--text); border: 2px solid var(--frame); white-space: nowrap; pointer-events: none; }
 .tag span { overflow: hidden; text-overflow: ellipsis; }
 .tag.open { background: var(--accent); color: #fff; }
+/* A parallel group's worker: its name tag is framed in the group's colour. */
+.tag.grouped { border-color: var(--group); box-shadow: inset 0 -2px 0 var(--group); }
 .worker { position: absolute; padding: 0; margin: 0; border: 0; background: transparent; cursor: pointer; }
 /* Helpers have a hover target over each sprite, and a "+N" marker for those not drawn; neither is in the Tab order. */
 .helper { position: absolute; cursor: pointer; }

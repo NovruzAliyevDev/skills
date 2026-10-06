@@ -1,7 +1,7 @@
 // The office: where the zones are, how workers and helpers walk and what they do in place, drawing on
 // a canvas at world resolution scaled up by an integer factor, and the DOM overlay kept over the
-// sprites: one button and one name tag per worker, a hover target per helper and the "+N" helper
-// marker, the run-state sign, the "+N done" counter with its list, and the tooltip. The overlay is the
+// sprites: one button and one name tag per worker, a hover target per helper and a "+N" helper marker
+// per desk, the run-state sign, the "+N done" counter with its list, and the tooltip. The overlay is the
 // only way in; the canvas is hidden from assistive technology.
 import { color, confettiSprite, handsSprite, helperSprite, sceneSprite, workerSprite } from './sprites.js';
 import { STATE_LABEL, badge, esc, money, setHtml, taskDuration, taskFacts } from './panel.js';
@@ -22,7 +22,7 @@ const MONITOR = { x: 155, y: DESK.y - 12 };
 const KEYBOARD = { x: SEAT.x + 1, y: DESK.y + 1 };
 const HANDS = { x: KEYBOARD.x, y: KEYBOARD.y - 1 };
 const HELPER_SIZE = { w: 10, h: 12 };
-// Where the desk task's subagents stand, one per helper the office draws (HELPERS_SHOWN in workers.js):
+// Where a desk task's subagents stand, one per helper the office draws (HELPERS_SHOWN in workers.js):
 // beside the desk and in front of it. A helper comes in at the door, walks along the aisle under the
 // wall, then down the desk's left or right `side` to its spot, and leaves the same way back.
 const HELPER_SPOTS = [
@@ -30,10 +30,22 @@ const HELPER_SPOTS = [
 ];
 const DOORWAY = { x: 16, y: WALL_H - HELPER_SIZE.h };
 const AISLE_Y = 52;
-const HELPERS_MORE = { x: 216, y: 82 };                 // the "+N" marker of the helpers not drawn
+const HELPERS_MORE = { x: 216, y: 82 };                 // a desk's "+N" marker of the helpers not drawn
+// While a parallel group runs, each of its tasks has a desk of its own: the first desk is where the one
+// desk always stood, and the others stand in a column under it, DESK_ROW apart, each with its chair, its
+// helper spots and its "+N" marker. Desk d is the first desk moved down by d * DESK_ROW. Workers and
+// helpers reach a lower desk by a lane beside the column (LANE), so they never walk through the desks above.
+const DESK_ROW = 60;                                    // room for the front helpers and, under them, the next name tag at 1x
+const LANE = { worker: 120, left: 124, right: 216 };      // x of a worker's lane, and of the helpers' lanes left and right of the desks
 const DONE = { x: 236, y: 118, step: 20, perRow: 4 };    // the "+N done" counter takes the slot after its workers
-const ALERT = { x: 292, y: 66, step: 20 };
+// The alert corner holds two workers a row; a corner of more rows pushes the done zone down by as many.
+const ALERT = { x: 292, y: 66, step: 20, perRow: 2 };
 const ALERT_ZONE = { x: 264, y: WALL_H, w: WORLD_W - 264, h: 46 };
+// Group marks, one colour per group in the run's order: a band under the feet of a group's workers in the
+// queue line, a plaque on the desk of each of its workers, and their name tags' border.
+const GROUP_COLORS = 4;                                 // the --scene-group-N tokens of index.html, in both themes
+const GROUP_BAND = { y: SPRITE + 4, h: 2 };
+const GROUP_PLAQUE = { x: 4, y: 6, w: 8, h: 4 };
 const DOOR = { x: 10, y: WALL_H - 34 };
 const WINDOW = { x: 222, y: 10 };
 const BEACON = { x: 298, y: 16 };
@@ -58,8 +70,24 @@ const LOOP_MS = 80;                                    // how often figures stan
 const BOB_EVERY = 2400, BOB_FOR = 400, BLINK_EVERY = 3700, BLINK_FOR = 150;
 const TYPE_MS = 200, SCREEN_MS = 900, BREATH_MS = 1200, ZZ_MS = 450, ALARM_MS = 400, HELPER_BOB_MS = 300;
 
+// How far desk `desk` stands below the first one.
+const deskDown = desk => desk * DESK_ROW;
+
+// Slots in use: the queue's workers; the done zone's workers and the counter after them; the alert corner's.
+const queueSlots = office => office.workers.filter(w => w.place === 'queue').length;
+const doneWorkers = office => office.workers.filter(w => w.place === 'done').length;
+const doneSlots = office => doneWorkers(office) + (office.collapsed.length ? 1 : 0);
+const alertSlots = office => office.workers.filter(w => w.place === 'alert').length;
+
+// How the office is laid out for an office snapshot: its desks, its alert corner's rows, and where the
+// done zone starts under them.
+function layoutOf(office) {
+  const alertRows = Math.max(1, Math.ceil(alertSlots(office) / ALERT.perRow));
+  return { desks: office.desks || 1, alertRows, doneY: DONE.y + (alertRows - 1) * ROW };
+}
+
 // Where a worker stands, and how wide its name tag may be.
-function spotOf(worker) {
+function spotOf(worker, layout) {
   const { place, slot } = worker;
   if (place === 'queue') {
     const row = Math.floor(slot / QUEUE.perRow), col = slot % QUEUE.perRow;
@@ -68,27 +96,25 @@ function spotOf(worker) {
   }
   if (place === 'done') {
     const row = Math.floor(slot / DONE.perRow), col = slot % DONE.perRow;
-    return { x: DONE.x + col * DONE.step, y: DONE.y + row * ROW, tagWidth: DONE.step - 2 };
+    return { x: DONE.x + col * DONE.step, y: layout.doneY + row * ROW, tagWidth: DONE.step - 2 };
   }
-  if (place === 'alert') return { x: ALERT.x - slot * ALERT.step, y: ALERT.y, tagWidth: slot ? ALERT.step - 2 : 40 };
-  // The runner runs one task at a time; should two be at the desk, the others stand beside it.
-  return slot ? { x: DESK.x + 46 + (slot - 1) * 18, y: SEAT.y + 4, tagWidth: 16 } : { x: SEAT.x, y: SEAT.y, tagWidth: 56 };
+  if (place === 'alert') {
+    const row = Math.floor(slot / ALERT.perRow), col = slot % ALERT.perRow;
+    return { x: ALERT.x - col * ALERT.step, y: ALERT.y + row * ROW, tagWidth: worker.alone ? 40 : ALERT.step - 2 };
+  }
+  return { x: SEAT.x, y: SEAT.y + deskDown(slot), tagWidth: 56 };
 }
 const NARROW_TAG = QUEUE.step - 2;                      // a walking worker's name tag never crowds the others
 
-// Slots in use: the queue's workers; the done zone's workers and the counter after them.
-const queueSlots = office => office.workers.filter(w => w.place === 'queue').length;
-const doneWorkers = office => office.workers.filter(w => w.place === 'done').length;
-const doneSlots = office => doneWorkers(office) + (office.collapsed.length ? 1 : 0);
-
 // Where a zone's last row ends; it always has at least one row.
-function zoneBottom(zone, slots) {
-  return zone.y + Math.max(1, Math.ceil(slots / zone.perRow)) * ROW;
+function zoneBottom(zone, slots, top = zone.y) {
+  return top + Math.max(1, Math.ceil(slots / zone.perRow)) * ROW;
 }
 
-// The world grows taller for long queues instead of shrinking the workers.
-function worldHeight(office) {
-  return Math.max(MIN_WORLD_H, zoneBottom(QUEUE, queueSlots(office)), zoneBottom(DONE, doneSlots(office)));
+// The world grows taller for long queues and for more desks instead of shrinking the workers.
+function worldHeight(office, layout) {
+  return Math.max(MIN_WORLD_H, zoneBottom(QUEUE, queueSlots(office)), zoneBottom(DONE, doneSlots(office), layout.doneY),
+    DESK_FRONT + 28 + deskDown(layout.desks - 1));
 }
 
 // Device pixels per world pixel: the largest whole number that fits the width, so every world pixel is
@@ -127,12 +153,25 @@ function pointAt(route, s) {
   return { x: end.x, y: end.y, dx: 0 };
 }
 
-// A worker walks across, then up or down: out from behind the desk first, and never through it.
-const workerRoute = (from, to) => dedupe([{ x: from.x, y: from.y }, { x: to.x, y: from.y }, { x: to.x, y: to.y }]);
+// A worker walks across, then up or down: out from behind the desk first, and never through it. To a
+// lower desk it walks down the lane beside the desks first, then across to its seat.
+function workerRoute(from, to, desk) {
+  if (desk > 0 && from.x < to.x) {
+    return dedupe([{ x: from.x, y: from.y }, { x: LANE.worker, y: from.y }, { x: LANE.worker, y: to.y }, { x: to.x, y: to.y }]);
+  }
+  return dedupe([{ x: from.x, y: from.y }, { x: to.x, y: from.y }, { x: to.x, y: to.y }]);
+}
 
-function helperRoute(spot) {
+// A helper's spot at a desk.
+function helperSpot(spot, desk) {
   const { x, y, side } = HELPER_SPOTS[spot];
-  return dedupe([DOORWAY, { x: DOORWAY.x, y: AISLE_Y }, { x: side, y: AISLE_Y }, { x: side, y }, { x, y }]);
+  return { x, y: y + deskDown(desk), side };
+}
+
+function helperRoute(spot, desk) {
+  const { x, y, side } = helperSpot(spot, desk);
+  const lane = desk ? (side < SEAT.x ? LANE.left : LANE.right) : side;
+  return dedupe([DOORWAY, { x: DOORWAY.x, y: AISLE_Y }, { x: lane, y: AISLE_Y }, { x: lane, y }, { x, y }]);
 }
 
 // Puts a figure at distance `s` along `route`.
@@ -212,7 +251,7 @@ function offsetOf(id) {
 const offBeat = (t, ms) => Math.floor(t / ms) % 2 === 1;
 const blinking = t => t % BLINK_EVERY < BLINK_FOR;
 
-function drawRoom(ctx, height, office) {
+function drawRoom(ctx, height, office, layout) {
   const fill = (x, y, w, h, c) => { ctx.fillStyle = color(c); ctx.fillRect(x, y, w, h); };
   fill(0, 0, WORLD_W, WALL_H, '--scene-wall');
   fill(0, 0, WORLD_W, 4, '--scene-ceiling');
@@ -231,15 +270,21 @@ function drawRoom(ctx, height, office) {
     fill(x + 2, y + SPRITE + 1, SPRITE - 4, 2, '--scene-hazard');
   }
 
-  for (const { x, y } of HELPER_SPOTS) fill(x + 1, y + HELPER_SIZE.h + 1, HELPER_SIZE.w - 2, 2, '--scene-metal-light');
+  for (let desk = 0; desk < layout.desks; desk++) {
+    for (let spot = 0; spot < HELPER_SPOTS.length; spot++) {
+      const { x, y } = helperSpot(spot, desk);
+      fill(x + 1, y + HELPER_SIZE.h + 1, HELPER_SIZE.w - 2, 2, '--scene-metal-light');
+    }
+  }
 
   // The done zone: a rug under its rows.
-  const doneBottom = zoneBottom(DONE, doneSlots(office)) - 8;
-  fill(DONE.x - 8, DONE.y - 16, WORLD_W - DONE.x + 4, doneBottom - DONE.y + 16, '--scene-rug-edge');
-  fill(DONE.x - 6, DONE.y - 14, WORLD_W - DONE.x, doneBottom - DONE.y + 12, '--scene-rug');
+  const top = layout.doneY;
+  const doneBottom = zoneBottom(DONE, doneSlots(office), top) - 8;
+  fill(DONE.x - 8, top - 16, WORLD_W - DONE.x + 4, doneBottom - top + 16, '--scene-rug-edge');
+  fill(DONE.x - 6, top - 14, WORLD_W - DONE.x, doneBottom - top + 12, '--scene-rug');
 
   // The alert corner: red floor inside hazard stripes.
-  const z = ALERT_ZONE;
+  const z = { ...ALERT_ZONE, h: ALERT_ZONE.h + (layout.alertRows - 1) * ROW };
   fill(z.x, z.y, z.w, z.h, '--scene-alert-floor');
   for (let y = z.y; y < z.y + z.h; y++) {
     for (let x = z.x; x < z.x + z.w; x++) {
@@ -290,7 +335,6 @@ export function createScene(host, { onOpen }) {
   const sign = document.createElement('div');
   const tags = document.createElement('div');
   const helperLayer = document.createElement('div');
-  const more = document.createElement('div');
   const crew = document.createElement('div');
   const counter = document.createElement('button');
   const list = document.createElement('div');
@@ -303,9 +347,6 @@ export function createScene(host, { onOpen }) {
   tags.setAttribute('aria-hidden', 'true');
   // Helpers are for the pointer only: the desk worker's name says how many there are.
   helperLayer.setAttribute('aria-hidden', 'true');
-  more.className = 'helpers-more';
-  more.hidden = true;
-  helperLayer.append(more);
   counter.type = 'button';
   counter.className = 'counter';
   counter.setAttribute('aria-expanded', 'false');
@@ -327,7 +368,9 @@ export function createScene(host, { onOpen }) {
   const walkers = new Map();                     // task id -> its worker's figure
   const helpers = new Map();                     // helper id -> its figure, kept while it walks out
   const targets = new Map();                     // helper id -> its hover target
-  let office = { state: null, preflightError: null, workers: [], collapsed: [], helperTask: null, helpers: [], otherHelpers: [], first: true };
+  const mores = new Map();                       // task id -> its desk's "+N" marker
+  let office = { state: null, preflightError: null, workers: [], collapsed: [], desks: 1, helpers: [], otherHelpers: [], first: true };
+  let layout = layoutOf(office);
   let openId = null;                             // the task whose drawer is open
   let height = MIN_WORLD_H;
   let scale = null;
@@ -339,8 +382,7 @@ export function createScene(host, { onOpen }) {
   let still = motion.matches;
 
   const px = v => `${v * scale.css}px`;
-  // The worker whose subagents the helpers are.
-  const helpersParent = () => office.workers.find(w => w.id === office.helperTask);
+  const workerOf = id => office.workers.find(w => w.id === id);
 
   // --- The tooltip: for the hovered element or the focused worker, whichever came last, until Esc. ---
 
@@ -353,19 +395,22 @@ export function createScene(host, { onOpen }) {
 
   function tipHtml(target) {
     if (target === sign) return office.preflightError && `<p class="tip-title">${badge(office.state)}</p><p>${esc(office.preflightError)}</p>`;
-    if (target === more) {
-      const others = office.otherHelpers;
+    const parent = workerOf(target.dataset.task);
+    const owner = parent && office.desks > 1 ? `<p class="muted">Subagents of ${esc(parent.number)} ${esc(parent.title)}</p>` : '';
+    if (target.classList.contains('helpers-more')) {
+      const others = office.otherHelpers.find(o => o.task === target.dataset.task)?.list || [];
       return others.length && `<p class="tip-title">${others.length} more ${others.length === 1 ? 'helper' : 'helpers'}</p>` +
-        `<ul class="tip-list">${others.map(h => `<li><b>${esc(h.type)}</b> ${esc(h.description)}</li>`).join('')}</ul>`;
+        `<ul class="tip-list">${others.map(h => `<li><b>${esc(h.type)}</b> ${esc(h.description)}</li>`).join('')}</ul>${owner}`;
     }
     if (target.classList.contains('helper')) {
-      const helper = office.helpers.find(h => h.id === target.dataset.helper), parent = helpersParent();
+      const helper = office.helpers.find(h => h.id === target.dataset.helper);
       return helper && `<p class="tip-title">Helper · <b>${esc(helper.type)}</b></p><p>${esc(helper.description)}</p>` +
         (parent ? `<p class="muted">Subagent of ${esc(parent.number)} ${esc(parent.title)}</p>` : '');
     }
-    const worker = office.workers.find(w => w.id === target.dataset.id);
+    const worker = workerOf(target.dataset.id);
     if (!worker) return null;
-    return `<p class="tip-title"><b>${esc(worker.number)}</b> ${esc(worker.title)}</p>${badge(worker.state)}${taskFacts(worker.task)}`;
+    const group = worker.group ? `<p class="muted">Parallel group ${esc(worker.group)}</p>` : '';
+    return `<p class="tip-title"><b>${esc(worker.number)}</b> ${esc(worker.title)}</p>${group}${badge(worker.state)}${taskFacts(worker.task)}`;
   }
 
   function showTip() {
@@ -430,9 +475,10 @@ export function createScene(host, { onOpen }) {
       onOpen(entry.dataset.entry);
     }
   });
-  // A helper, or the "+N" marker, opens its task's drawer on Activity, where its subagent's work shows.
+  // A helper, or a "+N" marker, opens its task's drawer on Activity, where its subagent's work shows.
   helperLayer.addEventListener('click', e => {
-    if (office.helperTask && e.target.closest('.helper, .helpers-more')) onOpen(office.helperTask, 'activity');
+    const task = e.target.closest('.helper, .helpers-more')?.dataset.task;
+    if (task) onOpen(task, 'activity');
   });
 
   // --- The "+N done" counter: in a long run, a button after the workers that lists the finished tasks
@@ -547,12 +593,12 @@ export function createScene(host, { onOpen }) {
   }
 
   function roomCanvas() {
-    const key = `${height}|${queueSlots(office)}|${doneSlots(office)}`;
+    const key = `${height}|${queueSlots(office)}|${doneSlots(office)}|${layout.desks}|${layout.alertRows}`;
     if (room && roomKey === key) return room;
     room = document.createElement('canvas');
     room.width = WORLD_W;
     room.height = height;
-    drawRoom(room.getContext('2d'), height, office);
+    drawRoom(room.getContext('2d'), height, office, layout);
     roomKey = key;
     return room;
   }
@@ -582,14 +628,37 @@ export function createScene(host, { onOpen }) {
     ctx.drawImage(sprite, Math.round(figure.x), Math.round(figure.y));
   }
 
-  // The desk, its screen and keyboard, and the hands of the worker typing there.
-  function drawDesk(now) {
-    const typist = office.workers.find(w => w.place === 'desk' && w.slot === 0 && w.anim === 'type' && !walking(walkers.get(w.id)));
+  const groupToken = worker => `--scene-group-${worker.groupIndex % GROUP_COLORS}`;
+  const groupColor = worker => color(groupToken(worker));
+
+  // A desk, its screen and keyboard, the hands of the worker typing there, and the plaque of its worker's
+  // group.
+  function drawDesk(desk, now) {
+    const down = deskDown(desk);
+    const seated = office.workers.find(w => w.place === 'desk' && w.slot === desk && !walking(walkers.get(w.id)));
+    const typist = seated?.anim === 'type' ? seated : null;
     const moving = typist && !still;
-    ctx.drawImage(sceneSprite('desk'), DESK.x, DESK.y);
-    ctx.drawImage(sceneSprite(moving && offBeat(now, SCREEN_MS) ? 'monitor-scrolled' : 'monitor'), MONITOR.x, MONITOR.y);
-    ctx.drawImage(sceneSprite('keyboard'), KEYBOARD.x, KEYBOARD.y);
-    if (typist) ctx.drawImage(handsSprite(typist.look, moving && offBeat(now, TYPE_MS) ? 1 : 0), HANDS.x, HANDS.y);
+    ctx.drawImage(sceneSprite('desk'), DESK.x, DESK.y + down);
+    ctx.drawImage(sceneSprite(moving && offBeat(now, SCREEN_MS) ? 'monitor-scrolled' : 'monitor'), MONITOR.x, MONITOR.y + down);
+    ctx.drawImage(sceneSprite('keyboard'), KEYBOARD.x, KEYBOARD.y + down);
+    if (typist) ctx.drawImage(handsSprite(typist.look, moving && offBeat(now, TYPE_MS) ? 1 : 0), HANDS.x, HANDS.y + down);
+    if (seated?.group) {
+      const { x, y, w, h } = GROUP_PLAQUE;
+      ctx.fillStyle = color('--scene-ink');
+      ctx.fillRect(DESK.x + x - 1, DESK.y + down + y - 1, w + 2, h + 2);
+      ctx.fillStyle = groupColor(seated);
+      ctx.fillRect(DESK.x + x, DESK.y + down + y, w, h);
+    }
+  }
+
+  // The band under the feet of a group's workers waiting in the queue line; neighbours' bands join.
+  function drawQueueBands() {
+    for (const worker of office.workers) {
+      const figure = walkers.get(worker.id);
+      if (worker.place !== 'queue' || !worker.group || walking(figure)) continue;
+      ctx.fillStyle = groupColor(worker);
+      ctx.fillRect(Math.round(figure.x) - (QUEUE.step - SPRITE) / 2, Math.round(figure.y) + GROUP_BAND.y, QUEUE.step, GROUP_BAND.h);
+    }
   }
 
   // A worker's marker shows once it stands in its place. The "Zz" rises and the "!" bounces, staying
@@ -619,13 +688,14 @@ export function createScene(host, { onOpen }) {
     ctx.drawImage(roomCanvas(), 0, 0);
     const alarm = office.workers.some(w => w.anim === 'alarm' && !walking(walkers.get(w.id)));
     ctx.drawImage(sceneSprite(alarm && (still || offBeat(now, ALARM_MS)) ? 'beacon' : 'beacon-off'), BEACON.x, BEACON.y);
-    ctx.drawImage(sceneSprite('chair'), CHAIR.x, CHAIR.y);
+    drawQueueBands();
+    for (let desk = 0; desk < layout.desks; desk++) ctx.drawImage(sceneSprite('chair'), CHAIR.x, CHAIR.y + deskDown(desk));
     const layers = office.workers.map(worker => {
       const figure = walkers.get(worker.id);
       return { feet: figure.y + SPRITE, paint: () => drawWorker(worker, figure, now) };
     });
     for (const [id, figure] of helpers) layers.push({ feet: figure.y + HELPER_SIZE.h, paint: () => drawHelper(id, figure, now) });
-    layers.push({ feet: DESK_FRONT, paint: () => drawDesk(now) });
+    for (let desk = 0; desk < layout.desks; desk++) layers.push({ feet: DESK_FRONT + deskDown(desk), paint: () => drawDesk(desk, now) });
     layers.sort((a, b) => a.feet - b.feet);
     for (const layer of layers) layer.paint();
     for (const worker of office.workers) drawMarker(worker, walkers.get(worker.id), now);
@@ -662,8 +732,10 @@ export function createScene(host, { onOpen }) {
       const figure = helpers.get(id);
       Object.assign(target.style, { left: px(Math.round(figure.x)), top: px(Math.round(figure.y)), width: px(HELPER_SIZE.w), height: px(HELPER_SIZE.h) });
     }
-    Object.assign(more.style, { left: px(HELPERS_MORE.x), top: px(HELPERS_MORE.y) });
-    const slot = spotOf({ place: 'done', slot: doneWorkers(office) });
+    for (const { task, desk } of office.otherHelpers) {
+      Object.assign(mores.get(task).style, { left: px(HELPERS_MORE.x), top: px(HELPERS_MORE.y + deskDown(desk)) });
+    }
+    const slot = spotOf({ place: 'done', slot: doneWorkers(office) }, layout);
     Object.assign(counter.style, { left: px(slot.x), top: px(slot.y + 3) });
     placeTip();
     placeList();
@@ -691,6 +763,10 @@ export function createScene(host, { onOpen }) {
       const [number, title] = el.tag.children;
       if (number.textContent !== worker.number) number.textContent = worker.number;
       if (title.textContent !== worker.title) title.textContent = worker.title;
+      // A group's mark on the name tag, while its worker waits in the queue line or sits at a desk.
+      const marked = !!worker.group && (worker.place === 'queue' || worker.place === 'desk');
+      el.tag.classList.toggle('grouped', marked);
+      if (marked) el.tag.style.setProperty('--group', `var(${groupToken(worker)})`);
     }
     keepOrder(crew, [...office.workers.map(w => elements.get(w.id).button), counter, list]);
     keepOrder(tags, office.workers.map(w => elements.get(w.id).tag));
@@ -704,11 +780,25 @@ export function createScene(host, { onOpen }) {
       const target = document.createElement('div');
       target.className = 'helper';
       target.dataset.helper = helper.id;
+      target.dataset.task = helper.task;
       helperLayer.append(target);
       targets.set(helper.id, target);
     }
-    more.hidden = !office.otherHelpers.length;
-    more.textContent = `+${office.otherHelpers.length}`;
+    const waiting = new Set(office.otherHelpers.map(o => o.task));
+    for (const [task, marker] of mores) {
+      if (!waiting.has(task)) { marker.remove(); mores.delete(task); }
+    }
+    for (const { task, list: others } of office.otherHelpers) {
+      let marker = mores.get(task);
+      if (!marker) {
+        marker = document.createElement('div');
+        marker.className = 'helpers-more';
+        marker.dataset.task = task;
+        helperLayer.append(marker);
+        mores.set(task, marker);
+      }
+      marker.textContent = `+${others.length}`;
+    }
     syncCounter();
     markOpen();
   }
@@ -721,12 +811,14 @@ export function createScene(host, { onOpen }) {
     const ids = new Set(office.workers.map(w => w.id));
     for (const id of walkers.keys()) if (!ids.has(id)) walkers.delete(id);
     for (const worker of office.workers) {
-      const spot = spotOf(worker);
+      const spot = spotOf(worker, layout);
       let figure = walkers.get(worker.id);
+      // A worker whose spot moved with the layout (the done zone under a deeper alert corner) walks there too.
+      const shifted = figure && (figure.spot.x !== spot.x || figure.spot.y !== spot.y);
       if (!figure) walkers.set(worker.id, figure = figureOn([spot]));
       else if (!live) setRoute(figure, [spot]);
-      else if (worker.moved) {
-        setRoute(figure, workerRoute(figure, spot));
+      else if (worker.moved || shifted) {
+        setRoute(figure, workerRoute(figure, spot, worker.place === 'desk' ? worker.slot : 0));
         figure.cheer = null;
       }
       figure.spot = spot;
@@ -743,7 +835,7 @@ export function createScene(host, { onOpen }) {
     for (const helper of office.helpers) {
       let figure = helpers.get(helper.id);
       if (!figure) {
-        const route = helperRoute(helper.spot);
+        const route = helperRoute(helper.spot, helper.desk);
         figure = figureOn(route, live && helper.arrive === 'walk' ? 0 : routeLength(route));
         helpers.set(helper.id, figure);
       } else if (figure.leaving) comeBack(figure);
@@ -811,8 +903,19 @@ export function createScene(host, { onOpen }) {
     // The office of a new snapshot, or of new helpers (see createOffice).
     update(next) {
       office = next;
+      layout = layoutOf(office);
       moveFigures();
-      height = worldHeight(office);
+      // A desk stays while its worker walks away from it, and a figure still walking from a desk that is
+      // gone keeps the world tall enough for its walk; the next snapshot after the walk lets both go.
+      for (const figure of walkers.values()) {
+        const from = figure.route[0], desk = (from.y - SEAT.y) / DESK_ROW;
+        if (walking(figure) && from.x === SEAT.x && Number.isInteger(desk) && desk >= 0) layout.desks = Math.max(layout.desks, desk + 1);
+      }
+      let reach = 0;
+      for (const [figure, size] of [...[...walkers.values()].map(f => [f, SPRITE]), ...[...helpers.values()].map(f => [f, HELPER_SIZE.h])]) {
+        if (walking(figure)) reach = Math.max(reach, ...figure.route.map(p => p.y + size + 4));
+      }
+      height = Math.max(worldHeight(office, layout), reach);
       // A preflight failure's message is the sign's tooltip, and part of its text for screen readers.
       const preflight = office.preflightError ? `<span class="sr-only">. ${esc(office.preflightError)}</span>` : '';
       sign.className = `sign s-${office.state}`;

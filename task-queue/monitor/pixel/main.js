@@ -1,10 +1,10 @@
 // Wiring: the pollers, run selection and the URL hash, the selected run's header, office, sections and
-// task drawer, the running task's helpers, notifications and the permission button, the tab title, the
+// task drawer, the running tasks' helpers, notifications and the permission button, the tab title, the
 // offline marker, the theme listener and the keyboard.
 import { onOffline, readFeed, watchRun, watchRuns } from './api.js';
 import { BAD, STATE_LABEL, createDrawer, esc, onRunChosen, renderCommits, renderProgress, renderRunHeader, renderRunList, runKey } from './panel.js';
 import { resetSprites } from './sprites.js';
-import { createHelperList, createOffice, helperTaskOf } from './workers.js';
+import { createHelperList, createOffice, helperTasksOf } from './workers.js';
 import { createScene } from './scene.js';
 
 const layout = document.getElementById('layout');
@@ -23,7 +23,7 @@ let selected = null;
 let detail = null;            // the selected run's last snapshot
 let office = null;            // the selected run's office model, which compares its snapshots
 let scene = null;
-let desk = { task: null, helpers: null, stop: null };   // the helper task's log, read for its helpers
+const desks = new Map();      // helper task id -> { helpers, stop }: its log, read for its helpers
 let opener = null;            // what had the focus when the drawer opened; it gets the focus back on close
 let previousRuns = null;      // the run list of the poll before, to notice what changed
 
@@ -55,7 +55,7 @@ function openTask(id, tab) {
 function select(run) {
   if (selected && runKey(selected) === runKey(run)) return;
   drawer.close();
-  followDesk(null);
+  followDesks([]);
   selected = { project: run.project, run: run.run };
   detail = null;
   history.replaceState(null, '', `#${encodeURIComponent(runKey(selected))}`);
@@ -67,28 +67,34 @@ function select(run) {
   runPoll.refresh();
 }
 
-// The helper task's session log is read while it runs, for the helpers around the desk (see
-// helperTaskOf). When the drawer shows the same task, its Activity shares the reader.
-function followDesk(taskId) {
-  if (taskId === desk.task) return;
-  desk.stop?.();
-  desk = { task: taskId, helpers: null, stop: null };
-  if (!taskId) return;
-  const followed = desk, subagents = createHelperList();
-  followed.stop = readFeed(selected, taskId, batch => {
-    subagents.apply(batch);
-    followed.helpers = { task: taskId, list: subagents.active };
-    if (desk === followed && detail) showOffice();
-  });
+// Each helper task's session log is read while it runs, for the helpers around its desk (see
+// helperTasksOf). When the drawer shows the same task, its Activity shares the reader.
+function followDesks(taskIds) {
+  for (const [id, followed] of desks) {
+    if (taskIds.includes(id)) continue;
+    followed.stop();
+    desks.delete(id);
+  }
+  for (const id of taskIds) {
+    if (desks.has(id)) continue;
+    const followed = { helpers: null, stop: null }, subagents = createHelperList();
+    desks.set(id, followed);
+    followed.stop = readFeed(selected, id, batch => {
+      subagents.apply(batch);
+      followed.helpers = subagents.active;
+      if (desks.get(id) === followed && detail) showOffice();
+    });
+  }
 }
 
 function showOffice() {
-  scene.update(office.update(detail, desk.helpers));
+  const helpers = new Map([...desks].filter(([, d]) => d.helpers).map(([id, d]) => [id, d.helpers]));
+  scene.update(office.update(detail, helpers));
 }
 
 const runPoll = watchRun(() => selected, next => {
   detail = next;
-  followDesk(helperTaskOf(detail));
+  followDesks(helperTasksOf(detail));
   renderRunHeader(runHead, detail, selected);
   showOffice();
   drawer.update(detail);
@@ -125,14 +131,17 @@ function updateTitle() {
   document.title = `${icon} ${done}/${detail.tasks.length}${label} · ${selected.project}`;
 }
 
-// A notification when a task finishes, when a queue finishes, and when a queue stops in a bad state.
+// A notification when a task finishes (one each, also when tasks of a group finish between two polls),
+// when a queue finishes, and when a queue stops in a bad state.
 function notifyChanges(list) {
   const now = new Map(list.map(r => [runKey(r), r]));
   if (previousRuns) {
     for (const [key, r] of now) {
       const before = previousRuns.get(key);
       if (!before) continue;
-      if ((r.counts.done || 0) > (before.counts.done || 0) && r.state !== 'done') notify(`Task done (${r.counts.done}/${r.total})`, key);
+      if (r.state !== 'done') {
+        for (let done = (before.counts.done || 0) + 1; done <= (r.counts.done || 0); done++) notify(`Task done (${done}/${r.total})`, key);
+      }
       if (r.state !== before.state && r.state === 'done') notify(`Queue finished: all ${r.total} tasks DONE`, key);
       if (r.state !== before.state && BAD.has(r.state)) notify(`Queue ${STATE_LABEL[r.state]}`, key);
     }
