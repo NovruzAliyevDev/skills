@@ -59,9 +59,10 @@ page shows how far the queue has got.
    `[[3,4],[9,10,11]]`: the numbers are your items in list order, and each group needs two or more
    consecutive items. Claude asks about a group it cannot accept, and never makes groups of its own.
 3. Claude turns each item into a brief that a stranger to the conversation could act on, resolving
-   shorthand such as "ticket 62" to real paths. It shows the numbered titles, a summary of each brief,
-   the groups and the settings, and flags anything that cannot run unattended. Correct it until it is
-   right, then confirm.
+   shorthand such as "ticket 62" to real paths. It checks the tasks and leaves the work itself, even a
+   quick look-up of the answer, to the queue's sessions. It shows the numbered titles, a summary of
+   each brief, the groups and the settings, and flags anything that cannot run unattended. Correct it
+   until it is right, then confirm.
 4. Claude writes the run folder, starts the queue in its own PowerShell window, and opens the monitor.
 
 Leave the repository alone until the queue finishes: the sessions work in that same working tree, and

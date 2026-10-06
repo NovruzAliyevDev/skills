@@ -4,6 +4,8 @@ description: Collect a list of tasks, then run them in order, each in its own fr
 disable-model-invocation: true
 ---
 
+You prepare and launch the queue; you never do any part of the tasks themselves. Your work is checking that each task is clear enough for an unattended session, and the answers, findings and research all belong to that session.
+
 Talk to the user in their language. Everything written to disk is English, except task text the user wrote themselves, which is copied as written.
 
 Each task runs in a **fresh session**: it sees the repository, its `CLAUDE.md` and the task file, and nothing of this conversation. The runner (`runner.ps1` beside this file) runs the tasks in order and stops at the first one whose report does not start with `DONE`. Its sessions cannot run background commands, which would die when a headless session ends, and a session that ends without writing a report is resumed once to write it.
@@ -24,6 +26,8 @@ End the turn and wait. Done when the user has sent the list.
 
 The list may end with the **group notation**: double brackets holding one or more groups, each a comma-separated list of numbers, such as `[[9,10]]` or `[[3,4],[9,10,11]]`. A number is an item's position in the user's list, counting from 1, and resolves to that item's task id: the position as two digits (`9` → `"09"`). A list without the notation has no groups; skip to step 3.
 
+A notation written another way whose meaning is unambiguous, such as `parallel: [1,2,3]` for `[[1,2,3]]`, is accepted: state how you read it when you show the list in step 3.
+
 Check every group. Ask the user, and wait for the answer, when a group:
 
 - has only one task;
@@ -35,16 +39,18 @@ Ask the same way when **maxParallel** is not a whole number from 1 up. Quote the
 
 ## 3. Turn each item into a brief
 
-A **brief** is what a stranger to this conversation needs to do the task: goal, scope, where to look, and what proves it done. For every item:
+A **brief** is what a stranger to this conversation needs to do the task: goal, scope, where to look, and what proves it done. It holds the user's words, what they mean, the resolved paths, the scope and the done-criterion, and nothing of the answer. For every item:
 
-- Resolve references the user made in shorthand ("ticket 62", "the palette thing") to concrete paths in the repository by looking them up. Write only what you found or what the user said; a reference you cannot resolve is a question for the user, asked now.
+- Resolve references the user made in shorthand ("ticket 62", "the palette thing", a misspelt skill name) to concrete paths by looking up names and locations only. Opening a file to learn what it says is the task's work, left to its session. Write only what you found or what the user said; a reference you cannot resolve is a question for the user, asked now.
 - Keep the user's own words in the brief, and add below them what you resolved.
 - Give it a short title (a few words, no double quotes). The session is named `ProjectName - title`, where ProjectName is the project's name in CamelCase, as in this session's title.
 - Name what proves it done, when the repository defines it (tests to run, a ticket's acceptance criteria).
 
 When there are groups, first check the working directory with `git rev-parse --is-inside-work-tree` and `git symbolic-ref --quiet HEAD`: it must be a git repository with a branch checked out. If it is not, say so when you show the list and ask whether to drop the groups.
 
-Show the user the numbered titles, a one-line summary of each brief, the settings, and the working directory (this session's). Mark each group in the list, for example by bracketing its tasks under a `Group 09-10, in parallel` line. When there are groups, state that every task, sequential ones included, will be asked to commit its work following the repository's own commit rules, and that a group starts only from a main checkout with nothing uncommitted or untracked.
+Your checks are exactly these: each task is clear and unambiguous, its shorthand is resolved, the group notation is valid, the settings are valid, and nothing in it needs a person or touches production or an external service. A risk you suspect (a file outside the working directory, a tool the permission mode may refuse) is a flag in the list for the user, left untested.
+
+Show the user the numbered titles, a one-line summary of each brief saying what the task asks (its answer stays with the task's session), the settings, and the working directory (this session's). Mark each group in the list, for example by bracketing its tasks under a `Group 09-10, in parallel` line. When there are groups, state that every task, sequential ones included, will be asked to commit its work following the repository's own commit rules, and that a group starts only from a main checkout with nothing uncommitted or untracked.
 
 Flag anything that looks like it cannot run unattended: a step only a person can do, or one that touches production or an external service. Done when the user confirms the list; apply their corrections and show it again until they do. A correction that adds, drops or moves items changes what the group numbers point at: check the groups again as in step 2 and ask about any that moved.
 
