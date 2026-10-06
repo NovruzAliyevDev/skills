@@ -1,8 +1,8 @@
 // The office: where the zones are, how workers and helpers walk and what they do in place, drawing on
 // a canvas at world resolution scaled up by an integer factor, and the DOM overlay kept over the
 // sprites: one button and one name tag per worker, a hover target per helper and a "+N" helper marker
-// per desk, the run-state sign, the "+N done" counter with its list, and the tooltip. The overlay is the
-// only way in; the canvas is hidden from assistive technology.
+// per desk, the run-state sign with a merge sign per parallel group under it, the "+N done" counter with
+// its list, and the tooltip. The overlay is the only way in; the canvas is hidden from assistive technology.
 import { color, confettiSprite, handsSprite, helperSprite, sceneSprite, workerSprite } from './sprites.js';
 import { STATE_LABEL, badge, esc, money, setHtml, taskDuration, taskFacts } from './panel.js';
 
@@ -51,6 +51,12 @@ const WINDOW = { x: 222, y: 10 };
 const BEACON = { x: 298, y: 16 };
 const PLANT = { x: 36, y: WALL_H - 14 };
 const MARKER_OFFSET = { x: 13, y: 0 };                  // markers sit beside the head, under the name tag
+// The signs on the wall: the run state, and under it a merge sign per group, rows of them wrapping within
+// SIGNS_WIDTH world pixels.
+const SIGNS = { x: WORLD_W / 2, y: 10 };
+const SIGNS_WIDTH = 180;
+// A group's merge step, as the accessible name and tooltip of its sign say it; the sign shows the state's name.
+const MERGE_LABEL = { waiting: 'waiting', merging: 'merging', resolving: 'resolving a conflict', merged: 'merged', failed: 'failed' };
 const GAP = 6;                                          // CSS pixels between a tooltip or list and what it belongs to
 const HIDE_DELAY_MS = 150;                              // time to move the pointer from a worker onto its tooltip
 
@@ -327,12 +333,14 @@ function placeBeside(box, anchor, preferAbove) {
   box.style.top = `${clamp(top, GAP, viewH - height - GAP)}px`;
 }
 
-// `onOpen(taskId, tab)` is called when a worker, an entry of the "+N done" list, or a helper (with tab
-// 'activity') is activated.
+// `onOpen(taskId, tab)` is called when a worker, an entry of the "+N done" list, a helper (with tab
+// 'activity'), or a merge sign whose group has a conflict session (with its id) is activated.
 export function createScene(host, { onOpen }) {
   const stage = document.createElement('div');
   const canvas = document.createElement('canvas');
+  const board = document.createElement('div');
   const sign = document.createElement('div');
+  const mergeRow = document.createElement('div');
   const tags = document.createElement('div');
   const helperLayer = document.createElement('div');
   const crew = document.createElement('div');
@@ -344,6 +352,9 @@ export function createScene(host, { onOpen }) {
   sign.className = 'sign';
   sign.setAttribute('role', 'status');
   sign.hidden = true;                            // until the run's first snapshot says its state
+  board.className = 'signs';
+  mergeRow.className = 'merge-signs';
+  board.append(sign, mergeRow);
   tags.setAttribute('aria-hidden', 'true');
   // Helpers are for the pointer only: the desk worker's name says how many there are.
   helperLayer.setAttribute('aria-hidden', 'true');
@@ -360,7 +371,7 @@ export function createScene(host, { onOpen }) {
   tip.id = 'scene-tip';
   tip.setAttribute('role', 'tooltip');
   tip.hidden = true;
-  stage.append(canvas, sign, tags, helperLayer, crew, tip);
+  stage.append(canvas, board, tags, helperLayer, crew, tip);
   host.replaceChildren(stage);
 
   const ctx = canvas.getContext('2d');
@@ -369,7 +380,8 @@ export function createScene(host, { onOpen }) {
   const helpers = new Map();                     // helper id -> its figure, kept while it walks out
   const targets = new Map();                     // helper id -> its hover target
   const mores = new Map();                       // task id -> its desk's "+N" marker
-  let office = { state: null, preflightError: null, workers: [], collapsed: [], desks: 1, helpers: [], otherHelpers: [], first: true };
+  const mergeSigns = new Map();                  // group id -> its merge sign
+  let office = { state: null, preflightError: null, workers: [], collapsed: [], merges: [], desks: 1, helpers: [], otherHelpers: [], first: true };
   let layout = layoutOf(office);
   let openId = null;                             // the task whose drawer is open
   let height = MIN_WORLD_H;
@@ -388,13 +400,14 @@ export function createScene(host, { onOpen }) {
 
   let hovered = null, focused = null, byFocus = false, shownFor = null, dismissed = false, hideTimer = 0;
 
-  // What a pointer or focus event is about: a worker button, a helper, the sign, or the tooltip itself.
+  // What a pointer or focus event is about: a worker button, a helper, a sign, or the tooltip itself.
   function tipTarget(node) {
     return node instanceof Element ? node.closest('.worker, .helper, .helpers-more, .sign, .tip') : null;
   }
 
   function tipHtml(target) {
     if (target === sign) return office.preflightError && `<p class="tip-title">${badge(office.state)}</p><p>${esc(office.preflightError)}</p>`;
+    if (target.classList.contains('merge-sign')) return mergeTipHtml(office.merges.find(m => m.group === target.dataset.group));
     const parent = workerOf(target.dataset.task);
     const owner = parent && office.desks > 1 ? `<p class="muted">Subagents of ${esc(parent.number)} ${esc(parent.title)}</p>` : '';
     if (target.classList.contains('helpers-more')) {
@@ -409,8 +422,25 @@ export function createScene(host, { onOpen }) {
     }
     const worker = workerOf(target.dataset.id);
     if (!worker) return null;
-    const group = worker.group ? `<p class="muted">Parallel group ${esc(worker.group)}</p>` : '';
+    const group = worker.conflict ? `<p class="muted">Conflict session of the merge of group ${esc(worker.group)}</p>`
+      : worker.group ? `<p class="muted">Parallel group ${esc(worker.group)}</p>` : '';
     return `<p class="tip-title"><b>${esc(worker.number)}</b> ${esc(worker.title)}</p>${group}${badge(worker.state)}${taskFacts(worker.task)}`;
+  }
+
+  // A merge sign's tooltip: the merge step's state, the branches merged so far, why it failed, and the
+  // conflict session to open.
+  function mergeTipHtml(merge) {
+    if (!merge) return null;
+    const conflict = merge.conflict && workerOf(merge.conflict);
+    const rows = [];
+    if (merge.merged.length) rows.push(['Merged', merge.merged.map(id => `task ${id}`).join(', ')]);
+    if (conflict?.task.conflictTask) rows.push(['Conflict merging', `task ${conflict.task.conflictTask}`]);
+    if (merge.reason) rows.push(['Stop reason', merge.reason]);
+    const facts = rows.map(([label, value]) => `<div><dt>${label}</dt><dd>${esc(value)}</dd></div>`).join('');
+    return `<p class="tip-title">Merge of group ${esc(merge.group)}</p>` +
+      `<span class="badge m-${esc(merge.state)}">${esc(MERGE_LABEL[merge.state] || merge.state)}</span>` +
+      (facts ? `<dl class="task-facts">${facts}</dl>` : '') +
+      (conflict ? `<p class="muted">Conflict session ${esc(STATE_LABEL[conflict.state] || conflict.state)}: activate the sign to open it.</p>` : '');
   }
 
   function showTip() {
@@ -421,7 +451,7 @@ export function createScene(host, { onOpen }) {
     if (!html) return hideTip();
     if (shownFor !== target) shownFor?.removeAttribute('aria-describedby');
     shownFor = target;
-    if (target.classList.contains('worker')) target.setAttribute('aria-describedby', tip.id);
+    if (target.classList.contains('worker') || target.classList.contains('merge-sign')) target.setAttribute('aria-describedby', tip.id);
     setHtml(tip, html);
     tip.hidden = false;
     placeTip();
@@ -465,6 +495,18 @@ export function createScene(host, { onOpen }) {
     showTip();
   });
   crew.addEventListener('focusout', () => { focused = null; showTip(); });
+  mergeRow.addEventListener('focusin', e => {
+    focused = e.target.closest('.merge-sign');
+    byFocus = true;
+    dismissed = false;
+    showTip();
+  });
+  mergeRow.addEventListener('focusout', () => { focused = null; showTip(); });
+  // A merge sign opens its group's conflict session, when there is one.
+  mergeRow.addEventListener('click', e => {
+    const merge = office.merges.find(m => m.group === e.target.closest('.merge-sign')?.dataset.group);
+    if (merge?.conflict) onOpen(merge.conflict);
+  });
   crew.addEventListener('click', e => {
     const worker = e.target.closest('.worker');
     if (worker) return onOpen(worker.dataset.id);
@@ -720,7 +762,8 @@ export function createScene(host, { onOpen }) {
   // Buttons and name tags follow their workers, and hover targets their helpers, while they walk.
   function positionOverlay() {
     if (!scale) return;
-    Object.assign(sign.style, { left: px(WORLD_W / 2), top: px(10) });
+    Object.assign(board.style, { left: px(SIGNS.x), top: px(SIGNS.y) });
+    mergeRow.style.maxWidth = px(SIGNS_WIDTH);
     for (const worker of office.workers) {
       const figure = walkers.get(worker.id), { button, tag } = elements.get(worker.id);
       const x = Math.round(figure.x), y = Math.round(figure.y);
@@ -799,8 +842,34 @@ export function createScene(host, { onOpen }) {
       }
       marker.textContent = `+${others.length}`;
     }
+    syncMergeSigns();
     syncCounter();
     markOpen();
+  }
+
+  // One merge sign per group, in the run's order, kept across updates so focus survives. Its accessible
+  // name gives the group and the merge state, and whether it opens a conflict session.
+  function syncMergeSigns() {
+    const groups = new Set(office.merges.map(m => m.group));
+    for (const [group, button] of mergeSigns) {
+      if (!groups.has(group)) { button.remove(); mergeSigns.delete(group); }
+    }
+    for (const merge of office.merges) {
+      let button = mergeSigns.get(merge.group);
+      if (!button) {
+        button = document.createElement('button');
+        button.type = 'button';
+        button.dataset.group = merge.group;
+        mergeSigns.set(merge.group, button);
+      }
+      button.className = `sign merge-sign m-${merge.state}`;   // markOpen marks the open one again
+      button.style.setProperty('--group', `var(--scene-group-${merge.groupIndex % GROUP_COLORS})`);
+      const label = `Merge of group ${merge.group}: ${MERGE_LABEL[merge.state] || merge.state}${merge.conflict ? ' · opens the conflict session' : ''}`;
+      if (button.getAttribute('aria-label') !== label) button.setAttribute('aria-label', label);
+      const text = `Merge ${merge.group} · ${merge.state}`;
+      if (button.textContent !== text) button.textContent = text;
+    }
+    keepOrder(mergeRow, office.merges.map(m => mergeSigns.get(m.group)));
   }
 
   // Workers go to their spots: they walk when they move while someone watches, else they are placed
@@ -880,6 +949,7 @@ export function createScene(host, { onOpen }) {
       tag.classList.toggle('open', id === openId);
     }
     counter.classList.toggle('open', office.collapsed.some(c => c.id === openId));
+    for (const merge of office.merges) mergeSigns.get(merge.group)?.classList.toggle('open', !!openId && merge.conflict === openId);
     if (!list.hidden) renderList();
   }
 

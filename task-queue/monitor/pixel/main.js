@@ -2,7 +2,7 @@
 // task drawer, the running tasks' helpers, notifications and the permission button, the tab title, the
 // offline marker, the theme listener and the keyboard.
 import { onOffline, readFeed, watchRun, watchRuns } from './api.js';
-import { BAD, STATE_LABEL, createDrawer, esc, onRunChosen, renderCommits, renderProgress, renderRunHeader, renderRunList, runKey } from './panel.js';
+import { BAD, STATE_LABEL, createDrawer, entryOf, esc, onRunChosen, renderCommits, renderProgress, renderRunHeader, renderRunList, runKey } from './panel.js';
 import { resetSprites } from './sprites.js';
 import { createHelperList, createOffice, helperTasksOf } from './workers.js';
 import { createScene } from './scene.js';
@@ -40,9 +40,10 @@ const drawer = createDrawer(document.getElementById('drawer'), {
   },
 });
 
-// `tab` picks the drawer's tab; without it, an open drawer keeps its own.
+// `tab` picks the drawer's tab; without it, an open drawer keeps its own. `id` names a task or a conflict
+// session.
 function openTask(id, tab) {
-  const task = detail?.tasks.find(t => t.id === id);
+  const task = detail && entryOf(detail, id);
   if (!task) return;
   if (!drawer.taskId) opener = document.activeElement;
   layout.classList.add('drawer-open');
@@ -132,7 +133,7 @@ function updateTitle() {
 }
 
 // A notification when a task finishes (one each, also when tasks of a group finish between two polls),
-// when a queue finishes, and when a queue stops in a bad state.
+// when a merge conflicts (one each), when a queue finishes, and when a queue stops in a bad state.
 function notifyChanges(list) {
   const now = new Map(list.map(r => [runKey(r), r]));
   if (previousRuns) {
@@ -142,6 +143,7 @@ function notifyChanges(list) {
       if (r.state !== 'done') {
         for (let done = (before.counts.done || 0) + 1; done <= (r.counts.done || 0); done++) notify(`Task done (${done}/${r.total})`, key);
       }
+      if ((r.conflicts || 0) > (before.conflicts || 0)) notify('Merge conflict', key);
       if (r.state !== before.state && r.state === 'done') notify(`Queue finished: all ${r.total} tasks DONE`, key);
       if (r.state !== before.state && BAD.has(r.state)) notify(`Queue ${STATE_LABEL[r.state]}`, key);
     }

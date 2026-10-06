@@ -54,7 +54,7 @@ The session of a parallel task runs in a child process of the runner, whose comm
 
 ## Status
 
-Tickets 01, 02 and 04 are done. The `Status:` lines and checkboxes inside the ticket files are as they were written and were not updated.
+Tickets 01 to 04 are done. Ticket 05 is done except its last item, the real check with real sessions on a scratch repository, which costs money and has not been run yet. The `Status:` lines and checkboxes inside the ticket files are as they were written and were not updated.
 
 ## Check tooling
 
@@ -70,3 +70,13 @@ The monitor checks for groups are `check-parallel.mjs` in the fixtures folder, w
 - The server tells the runner from its `-ParallelTask` child processes: a session of the runner belongs to the sequential task, a session of a child to that child's task. A running parallel task is no-session when its child lives without a session, and interrupted when its child is gone; the run is no-session only when no running task has a session. The runner's `session` field says whether any session lives.
 - The scene gives every task at a desk its own desk, in a column under the first one, with its own helpers and "+N" marker; a task keeps its desk while it stays at one. The alert corner holds two workers a row and pushes the done zone down when it needs more. A group's tasks have a band under their feet in the queue line, a plaque on their desk and a name tag framed in the group's colour; their accessible names end with `group <id>` (before the helper count at a desk).
 - One notification per finished task, also when several finish between two polls.
+
+## Monitor: what ticket 05 added
+
+- `/api/run` answers, for a run with groups, each group's merge step in `groups`: `merge` (`waiting` until its `merging` line, `merging`, `resolving` from a `conflict merging` line until the conflict session ends, `merged` after `merge DONE`, `failed` after `merge STOPPED`), `merged` (the task ids merged in the current merge step) and `reason` (the `merge STOPPED` reason). A `Queue` line (a re-run) puts every merge that did not end in `merged` back to `waiting`, and marks a conflict session still open then as interrupted: its runner died with it.
+- It also answers `conflicts`: one entry per group that had a conflict session, with `id` (`merge-<group>`, the name of its log and report), `kind: "conflict"`, `group`, `title`, `conflictTask` (the task whose branch conflicted last), `state`, `start`, `end`, `sessionId`, `cost`, `reason` and the report and log facts of a task. A `merging` line starts a new merge step: its first conflict starts a new entry, a later one resumes it (same start and session id). A merge step that ends in `merge DONE` without a conflict drops the entry of an earlier attempt, so a finished queue keeps no failed conflict session in the alert corner; its report stays in `results`. The conflict session runs in the runner's own process, so its running, no-session and interrupted are judged as a sequential task's, and it counts for the run's no-session.
+- `/api/feed` and `/api/file` take `task=merge-<group>`; `kind=brief` answers 404. `/api/runs` adds, for a run with groups, `conflicts` (how many `conflict merging` lines there are) for the page's notification; its `cost`, and the header's, include the conflict sessions. Task counts and the tab title leave them out.
+- The scene has a row of merge signs under the run-state sign, one button per group, edged in the group's colour, coloured and labelled by its merge state ("Merge of group 01-02: resolving a conflict · opens the conflict session"). Its tooltip gives the merged tasks, the conflicting task and the stop reason; activating it opens the conflict session's drawer.
+- The conflict session is a worker named "M Merge 01-02": at a desk with its helpers while it runs, asleep when its process is gone, in the done zone or the alert corner after. Its drawer has Activity and Report (with the earlier attempt's), no Brief, and a "Conflict merging" fact.
+- A notification fires for every merge conflict.
+- The fake runner plays the merge step and the conflict session (`merging`, `merge <n>`, `merge-done`, `conflict <n>`, `resolve`, `refuse`, `rerun`), in the scenarios `merge`, `conflict`, `conflict-refused` and `conflict-killed`; `check-parallel.mjs` checks them.

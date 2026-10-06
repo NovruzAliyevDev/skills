@@ -160,11 +160,72 @@ function groupsOf(queue) {
         .map(g => ({ id: `${g[0]}-${g[g.length - 1]}`, tasks: g }));
 }
 
-const GROUP_START_RE = /^Group (\S+) - starting \(/;
+// A group's lines, as the README's progress line contract words them. Group ids are task ids joined by `-`.
+const GROUP_LINE_RE = /^Group (\S+) - (.*)$/;
+const CONFLICT_DONE_RE = /^DONE \(session (\S*?)(?:, cost \$([\d.]+))?\)$/;
+
+// The conflict session's id, as its log and report are named: `merge-<group id>`.
+const conflictIdOf = group => `merge-${group}`;
+
+// Applies one group line to its group's merge step and to its conflict session. The merge is `waiting`
+// until the group's merge step starts, `merging` while branches are merged, `resolving` from a conflict
+// until the conflict session ends, then `merged` or `failed`. A merge step that starts again (a re-run)
+// starts a new conflict session at its first conflict; a later conflict of the same step resumes it. A
+// merge step that ends without a conflict leaves no conflict session from an earlier attempt to show.
+function applyGroupLine(group, conflicts, time, rest) {
+    if (rest.startsWith('starting (')) { group.merge = 'waiting'; group.reason = null; return; }
+    if (rest === 'merging') { Object.assign(group, { merge: 'merging', merged: [], reason: null, freshStep: true }); return; }
+    if (rest === 'merge DONE') {
+        group.merge = 'merged';
+        if (group.freshStep) conflicts.delete(conflictIdOf(group.id));
+        return;
+    }
+    let m = /^merged (\S+) \(/.exec(rest);
+    if (m) { if (!group.merged.includes(m[1])) group.merged.push(m[1]); group.merge = 'merging'; return; }
+    m = /^conflict merging (\S+) \(/.exec(rest);
+    if (m) { group.merge = 'resolving'; group.conflictTask = m[1]; return; }
+    m = /^merge STOPPED \((.*)\)$/.exec(rest);
+    if (m) { Object.assign(group, { merge: 'failed', reason: m[1] }); return; }
+    if (!rest.startsWith('conflict session - ')) return;
+    const what = rest.slice('conflict session - '.length);
+    const id = conflictIdOf(group.id);
+    if (what === 'starting') {
+        const fresh = group.freshStep || !conflicts.has(id);
+        group.freshStep = false;
+        const entry = fresh ? { id, kind: 'conflict', group: group.id, title: `Merge ${group.id}`, start: time, sessionId: null, cost: null } : conflicts.get(id);
+        Object.assign(entry, { conflictTask: group.conflictTask ?? null, state: 'running', end: null, reason: null });
+        conflicts.set(id, entry);
+        return;
+    }
+    const entry = conflicts.get(id);
+    if (!entry) return;
+    if ((m = /^session (\S+)$/.exec(what))) entry.sessionId = m[1];
+    else if ((m = CONFLICT_DONE_RE.exec(what))) {
+        Object.assign(entry, { state: 'done', end: time, sessionId: m[1] || entry.sessionId, cost: m[2] ? Number(m[2]) : null });
+        group.merge = 'merging';
+    }
+    else if ((m = /^STOPPED \((.*)\)$/.exec(what))) {
+        Object.assign(entry, { state: /report status 'FAILED'/.test(m[1]) ? 'failed' : 'stopped', end: time, reason: m[1] });
+    }
+}
+
+// What the page reads about a task's or conflict session's files: its report, the earlier attempt's, its
+// session log.
+function addFileFacts(runDir, entry) {
+    const result = statOrNull(path.join(runDir, 'results', `${entry.id}.md`));
+    const previous = statOrNull(path.join(runDir, 'results', `${entry.id}.previous.md`));
+    const log = statOrNull(path.join(runDir, 'logs', `${entry.id}.jsonl`));
+    entry.resultMtime = result ? result.mtimeMs : null;
+    entry.hasPrevious = !!previous;
+    entry.logSize = log ? log.size : 0;
+    entry.lastActivity = log ? log.mtimeMs : null;
+}
 
 function deriveRun(runDir, queue, lines, runner) {
     const groups = groupsOf(queue);
     const groupOf = new Map(groups.flatMap(g => g.tasks.map(id => [id, g.id])));
+    const merges = new Map(groups.map(g => [g.id, { id: g.id, merge: 'waiting', merged: [], reason: null, conflictTask: null, freshStep: false }]));
+    const conflicts = new Map();               // conflict session id -> its entry, in the order they started
     const tasks = (queue.tasks || []).map((t, i) => ({
         index: i + 1, id: t.id, title: t.title, state: 'pending',
         start: null, end: null, sessionId: null, cost: null, reason: null,
@@ -174,16 +235,27 @@ function deriveRun(runDir, queue, lines, runner) {
     let startedAt = lines.length ? lines[0].time : null;
     let preflight = null;
     for (const { time, message } of lines) {
-        if (message.startsWith('Queue ')) { runState = 'running'; continue; }
+        if (message.startsWith('Queue ')) {
+            runState = 'running';
+            // A re-run tries a merge that did not end again, and a conflict session still open was cut off with
+            // the runner before it.
+            for (const g of merges.values()) if (g.merge !== 'merged') Object.assign(g, { merge: 'waiting', reason: null });
+            for (const c of conflicts.values()) if (c.state === 'running') c.state = 'interrupted';
+            continue;
+        }
         if (message.startsWith('Preflight: model')) { preflight = message.slice('Preflight: '.length); continue; }
         if (message.startsWith('Preflight: asked')) { runState = 'preflight-failed'; preflight = message; continue; }
         if (message.startsWith('All ') && message.includes(' tasks DONE')) { runState = 'done'; continue; }
         if (message.startsWith('Fix the cause')) { runState = 'stopped'; continue; }
         // A re-run starts a group again: a task of it still open from an earlier, killed run waits for its
         // child process (maybe for a free slot) and writes its starting line again when it gets one.
-        const groupStart = GROUP_START_RE.exec(message);
-        if (groupStart) {
-            for (const t of tasks) if (t.group === groupStart[1] && t.state === 'running') Object.assign(t, { state: 'pending', start: null });
+        const groupLine = GROUP_LINE_RE.exec(message);
+        if (groupLine && merges.has(groupLine[1])) {
+            const [, id, rest] = groupLine;
+            if (rest.startsWith('starting (')) {
+                for (const t of tasks) if (t.group === id && t.state === 'running') Object.assign(t, { state: 'pending', start: null });
+            }
+            applyGroupLine(merges.get(id), conflicts, time, rest);
             continue;
         }
         const m = LABEL_RE.exec(message);
@@ -205,33 +277,40 @@ function deriveRun(runDir, queue, lines, runner) {
     // parallel task, its own child process of the runner and that process's session. Each task is judged
     // on its own; the run is no-session only when no running task has a session. A process snapshot taken
     // before the last log line can't judge it (the runner, or a task's process, may have just started).
+    // A conflict session runs in the runner's own process, as a sequential task does.
     const open = tasks.filter(t => t.state === 'running');
+    const openConflicts = [...conflicts.values()].filter(c => c.state === 'running');
     const lastLineAt = lines.length ? parseLocal(lines[lines.length - 1].time) : 0;
     if (runState === 'running' && liveness.at > lastLineAt + 5000 && runner.known) {
         if (!runner.alive) runState = 'interrupted';
-        else if (open.length) {
+        else if (open.length || openConflicts.length) {
             for (const t of open) {
                 if (!groupOf.has(t.id)) t.state = runner.main ? 'running' : 'no-session';
                 else if (!runner.tasks.has(t.id)) t.state = 'interrupted';
                 else t.state = runner.tasks.get(t.id) ? 'running' : 'no-session';
             }
-            if (!open.some(t => t.state === 'running')) runState = 'no-session';
+            for (const c of openConflicts) c.state = runner.main ? 'running' : 'no-session';
+            if (![...open, ...openConflicts].some(t => t.state === 'running')) runState = 'no-session';
         }
     }
-    if (runState !== 'running' && runState !== 'no-session') for (const t of open) t.state = 'interrupted';
+    if (runState !== 'running' && runState !== 'no-session') for (const t of [...open, ...openConflicts]) t.state = 'interrupted';
 
     for (const t of tasks) {
-        const result = statOrNull(path.join(runDir, 'results', `${t.id}.md`));
-        const previous = statOrNull(path.join(runDir, 'results', `${t.id}.previous.md`));
-        const log = statOrNull(path.join(runDir, 'logs', `${t.id}.jsonl`));
         t.hasBrief = !!statOrNull(path.join(runDir, 'tasks', `${t.id}.md`));
-        t.resultMtime = result ? result.mtimeMs : null;
-        t.hasPrevious = !!previous;
-        t.logSize = log ? log.size : 0;
-        t.lastActivity = log ? log.mtimeMs : null;
+        addFileFacts(runDir, t);
     }
+    for (const c of conflicts.values()) addFileFacts(runDir, c);
     const finishedAt = ['done', 'stopped', 'preflight-failed', 'interrupted'].includes(runState) && lines.length ? lines[lines.length - 1].time : null;
-    return { state: runState, startedAt, finishedAt, preflight, tasks, ...(groups.length ? { groups } : {}) };
+    // Runs with groups also answer each group's merge step, and the conflict sessions: task-like entries
+    // that are not tasks, so they are left out of the tasks and their counts.
+    const parallel = groups.length ? {
+        groups: groups.map(g => {
+            const { merge, merged, reason } = merges.get(g.id);
+            return { ...g, merge, merged, reason };
+        }),
+        conflicts: [...conflicts.values()],
+    } : {};
+    return { state: runState, startedAt, finishedAt, preflight, tasks, ...parallel };
 }
 
 function listRuns() {
@@ -248,15 +327,18 @@ function listRuns() {
     return runs.sort((a, b) => (b.run.localeCompare(a.run)) || a.project.localeCompare(b.project));
 }
 
+// A run with groups also answers how many merges have conflicted so far, so the page can notify each one.
 function summarize(project, run, runDir, queue) {
-    const detail = deriveRun(runDir, queue, parseProgress(readText(path.join(runDir, 'progress.log'))), runnerOf(runDir));
+    const lines = parseProgress(readText(path.join(runDir, 'progress.log')));
+    const detail = deriveRun(runDir, queue, lines, runnerOf(runDir));
     const counts = {};
     for (const t of detail.tasks) counts[t.state] = (counts[t.state] || 0) + 1;
     const missingBriefs = detail.tasks.filter(t => !t.hasBrief).map(t => t.id);
     return {
         project, run, state: detail.state, total: detail.tasks.length, counts, missingBriefs,
         startedAt: detail.startedAt, finishedAt: detail.finishedAt,
-        cost: detail.tasks.reduce((sum, t) => sum + (t.cost || 0), 0),
+        cost: [...detail.tasks, ...(detail.conflicts || [])].reduce((sum, t) => sum + (t.cost || 0), 0),
+        ...(detail.groups ? { conflicts: lines.filter(l => /^Group \S+ - conflict merging /.test(l.message)).length } : {}),
     };
 }
 
@@ -408,8 +490,11 @@ async function handle(req, res) {
         return send(res, 200, { ...detail, settings, runner: publicRunner(runner), livenessAt: liveness.at, commits, progress: lines });
     }
 
+    // A task of the queue, or the conflict session of one of its groups, whose log and report are named
+    // like a task's; it has no brief.
     const taskId = url.searchParams.get('task');
-    if (!taskId || !TASK_ID_RE.test(taskId) || !(queue.tasks || []).some(t => t.id === taskId)) return send(res, 404, { error: 'unknown task' });
+    const known = (queue.tasks || []).some(t => t.id === taskId) || groupsOf(queue).some(g => conflictIdOf(g.id) === taskId);
+    if (!taskId || !TASK_ID_RE.test(taskId) || !known) return send(res, 404, { error: 'unknown task' });
 
     if (url.pathname === '/api/feed') {
         const offset = Math.max(0, Number(url.searchParams.get('offset')) || 0);

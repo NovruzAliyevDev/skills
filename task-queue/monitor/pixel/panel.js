@@ -35,9 +35,11 @@ export function taskDuration(task) {
 
 // The facts the old page's task table showed, as a definition list: start and end, or the time so far
 // while running; duration; cost; last activity while running; the stop reason; an earlier failed attempt.
+// A conflict session also says which task's branch conflicted.
 export function taskFacts(task) {
   const live = task.state === 'running' || task.state === 'no-session';
   const rows = [];
+  if (task.conflictTask) rows.push(['Conflict merging', `task ${task.conflictTask}`]);
   const took = taskDuration(task);
   if (task.start) rows.push(['Started', hm(task.start)]);
   if (task.end) rows.push(['Ended', hm(task.end)]);
@@ -90,7 +92,7 @@ export function onRunChosen(el, choose) {
 
 export function renderRunHeader(el, detail, selection) {
   const s = detail.settings, r = detail.runner;
-  const cost = detail.tasks.reduce((sum, t) => sum + (t.cost || 0), 0);
+  const cost = [...detail.tasks, ...(detail.conflicts || [])].reduce((sum, t) => sum + (t.cost || 0), 0);
   const started = parseLocal(detail.startedAt);
   const end = detail.finishedAt ? parseLocal(detail.finishedAt) : new Date();
   let process = 'process check pending';
@@ -132,6 +134,7 @@ export function renderProgress(el, note, progress) {
 
 // --- The task drawer: the task's number, title, state and facts, then three tabs. Activity follows the
 // session log as it grows, Report reloads when the report changes, Brief loads when its tab is shown.
+// A conflict session opens in it like a task, without the Brief tab: it has no brief.
 // `onClose(hadFocus)` is called when it closes. ---
 
 export function createDrawer(root, { onClose }) {
@@ -146,13 +149,15 @@ export function createDrawer(root, { onClose }) {
 
   root.querySelector('.drawer-close').addEventListener('click', close);
   for (const t of tabs) t.addEventListener('click', () => show(t.dataset.tab));
-  // Arrow keys, Home and End move between the tabs, as in any tab list.
+  const briefTab = tabs.find(t => t.dataset.tab === 'brief');
+  // Arrow keys, Home and End move between the tabs shown, as in any tab list.
   root.querySelector('[role="tablist"]').addEventListener('keydown', e => {
-    const i = tabs.indexOf(e.target);
-    const next = { ArrowRight: i + 1, ArrowLeft: i - 1, Home: 0, End: tabs.length - 1 }[e.key];
+    const shown = tabs.filter(t => !t.hidden);
+    const i = shown.indexOf(e.target);
+    const next = { ArrowRight: i + 1, ArrowLeft: i - 1, Home: 0, End: shown.length - 1 }[e.key];
     if (i < 0 || next === undefined) return;
     e.preventDefault();
-    const t = tabs[(next + tabs.length) % tabs.length];
+    const t = shown[(next + shown.length) % shown.length];
     t.focus();
     show(t.dataset.tab);
   });
@@ -173,7 +178,10 @@ export function createDrawer(root, { onClose }) {
   }
 
   function renderHead() {
-    setHtml(title, `<b>${esc(String(task.index).padStart(2, '0'))}</b> ${esc(task.title)} ${badge(task.state)}`);
+    const head = task.kind === 'conflict'
+      ? `<b>M</b> ${esc(task.title)} <span class="muted">conflict session</span>`
+      : `<b>${esc(String(task.index).padStart(2, '0'))}</b> ${esc(task.title)}`;
+    setHtml(title, `${head} ${badge(task.state)}`);
     setHtml(facts, taskFacts(task));
   }
 
@@ -238,14 +246,16 @@ export function createDrawer(root, { onClose }) {
     task = next;
     renderHead();
     root.hidden = false;
-    show(nextTab || (wasOpen ? tab : 'activity'));
+    briefTab.hidden = task.kind === 'conflict';
+    const wanted = nextTab || (wasOpen ? tab : 'activity');
+    show(wanted === 'brief' && briefTab.hidden ? 'activity' : wanted);
     root.focus();
   }
 
   // A new snapshot of the run: new facts, and a new report if it changed. A task that left the run closes it.
   function update(detail) {
     if (!task) return;
-    const next = detail.tasks.find(t => t.id === task.id);
+    const next = entryOf(detail, task.id);
     if (!next) return close();
     task = next;
     renderHead();
@@ -265,6 +275,11 @@ export function createDrawer(root, { onClose }) {
   }
 
   return { open, update, close, get taskId() { return task ? task.id : null; } };
+}
+
+// A task of the run snapshot, or one of its conflict sessions, by id.
+export function entryOf(detail, id) {
+  return detail.tasks.find(t => t.id === id) || (detail.conflicts || []).find(c => c.id === id) || null;
 }
 
 // One feed item, as the old page showed it. A subagent's items go into a collapsible group of their own.

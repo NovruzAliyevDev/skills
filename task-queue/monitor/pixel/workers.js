@@ -30,20 +30,26 @@ const atDesk = task => (STATES[task.state] || STATES.pending).place === 'desk';
 // The first desk is "desk", as it was while a run had only one; the others are numbered.
 const deskName = desk => (desk ? `desk ${desk + 1}` : 'desk');
 
+// The tasks and the conflict sessions of a run snapshot: a conflict session is a worker too, though not a task.
+const entriesOf = run => [...run.tasks, ...(run.conflicts || [])];
+
 // A run snapshot from /api/run, and the desk of each task at a desk -> the run state (with the preflight
-// message when the preflight failed), one worker per task drawn, in task order, and the finished tasks
-// folded away. `slot` counts within the place: queue slot 0 is the next task, nearest the desk; at a desk
-// the slot is the desk. A task of a parallel group carries its group and the group's index in the run, and
-// its accessible name ends with the group. Each worker keeps its task's snapshot for the facts shown about it.
+// message when the preflight failed), one worker per task drawn, in task order, then one per conflict
+// session, the finished tasks folded away, and each group's merge step. `slot` counts within the place:
+// queue slot 0 is the next task, nearest the desk; at a desk the slot is the desk. A task of a parallel group
+// carries its group and the group's index in the run, and its accessible name ends with the group. A
+// conflict session carries its group, but its name says whose merge it resolves. Each worker keeps its task's
+// snapshot for the facts shown about it.
 function officeOf(run, desks) {
   const done = run.tasks.filter(t => t.state === 'done');
   const shown = new Set(run.tasks.length > LONG_RUN ? [...done].sort(byRecency).slice(0, DONE_SHOWN) : done);
   const groupIndex = new Map((run.groups || []).map((g, i) => [g.id, i]));
   const taken = { queue: 0, done: 0, alert: 0 };
   const workers = [], collapsed = [];
-  for (const task of run.tasks) {
-    const number = String(task.index).padStart(2, '0');
-    if (task.state === 'done' && !shown.has(task)) {
+  for (const task of entriesOf(run)) {
+    const conflict = task.kind === 'conflict';
+    const number = conflict ? 'M' : String(task.index).padStart(2, '0');
+    if (task.state === 'done' && !conflict && !shown.has(task)) {
       collapsed.push({ id: task.id, number, title: task.title, task });
       continue;
     }
@@ -51,10 +57,10 @@ function officeOf(run, desks) {
     const slot = place === 'desk' ? desks.get(task.id) : taken[place]++;
     const where = place === 'queue' ? `queue position ${slot + 1}` : place === 'desk' ? deskName(slot) : PLACE_NAME[place];
     const group = task.group ?? null;
-    const parts = [number, task.title, task.state, where];
-    if (group) parts.push(`group ${group}`);
+    const parts = conflict ? ['Conflict session', `merge of group ${group}`, task.state, where] : [number, task.title, task.state, where];
+    if (group && !conflict) parts.push(`group ${group}`);
     workers.push({
-      id: task.id, number, title: task.title, state: task.state, place, slot, anim, marker, task,
+      id: task.id, number, title: task.title, state: task.state, place, slot, anim, marker, task, conflict,
       group, groupIndex: group ? groupIndex.get(group) ?? 0 : null,
       look: lookOf(task.id), label: parts.join(' · '),
     });
@@ -63,13 +69,17 @@ function officeOf(run, desks) {
   const alerted = workers.filter(w => w.place === 'alert');
   for (const worker of alerted) worker.alone = alerted.length === 1;
   const preflightError = run.state === 'preflight-failed' ? run.preflight : null;
-  return { state: run.state, preflightError, workers, collapsed };
+  const conflictOf = new Map((run.conflicts || []).map(c => [c.group, c.id]));
+  const merges = (run.groups || []).map((g, i) => ({
+    group: g.id, groupIndex: i, state: g.merge, merged: g.merged, reason: g.reason, conflict: conflictOf.get(g.id) ?? null,
+  }));
+  return { state: run.state, preflightError, workers, collapsed, merges };
 }
 
-// The tasks whose subagents stand around their desks as helpers: the running ones. No-session and
-// interrupted mean no session works, so a task in either state has none.
+// The tasks whose subagents stand around their desks as helpers: the running ones, and a running conflict
+// session. No-session and interrupted mean no session works, so a task in either state has none.
 export function helperTasksOf(run) {
-  return run.tasks.filter(t => t.state === 'running').map(t => t.id);
+  return entriesOf(run).filter(t => t.state === 'running').map(t => t.id);
 }
 
 // The subagents at work in a task's session, from its session log's feed items (see readFeed). A helper
@@ -126,7 +136,7 @@ export function createOffice() {
   return {
     update(run, helpers) {
       const first = !before;
-      const seated = run.tasks.filter(atDesk);
+      const seated = entriesOf(run).filter(atDesk);
       const seatedIds = new Set(seated.map(t => t.id));
       for (const id of [...desks.keys()]) if (!seatedIds.has(id)) desks.delete(id);
       for (const task of seated) if (!desks.has(task.id)) desks.set(task.id, firstFree(desks.values()));
