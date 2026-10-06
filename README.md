@@ -5,7 +5,7 @@ instructions, plus any files it needs.
 
 | Skill | What it does | How it starts |
 |---|---|---|
-| [task-queue](task-queue/) | Runs a list of tasks one after another, each in its own fresh, unattended Claude Code session, and shows the queue on a local web page. | You type `/task-queue`. |
+| [task-queue](task-queue/) | Runs a list of tasks in order, each in its own fresh, unattended Claude Code session, with tasks you mark as a group running in parallel, and shows the queue on a local web page. | You type `/task-queue`. |
 | [delegate](delegate/) | Splits a big task into independent pieces, runs each in its own subagent, and keeps the main session's context light. | Claude uses it when you ask to delegate, split up, fan out or parallelize work; you can also type `/delegate`. |
 
 ## Install
@@ -32,14 +32,16 @@ New Claude Code sessions pick the skills up.
 ## task-queue
 
 Hand Claude a list of tasks and walk away. Each task runs in its own fresh, unattended session, one
-after another, and a local web page shows how far the queue has got.
+after another or, for tasks you mark as a parallel group, side by side in git worktrees. A local web
+page shows how far the queue has got.
 
 ### Requirements
 
 - Windows with Windows PowerShell 5.1: the runner is a PowerShell script.
 - The Claude Code CLI on the PATH as `claude`.
 - Node.js, for the monitor.
-- git, for the monitor's list of commits made during a run (optional).
+- git, for parallel groups and for the monitor's list of commits made during a run (optional without
+  groups).
 
 ### Run a queue
 
@@ -51,13 +53,19 @@ after another, and a local web page shows how far the queue has got.
      `manual` cannot run unattended, since nothing would approve a prompt.
    - **model** and **effort**: unset by default, so each session uses your usual ones. `auto` needs a
      model that supports it (Haiku does not); the runner checks this before the first task.
+   - **maxParallel**: how many sessions a parallel group runs at once, 5 by default.
+
+   To run some tasks in parallel, end the list with the group notation, for example `[[9,10]]` or
+   `[[3,4],[9,10,11]]`: the numbers are your items in list order, and each group needs two or more
+   consecutive items. Claude asks about a group it cannot accept, and never makes groups of its own.
 3. Claude turns each item into a brief that a stranger to the conversation could act on, resolving
-   shorthand such as "ticket 62" to real paths. It shows the numbered titles, a summary of each brief
-   and the settings, and flags anything that cannot run unattended. Correct it until it is right, then
-   confirm.
+   shorthand such as "ticket 62" to real paths. It shows the numbered titles, a summary of each brief,
+   the groups and the settings, and flags anything that cannot run unattended. Correct it until it is
+   right, then confirm.
 4. Claude writes the run folder, starts the queue in its own PowerShell window, and opens the monitor.
 
-Leave the repository alone until the queue finishes: the sessions work in that same working tree.
+Leave the repository alone until the queue finishes: the sessions work in that same working tree, and
+the merge of a parallel group lands there too.
 
 ### The run folder
 
@@ -69,6 +77,7 @@ Leave the repository alone until the queue finishes: the sessions work in that s
   progress.log     the running record
   results\NN.md    each task's report; its first line is DONE or FAILED
   logs\NN.jsonl    each session's full event stream
+  wt\NN\           the worktree of a task in a parallel group, while the group runs
 ```
 
 ### How a queue runs
@@ -82,6 +91,22 @@ Leave the repository alone until the queue finishes: the sessions work in that s
 - Sessions cannot run background commands, because a headless session's background commands die when
   it ends; slow commands such as a full test suite get up to 60 minutes instead. A session that ends
   without writing its report is resumed once to write it.
+
+### Parallel groups
+
+- A queue with groups needs a git repository with a branch checked out, and every task in it is asked
+  to commit its work. A group starts only from a main checkout with nothing uncommitted or untracked.
+- When the queue reaches a group, its tasks start together, each in its own worktree and branch made
+  from the queue's branch. When all of them are `DONE`, the runner merges their branches in task order
+  and removes the worktrees and branches.
+- A merge conflict starts a conflict session that resolves it, tests what it touched and commits the
+  merge. If it cannot, that merge is undone, the queue stops, and the branches and worktrees not yet
+  merged are kept.
+- If a task of a group fails, the others finish, nothing is merged and the queue stops. Running
+  `run.ps1` again continues the failed task in its own worktree.
+- While a group runs, the window shows only start and finish lines for its tasks; the monitor and
+  `logs\NN.jsonl` show the rest. The design record is in
+  [task-queue/docs/parallel-tasks](task-queue/docs/parallel-tasks/).
 
 ### The monitor
 

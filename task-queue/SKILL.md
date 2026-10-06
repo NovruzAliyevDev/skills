@@ -1,6 +1,6 @@
 ---
 name: task-queue
-description: Collect a list of tasks, then run them one after another, each in its own fresh headless Claude Code session, from a generated PowerShell script.
+description: Collect a list of tasks, then run them in order, each in its own fresh headless Claude Code session, from a generated PowerShell script. Tasks the user marks as a group run in parallel, in git worktrees.
 disable-model-invocation: true
 ---
 
@@ -8,16 +8,32 @@ Talk to the user in their language. Everything written to disk is English, excep
 
 Each task runs in a **fresh session**: it sees the repository, its `CLAUDE.md` and the task file, and nothing of this conversation. The runner (`runner.ps1` beside this file) runs the tasks in order and stops at the first one whose report does not start with `DONE`. Its sessions cannot run background commands, which would die when a headless session ends, and a session that ends without writing a report is resumed once to write it.
 
+A **group** is two or more consecutive tasks the user marked to run in parallel. The runner starts them together, each in its own git worktree and branch, and once all of them are `DONE` merges their branches into the queue's branch in task order. A merge conflict goes to a **conflict session**, a headless session of its own. Groups come only from the user's notation: never propose or create one.
+
 ## 1. Collect the tasks
 
 Ask for the list: one task per item, in the order they must run, as much detail per item as the user wants. Also offer the settings, each with its default:
 
 - **permission mode**: `auto` (default), `acceptEdits`, `bypassPermissions`. `default`/`manual` cannot work unattended: nothing would approve a prompt.
 - **model** and **effort**: unset by default, so each session uses the user's normal ones. `auto` needs a model that supports it; Haiku does not, and silently falls back to `default`. The runner's preflight catches this before the first task.
+- **maxParallel**: the most sessions a group runs at once, a whole number from 1 up, default 5. A larger group starts its remaining tasks as running ones finish. It matters only when the list declares groups.
 
 End the turn and wait. Done when the user has sent the list.
 
-## 2. Turn each item into a brief
+## 2. Read the groups
+
+The list may end with the **group notation**: double brackets holding one or more groups, each a comma-separated list of numbers, such as `[[9,10]]` or `[[3,4],[9,10,11]]`. A number is an item's position in the user's list, counting from 1, and resolves to that item's task id: the position as two digits (`9` → `"09"`). A list without the notation has no groups; skip to step 3.
+
+Check every group. Ask the user, and wait for the answer, when a group:
+
+- has only one task;
+- names a number that is not in the list;
+- has numbers that are not consecutive (`[[3,9]]`), or names one twice;
+- shares a task with another group.
+
+Ask the same way when **maxParallel** is not a whole number from 1 up. Quote the user's notation and name the items it refers to; the user decides the fix. Done when every group has two or more consecutive tasks that exist and no task is in two groups, and **maxParallel** is valid. The runner applies the same checks and stops before the first session if one fails.
+
+## 3. Turn each item into a brief
 
 A **brief** is what a stranger to this conversation needs to do the task: goal, scope, where to look, and what proves it done. For every item:
 
@@ -26,9 +42,13 @@ A **brief** is what a stranger to this conversation needs to do the task: goal, 
 - Give it a short title (a few words, no double quotes). The session is named `ProjectName - title`, where ProjectName is the project's name in CamelCase, as in this session's title.
 - Name what proves it done, when the repository defines it (tests to run, a ticket's acceptance criteria).
 
-Show the user the numbered titles, a one-line summary of each brief, the settings, and the working directory (this session's). Flag anything that looks like it cannot run unattended: a step only a person can do, or one that touches production or an external service. Done when the user confirms the list; apply their corrections and show it again until they do.
+When there are groups, first check the working directory with `git rev-parse --is-inside-work-tree` and `git symbolic-ref --quiet HEAD`: it must be a git repository with a branch checked out. If it is not, say so when you show the list and ask whether to drop the groups.
 
-## 3. Write the run folder
+Show the user the numbered titles, a one-line summary of each brief, the settings, and the working directory (this session's). Mark each group in the list, for example by bracketing its tasks under a `Group 09-10, in parallel` line. When there are groups, state that every task, sequential ones included, will be asked to commit its work following the repository's own commit rules, and that a group starts only from a main checkout with nothing uncommitted or untracked.
+
+Flag anything that looks like it cannot run unattended: a step only a person can do, or one that touches production or an external service. Done when the user confirms the list; apply their corrections and show it again until they do. A correction that adds, drops or moves items changes what the group numbers point at: check the groups again as in step 2 and ask about any that moved.
+
+## 4. Write the run folder
 
 Create `%USERPROFILE%\.claude-queues\<ProjectName>\<yyyyMMdd-HHmm>\` holding:
 
@@ -41,14 +61,21 @@ Create `%USERPROFILE%\.claude-queues\<ProjectName>\<yyyyMMdd-HHmm>\` holding:
     "permissionMode": "auto",
     "model": null,
     "effort": null,
-    "tasks": [ { "id": "01", "title": "Ticket 62 push handling" } ]
+    "parallel": [ ["02", "03"] ],
+    "maxParallel": 5,
+    "tasks": [
+      { "id": "01", "title": "Ticket 62 push handling" },
+      { "id": "02", "title": "Ticket 63 export dialog" },
+      { "id": "03", "title": "Ticket 64 audit log" }
+    ]
   }
   ```
+  `parallel` holds one list per group, its task ids in ascending order, and `maxParallel` the setting. When the list declares no groups, leave both fields out.
 - `run.ps1`: a copy of `runner.ps1` from this skill's folder, unchanged.
 
-Done when every task in `queue.json` has its `tasks\<id>.md`.
+Done when every task in `queue.json` has its `tasks\<id>.md`, and `parallel` holds exactly the groups the user confirmed.
 
-## 4. Launch
+## 5. Launch
 
 Start it in its own window, so it outlives this session and the user can watch it. The inner double quotes are needed: `Start-Process` joins the arguments without quoting them.
 
@@ -68,4 +95,11 @@ Then tell the user, briefly:
 - the run folder; `progress.log` there is the running record, `results\NN.md` each task's report, `logs\NN.jsonl` each session's full stream;
 - the window shows each session's messages and tool calls live, and a red **STOPPED** line with the resume command when a task fails;
 - after a stop: fix the cause, then run `run.ps1` again; finished tasks are skipped;
-- the sessions work in this same working tree, so the user leaves the repository alone until the queue finishes.
+- the user leaves the repository alone until the queue finishes: the sessions work in this same working tree, and a group's merge lands there too.
+
+When there are groups, also tell them:
+
+- each task of a group works in its own worktree under `wt\` in the run folder, on its own branch; once the group is merged, its worktrees and branches are removed;
+- while a group runs, the window shows only start and finish lines for its tasks; the monitor shows the rest, and `logs\NN.jsonl` still holds each full stream;
+- a merge conflict starts a conflict session that resolves it, tests what it touched and commits the merge, reporting in `results\merge-<first id>-<last id>.md`. If it cannot, that merge is undone, the queue stops, and the branches and worktrees not yet merged are kept;
+- when a task of a group fails, the others finish, nothing is merged and the queue stops; running `run.ps1` again continues the failed task in its own worktree.
