@@ -76,10 +76,16 @@ Create `%USERPROFILE%\.claude-queues\<ProjectName>\<yyyyMMdd-HHmm>\` holding:
     ]
   }
   ```
-  `parallel` holds one list per group, its task ids in ascending order, and `maxParallel` the setting. When the list declares no groups, leave both fields out.
+  `parallel` holds one list per group, its task ids in ascending order, and `maxParallel` the setting. When the list declares no groups, leave both fields out. Every backslash in `workDir` is doubled, as in the example: a single one is an invalid JSON escape, and the runner exits before its first line.
 - `run.ps1`: a copy of `runner.ps1` from this skill's folder, unchanged.
 
-Done when every task in `queue.json` has its `tasks\<id>.md`, and `parallel` holds exactly the groups the user confirmed.
+Then read `queue.json` back the way the runner does, and fix the file until this prints the repository's path and `True`:
+
+```powershell
+$q = Get-Content -Raw -Encoding UTF8 '<run folder>\queue.json' | ConvertFrom-Json; $q.workDir; Test-Path $q.workDir
+```
+
+Done when that check passes, every task in `queue.json` has its `tasks\<id>.md`, and `parallel` holds exactly the groups the user confirmed.
 
 ## 5. Launch
 
