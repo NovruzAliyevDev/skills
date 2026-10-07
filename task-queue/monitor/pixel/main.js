@@ -42,14 +42,15 @@ const drawer = createDrawer(document.getElementById('drawer'), {
     if (hadFocus && opener?.isConnected) opener.focus();
     opener = null;
   },
-  // Skip asks for confirmation first; Un-skip does not. The page then shows what happened from its next poll.
-  async onAction(selection, task, action) {
+  // Skip asks for confirmation first; Un-skip and Retry do not. The page then shows what happened from its
+  // next poll.
+  async onAction(selection, task, action, extra = {}) {
     if (action === 'skip' && !await confirmAction({
       title: `Skip task ${String(task.index).padStart(2, '0')}?`,
       text: `"${task.title}" will not run: when the queue reaches it, it passes over it and writes a SKIPPED report. You can un-skip it until then.`,
       ok: 'Skip task',
     })) return null;
-    const result = await postAdmin(selection, action, { task: task.id });
+    const result = await postAdmin(selection, action, { ...extra, task: task.id });
     runPoll.refresh();
     runsPoll.refresh();
     return result;

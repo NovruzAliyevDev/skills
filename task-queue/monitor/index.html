@@ -196,6 +196,15 @@ pre.plain { margin: 0; max-height: 50vh; overflow: auto; padding: 8px 10px; back
 /* The task's actions, under its facts: only those the run answer allows now. */
 .task-actions { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; margin-top: 8px; }
 .skip-note { margin: 6px 0 0; color: var(--muted); font-size: 13px; font-weight: 600; }
+/* The retry form: the mode, an optional note, and its own Retry and Cancel. */
+.retry-form { display: grid; gap: 6px; margin-top: 8px; padding: 8px 10px; border: 2px solid var(--frame); background: var(--bg); }
+.retry-form fieldset { display: grid; gap: 2px; margin: 0; padding: 0; border: 0; min-width: 0; }
+.retry-form legend { padding: 0; margin-bottom: 4px; font: 700 11px/1.4 var(--mono); text-transform: uppercase; letter-spacing: .05em; }
+.retry-mode { display: flex; gap: 6px; align-items: baseline; font-size: 13px; cursor: pointer; }
+.retry-note-label { font-size: 13px; font-weight: 600; }
+.retry-form textarea { width: 100%; min-height: 4.5em; resize: vertical; padding: 4px 6px; font: 13px/1.4 "Segoe UI", system-ui, sans-serif;
+  color: var(--text); background: var(--panel); border: 2px solid var(--frame); }
+.retry-hint { margin: 0; font-size: 12px; }
 
 /* The confirmation dialog, in the page's pixel style. */
 .confirm { max-width: min(420px, calc(100vw - 32px)); padding: 14px 16px; color: var(--text); background: var(--panel);
@@ -296,6 +305,21 @@ details.agent > summary { cursor: pointer; font-size: 12px; color: var(--muted);
         <div class="control-buttons" role="group" aria-label="Task actions"></div>
         <p class="admin-msg" role="status"></p>
       </div>
+      <form class="retry-form" id="retry-form" aria-labelledby="retry-legend" hidden>
+        <fieldset>
+          <legend id="retry-legend">Retry the task</legend>
+          <label class="retry-mode" data-mode="resume"><input type="radio" name="retry-mode" value="resume"> Resume its last session</label>
+          <label class="retry-mode" data-mode="fresh"><input type="radio" name="retry-mode" value="fresh"> Start from scratch, in a new session</label>
+        </fieldset>
+        <label class="retry-note-label" for="retry-note">Note for the session <span class="muted">(optional)</span></label>
+        <textarea id="retry-note" rows="3" maxlength="4000" aria-describedby="retry-hint"></textarea>
+        <p class="retry-hint muted" id="retry-hint"></p>
+        <div class="control-buttons">
+          <button type="submit" class="btn">Retry task</button>
+          <button type="button" class="btn retry-cancel">Cancel</button>
+        </div>
+        <p class="admin-msg" role="status"></p>
+      </form>
     </div>
     <div class="tabs" role="tablist" aria-label="Task">
       <button type="button" role="tab" id="tab-activity" data-tab="activity" aria-controls="panel-activity" aria-selected="true">Activity</button>

@@ -178,9 +178,13 @@ const skipList = control => (Array.isArray(control.skip) ? control.skip : []).ma
 // The server is the only writer of the control file, and replaces it whole: the runner never reads half
 // of it.
 function writeControl(runDir, control) {
-    const file = path.join(runDir, 'control.json');
+    writeWhole(path.join(runDir, 'control.json'), JSON.stringify({ ...control, version: CONTROL_VERSION }, null, 2));
+}
+
+// Replaces a file whole (temporary file, then rename), as the control file and a brief are written.
+function writeWhole(file, text) {
     const temp = `${file}.${process.pid}.tmp`;
-    fs.writeFileSync(temp, JSON.stringify({ ...control, version: CONTROL_VERSION }, null, 2));
+    fs.writeFileSync(temp, text);
     withRetry(() => fs.renameSync(temp, file));
 }
 
@@ -484,9 +488,11 @@ function snapshotOf(runDir, queue) {
 const FINISHED = new Set(['done', 'finished-with-skips']);
 
 // Why a task action is not allowed now, or null when it is. Skip needs a task that has not started, in no
-// group that has started; un-skip a task marked to be skipped that has no SKIPPED report yet.
-function taskRefusal(action, task, finished, control) {
+// group that has started; un-skip a task marked to be skipped that has no SKIPPED report yet; retry a failed
+// or stopped task while no runner is alive (`busy` says why one is, as for Continue).
+function taskRefusal(action, task, finished, control, busy) {
     if (finished) return 'the run is finished';
+    if (action === 'retry') return !['failed', 'stopped'].includes(task.state) ? 'the task has not failed or stopped' : busy;
     if (task.state === 'skipped') return 'the task is skipped: it has its SKIPPED report';
     const marked = skipList(control).includes(task.id);
     if (action === 'unskip') return marked ? null : 'the task is not marked to be skipped';
@@ -500,7 +506,7 @@ function taskRefusal(action, task, finished, control) {
 // (`taskRefusals` by task id; each task's `actions` lists its allowed ones). The page shows these; the
 // admin endpoint judges each request by the same rules.
 function adminOf(runDir, supported, detail, runner, control, lines) {
-    for (const t of detail.tasks) t.actions = [];
+    for (const t of detail.tasks) { t.actions = []; t.retryModes = []; }
     if (!supported) return { supported: false, actions: [], refusals: {}, taskRefusals: {} };
     const finished = FINISHED.has(detail.state);
     const launching = starting(runDir, runner, lines);
@@ -512,14 +518,17 @@ function adminOf(runDir, supported, detail, runner, control, lines) {
     refuse('stop', finished ? 'the run is finished' : noRunner || (!(runner.known && runner.alive) ? 'the runner is starting' : null));
     refuse('pause', finished ? 'the run is finished' : noRunner || (control.pause ? 'a pause is already asked for' : null));
     refuse('cancel-pause', finished ? 'the run is finished' : noRunner || (!control.pause ? 'no pause is asked for' : null));
-    refuse('continue', finished ? 'the run is finished'
-        : !runner.known && !launching ? 'the process check is still pending'
-        : launching ? 'the runner is starting' : alive ? 'a runner of this run is alive' : null);
+    const busy = !runner.known && !launching ? 'the process check is still pending'
+        : launching ? 'the runner is starting' : alive ? 'a runner of this run is alive' : null;
+    refuse('continue', finished ? 'the run is finished' : busy);
     const actions = RUN_ACTIONS.filter(a => !refusals[a]);
     const taskRefusals = {};
     for (const t of detail.tasks) {
-        taskRefusals[t.id] = Object.fromEntries(TASK_ACTIONS.map(a => [a, taskRefusal(a, t, finished, control)]).filter(([, why]) => why));
+        taskRefusals[t.id] = Object.fromEntries(TASK_ACTIONS.map(a => [a, taskRefusal(a, t, finished, control, busy)]).filter(([, why]) => why));
         t.actions = TASK_ACTIONS.filter(a => !taskRefusals[t.id][a]);
+        // A retry resumes the session of the task's last attempt, never an earlier attempt's that the user
+        // left behind with a fresh retry: an attempt that died before naming a session can only start over.
+        if (t.actions.includes('retry')) t.retryModes = attemptSession(lines, t) ? ['resume', 'fresh'] : ['fresh'];
     }
     return { supported: true, actions, refusals, taskRefusals };
 }
@@ -652,7 +661,9 @@ function moduleFile(pathname) {
 // --- Admin actions: POST /api/admin { project, run, action }, with `task` for a task action. ---
 
 const RUN_ACTIONS = ['stop', 'pause', 'cancel-pause', 'continue'];
-const TASK_ACTIONS = ['skip', 'unskip'];
+const TASK_ACTIONS = ['skip', 'unskip', 'retry'];
+const RETRY_MODES = ['resume', 'fresh'];
+const NOTE_MAX = 4000;
 
 // The body as text; it rejects a body over BODY_MAX once it has been read to its end and dropped, so that
 // the sender gets the answer instead of a reset connection.
@@ -693,25 +704,31 @@ async function handleAdmin(req, res) {
     let body;
     try { body = JSON.parse(text); } catch { return send(res, 400, { error: 'the request is not JSON' }); }
     if (!body || typeof body !== 'object') return send(res, 400, { error: 'the request is not a JSON object' });
-    const { project, run, action, task } = body;
+    const { project, run, action, task, mode, note = '' } = body;
     if (typeof project !== 'string' || typeof run !== 'string' || !NAME_RE.test(project) || !NAME_RE.test(run)) return send(res, 400, { error: 'no valid project and run' });
     const forTask = TASK_ACTIONS.includes(action);
     if (!forTask && !RUN_ACTIONS.includes(action)) return send(res, 400, { error: `unknown action '${String(action)}'` });
     if (forTask && (typeof task !== 'string' || !TASK_ID_RE.test(task))) return send(res, 400, { error: 'no valid task' });
+    if (action === 'retry' && !RETRY_MODES.includes(mode)) return send(res, 400, { error: 'no valid retry mode: resume or fresh' });
+    if (action === 'retry' && (typeof note !== 'string' || note.length > NOTE_MAX)) return send(res, 400, { error: `the note is not text of at most ${NOTE_MAX} characters` });
     const runDir = runDirFrom(new URLSearchParams({ project, run }));
     if (!runDir) return send(res, 404, { error: 'unknown run' });
     const queue = readQueue(runDir);
     if (!queue) return send(res, 404, { error: 'unreadable queue.json' });
     if (forTask && !(queue.tasks || []).some(t => t.id === task)) return send(res, 400, { error: `unknown task '${task}'` });
-    return inTurn(runDir, () => applyAdmin(res, runDir, queue, action, task, forTask));
+    return inTurn(runDir, () => applyAdmin(res, runDir, queue, action, task, forTask, { mode, note: note.trim() }));
 }
 
-async function applyAdmin(res, runDir, queue, action, task, forTask) {
+// `retry` is a retry's `{ mode, note }`.
+async function applyAdmin(res, runDir, queue, action, task, forTask, retry) {
     await refreshLiveness();
-    const { control, problem, admin } = snapshotOf(runDir, queue);
+    const { lines, control, problem, detail, admin } = snapshotOf(runDir, queue);
     if (!admin.supported) return send(res, 409, { error: "this run folder's runner copy predates admin actions" });
     if (problem) appendProgress(runDir, `admin: control.json ignored (${problem})`);
-    const refusal = forTask ? admin.taskRefusals[task][action] : admin.refusals[action];
+    const target = forTask && detail.tasks.find(t => t.id === task);
+    const refusal = forTask ? admin.taskRefusals[task][action]
+        || (action === 'retry' && retry.mode === 'resume' && !attemptSession(lines, target) ? 'the task has no session to resume' : null)
+        : admin.refusals[action];
     if (refusal) {
         appendProgress(runDir, `admin: ${action} refused (${forTask ? `task ${task}: ` : ''}${refusal})`);
         return send(res, 409, { error: refusal });
@@ -735,8 +752,42 @@ async function applyAdmin(res, runDir, queue, action, task, forTask) {
     } else if (action === 'unskip') {
         writeControl(runDir, { ...control, skip: skipList(control).filter(id => id !== task) });
         appendProgress(runDir, `admin: unskip requested (task ${task})`);
+    } else if (action === 'retry') {
+        retryTask(runDir, lines, control, target, retry);
     }
     return send(res, 200, { ok: true, action });
+}
+
+// An entry the runner applied is used: its admin line names its id.
+function entryUsed(lines, id) {
+    return lines.some(l => /^admin: \S+ applied \(task [A-Za-z0-9_-]+, (mode \S+, )?entry /.test(l.message) && l.message.endsWith(`, entry ${id})`));
+}
+
+// The one-shot entries under the control file's `key` that the runner has not applied yet.
+function unusedEntries(lines, control, key) {
+    const entries = control[key] && typeof control[key] === 'object' ? control[key] : {};
+    return Object.fromEntries(Object.entries(entries).filter(([, e]) => e && !entryUsed(lines, e.id)));
+}
+
+// Writes the task's `retry` entry, which replaces a `resume` entry a hard stop left it, then launches the
+// runner as Continue does. A fresh retry's note is first appended to the brief, under a heading with the
+// time; a resumed one's reaches the session through the entry. The session to resume is the last attempt's.
+function retryTask(runDir, lines, control, task, { mode, note }) {
+    const id = crypto.randomBytes(6).toString('hex');
+    if (mode === 'fresh' && note) {
+        const brief = path.join(runDir, 'tasks', `${task.id}.md`);
+        const text = readText(brief) ?? '';
+        const eol = text.includes('\r\n') ? '\r\n' : '\n';
+        const heading = `## Note from the user for a retry (${stamp()})`;
+        writeWhole(brief, `${text.replace(/\s*$/, '')}${eol}${eol}${heading}${eol}${eol}${note.replace(/\r?\n/g, eol)}${eol}`);
+    }
+    const retry = { ...unusedEntries(lines, control, 'retry'), [task.id]: { mode, id, note, ...(mode === 'resume' ? { session: attemptSession(lines, task) } : {}) } };
+    const resume = unusedEntries(lines, control, 'resume');
+    delete resume[task.id];
+    writeControl(runDir, { ...control, pause: false, retry, resume });
+    const oneLine = note.replace(/\s+/g, ' ');
+    appendProgress(runDir, `admin: retry requested (task ${task.id}, mode ${mode}, entry ${id})${oneLine ? ` - note: ${oneLine}` : ''}`);
+    launchRunner(runDir);
 }
 
 // --- Hard stop: the runner's process tree is killed at once. ---
@@ -821,7 +872,7 @@ async function undoMerge(workDir) {
 function attemptSession(lines, task) {
     let session = null, resumed = false;
     for (const { message } of lines) {
-        if (message.startsWith(`admin: resume applied (task ${task.id}, `)) { resumed = true; continue; }
+        if (message.startsWith(`admin: resume applied (task ${task.id}, `) || message.startsWith(`admin: retry applied (task ${task.id}, mode resume, `)) { resumed = true; continue; }
         const m = LABEL_RE.exec(message);
         // The lines of the other tasks of a group may come in between.
         if (!m || Number(m[1]) !== task.index) continue;
@@ -861,10 +912,8 @@ async function hardStop(res, runDir, queue) {
     liveness = { ...liveness, processes: liveness.processes.filter(p => now.has(p.ProcessId)) };
 
     // An entry the runner applied is used; it is dropped, and a task cut off again gets a new one.
-    const used = id => lines.some(l => /^admin: \S+ applied \(task [A-Za-z0-9_-]+, entry /.test(l.message) && l.message.endsWith(`, entry ${id})`));
     const { control } = readControl(runDir);
-    const resume = Object.fromEntries(Object.entries(control.resume && typeof control.resume === 'object' ? control.resume : {})
-        .filter(([, e]) => e && !used(e.id)));
+    const resume = unusedEntries(lines, control, 'resume');
     const stopLines = [`admin: stop requested - the runner (process ${runner.pid}) and its sessions were killed`];
     for (const t of cutOff) {
         const session = attemptSession(lines, t);

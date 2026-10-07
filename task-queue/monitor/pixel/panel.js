@@ -120,7 +120,7 @@ export function renderRunHeader(el, detail, selection) {
 // --- Queue controls: for an unfinished run whose runner supports admin actions, Stop, Pause (Cancel pause
 // while pausing) and Continue, each usable when the run answer allows it. ---
 
-export const ACTION_LABEL = { 'stop': 'Stop', 'pause': 'Pause', 'cancel-pause': 'Cancel pause', 'continue': 'Continue', 'skip': 'Skip', 'unskip': 'Un-skip' };
+export const ACTION_LABEL = { 'stop': 'Stop', 'pause': 'Pause', 'cancel-pause': 'Cancel pause', 'continue': 'Continue', 'skip': 'Skip', 'unskip': 'Un-skip', 'retry': 'Retry' };
 const FINISHED = new Set(['done', 'finished-with-skips']);
 
 // Asks the user to confirm in the page's dialog: `title`, `text`, and `ok`, the confirming button's label.
@@ -185,8 +185,9 @@ export function renderProgress(el, note, progress) {
 // --- The task drawer: the task's number, title, state and facts, then three tabs. Activity follows the
 // session log as it grows, Report reloads when the report changes, Brief loads when its tab is shown.
 // A conflict session opens in it like a task, without the Brief tab: it has no brief. Under the facts, the
-// task's actions that the run answer allows now; `onAction(selection, task, action)` sends one and resolves
-// to `{ ok, error }`, or to null when the user did not confirm it.
+// task's actions that the run answer allows now; `onAction(selection, task, action, extra)` sends one and
+// resolves to `{ ok, error }`, or to null when the user did not confirm it. Retry opens a form first, for
+// the mode and a note; its request carries them in `extra`.
 // `onClose(hadFocus)` is called when it closes. ---
 
 export function createDrawer(root, { onClose, onAction }) {
@@ -196,6 +197,11 @@ export function createDrawer(root, { onClose, onAction }) {
   const actionButtons = actionBox.querySelector('.control-buttons');
   const actionMessage = actionBox.querySelector('.admin-msg');
   let busy = null;                              // the task action whose request is on its way
+  const retryForm = root.querySelector('.retry-form');
+  const retryNote = retryForm.querySelector('textarea');
+  const retryHint = retryForm.querySelector('.retry-hint');
+  const retrySubmit = retryForm.querySelector('[type="submit"]');
+  const retryMessage = retryForm.querySelector('.admin-msg');
   const tabs = [...root.querySelectorAll('[role="tab"]')];
   const panels = Object.fromEntries(tabs.map(t => [t.dataset.tab, document.getElementById(t.getAttribute('aria-controls'))]));
   const feed = panels.activity;
@@ -240,22 +246,93 @@ export function createDrawer(root, { onClose, onAction }) {
     setHtml(title, `${head} ${badge(task.state)}`);
     setHtml(facts, taskFacts(task));
     renderActions();
+    renderRetryForm();
   }
 
   // Skip and Un-skip share a slot, so the focus stays on the button as one turns into the other. A button
-  // whose request is on its way stays focusable, greyed.
+  // whose request is on its way stays focusable, greyed. Retry opens and closes the retry form.
   function renderActions() {
     const actions = task.actions || [];
     actionBox.hidden = !actions.length && !actionMessage.textContent;
     const html = actions.map(action => `<button type="button" class="btn" data-slot="${action === 'unskip' ? 'skip' : action}" data-action="${action}"` +
+      (action === 'retry' ? ` aria-expanded="${!retryForm.hidden}" aria-controls="retry-form"` : '') +
       ` aria-disabled="${!!busy}">${ACTION_LABEL[action] || action}${busy === action ? '…' : ''}</button>`).join('');
     const focused = actionButtons.contains(document.activeElement) ? document.activeElement.dataset.slot : null;
     if (setHtml(actionButtons, html) && focused) (actionButtons.querySelector(`[data-slot="${focused}"]`) || root).focus();
   }
 
+  // --- The retry form, with the modes the run answer allows (`retryModes`): resume only when the task's last
+  // attempt has a session. It stays open, with
+  // the note, until it is sent, cancelled, or the drawer shows another task; a refusal keeps both. ---
+
+  function renderRetryForm() {
+    if (retryForm.hidden) return;
+    const canResume = (task.retryModes || []).includes('resume');
+    const resume = retryForm.querySelector('[data-mode="resume"]');
+    resume.hidden = !canResume;
+    resume.querySelector('input').disabled = !canResume;
+    if (!canResume && retryMode() !== 'fresh') retryForm.querySelector('input[value="fresh"]').checked = true;
+    retryHint.textContent = retryMode() === 'resume'
+      ? 'The note goes into the message that resumes the session, which also names the earlier attempt’s report.'
+      : 'The note is appended to the brief, under a heading with the time. The Brief tab then shows it.';
+    retrySubmit.setAttribute('aria-disabled', String(busy === 'retry'));
+    retrySubmit.textContent = busy === 'retry' ? 'Retry task…' : 'Retry task';
+  }
+
+  const retryMode = () => retryForm.querySelector('input[name="retry-mode"]:checked')?.value;
+
+  function openRetryForm() {
+    retryForm.hidden = false;
+    retryMessage.textContent = '';
+    retryForm.querySelector(`input[value="${(task.retryModes || []).includes('resume') ? 'resume' : 'fresh'}"]`).checked = true;
+    renderActions();
+    renderRetryForm();
+    retryForm.querySelector('input[name="retry-mode"]:checked').focus();
+  }
+
+  // `focusBack`: the focus goes back to the Retry button, or to the drawer when it is gone.
+  function closeRetryForm(focusBack) {
+    retryForm.hidden = true;
+    retryNote.value = '';
+    retryMessage.textContent = '';
+    renderActions();
+    if (focusBack) (actionButtons.querySelector('[data-action="retry"]') || root).focus();
+  }
+
+  retryForm.addEventListener('change', renderRetryForm);
+  // While a retry is on its way the form stays, so that a refusal is seen. Esc closes the form only, not the
+  // drawer.
+  retryForm.querySelector('.retry-cancel').addEventListener('click', () => { if (busy !== 'retry') closeRetryForm(true); });
+  retryForm.addEventListener('keydown', e => {
+    if (e.key !== 'Escape') return;
+    e.stopPropagation();
+    if (busy !== 'retry') closeRetryForm(true);
+  });
+  retryForm.addEventListener('submit', async e => {
+    e.preventDefault();
+    if (busy) return;
+    const asked = generation, mode = retryMode();
+    busy = 'retry';
+    retryMessage.textContent = '';
+    renderActions();
+    renderRetryForm();
+    const result = await onAction(selection, task, 'retry', { mode, note: retryNote.value });
+    if (asked !== generation) return;
+    busy = null;
+    if (result?.ok) {
+      // A fresh retry's note is now at the end of the brief.
+      if (tab === 'brief') loadBrief();
+      return closeRetryForm(retryForm.contains(document.activeElement));
+    }
+    if (result) retryMessage.textContent = `Retry refused: ${result.error}`;
+    renderActions();
+    renderRetryForm();
+  });
+
   actionButtons.addEventListener('click', async e => {
     const button = e.target.closest('[data-action]');
     if (!button || button.getAttribute('aria-disabled') === 'true' || busy) return;
+    if (button.dataset.action === 'retry') return retryForm.hidden ? openRetryForm() : closeRetryForm(false);
     const action = button.dataset.action, asked = generation;
     busy = action;
     actionMessage.textContent = '';
@@ -319,6 +396,9 @@ export function createDrawer(root, { onClose, onAction }) {
       selection = sel;
       busy = null;
       actionMessage.textContent = '';
+      retryForm.hidden = true;
+      retryNote.value = '';
+      retryMessage.textContent = '';
       reportKey = null;
       groups = new Map();
       following = true;

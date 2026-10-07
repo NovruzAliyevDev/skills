@@ -83,8 +83,9 @@ $tasks = @($queue.tasks)
 $total = $tasks.Count
 
 # The user's standing commands, written whole by the monitor only: `pause`; `skip`, the task ids to
-# pass over; and `resume`, per task id the session a hard stop cut off. The runner reads them before each
-# sequential task, before each group and before each task's session starts, never while a session runs.
+# pass over; `resume`, per task id the session a hard stop cut off; and `retry`, per task id the retry the
+# user asked for a failed or stopped task. The runner reads them before each sequential task, before each
+# group and before each task's session starts, never while a session runs.
 $controlFile = Join-Path $root 'control.json'
 $controlVersion = 1
 $script:controlIgnored = $null
@@ -106,11 +107,12 @@ function Read-Control {
     return $null
 }
 
-# One-shot entries of the control file (`resume`) are applied at most once: an entry whose id the runner's
-# admin line for applying it names (`admin: <what> applied (task <id>, entry <id>)`) is used.
+# One-shot entries of the control file (`resume`, `retry`) are applied at most once: an entry whose id the
+# runner's admin line for applying it names (`admin: <what> applied (task <id>, [mode <mode>, ]entry <id>)`)
+# is used.
 function Test-EntryUsed([string]$entryId) {
     if (-not (Test-Path $progressLog)) { return $false }
-    $pattern = '  admin: \S+ applied \(task [A-Za-z0-9_-]+, entry ' + [regex]::Escape($entryId) + '\)\r?$'
+    $pattern = '  admin: \S+ applied \(task [A-Za-z0-9_-]+, (mode \S+, )?entry ' + [regex]::Escape($entryId) + '\)\r?$'
     return [regex]::IsMatch("$(Get-Content -Raw -Encoding UTF8 $progressLog)", $pattern, 'Multiline')
 }
 
@@ -121,6 +123,18 @@ function Get-ResumeEntry($task) {
     if (-not $control -or -not $control.resume) { return $null }
     $entry = $control.resume."$($task.id)"
     if (-not $entry -or "$($entry.id)" -notmatch '^[A-Za-z0-9-]+$' -or "$($entry.session)" -notmatch '^[A-Za-z0-9-]+$') { return $null }
+    if (Test-EntryUsed "$($entry.id)") { return $null }
+    return $entry
+}
+
+# The unused `retry` entry the monitor wrote for a failed or stopped task, or $null: the mode (`resume`, with
+# the task's last session in `session`, or `fresh`), the entry's id (`id`) and the user's `note`.
+function Get-RetryEntry($task) {
+    $control = Read-Control
+    if (-not $control -or -not $control.retry) { return $null }
+    $entry = $control.retry."$($task.id)"
+    if (-not $entry -or "$($entry.id)" -notmatch '^[A-Za-z0-9-]+$' -or "$($entry.mode)" -notin 'resume', 'fresh') { return $null }
+    if ($entry.mode -eq 'resume' -and "$($entry.session)" -notmatch '^[A-Za-z0-9-]+$') { return $null }
     if (Test-EntryUsed "$($entry.id)") { return $null }
     return $entry
 }
@@ -415,11 +429,31 @@ $closing
     $dirArgs = @('--add-dir', $root)
     if ($group) { $dirArgs += @('--add-dir', $queue.workDir) }
 
-    # A task the user's hard stop cut off resumes its own session, told why it stopped.
+    # A task the user retries from the monitor resumes its last session with the user's note, or starts over
+    # in a new one, whose brief the server already ended with the note. Otherwise a task the user's hard stop
+    # cut off resumes its own session, told why it stopped.
     $cliArgs = Session-Args $dirArgs $sessionName
     $script:sessionId = $null
-    $resume = Get-ResumeEntry $task
-    if ($resume) {
+    $resume = $null
+    $retry = Get-RetryEntry $task
+    if ($retry) { Say "admin: retry applied (task $($task.id), mode $($retry.mode), entry $($retry.id))" 'Yellow' }
+    else { $resume = Get-ResumeEntry $task }
+    if ($retry -and $retry.mode -eq 'resume') {
+        $script:sessionId = "$($retry.session)"
+        $cliArgs = Session-Args $dirArgs '' $script:sessionId
+        $earlier = 'It wrote no report.'
+        if (Test-Path $previousFile) { $earlier = "Its report is $previousFile." }
+        $userNote = ''
+        if ("$($retry.note)".Trim()) { $userNote = "`n`nThe user's note for this retry:`n`n$("$($retry.note)".Trim())" }
+        $prompt = @"
+Your earlier attempt at this task did not finish. $earlier The user has asked, from the monitor, for the task to be tried again in this same session.$userNote
+
+Check the working tree before you go on: the earlier attempt's work may still be in it. Then carry on with your task; it is in $taskFile.$commitNote
+
+$closing
+"@
+    }
+    elseif ($resume) {
         Say "admin: resume applied (task $($task.id), entry $($resume.id))" 'Yellow'
         $script:sessionId = "$($resume.session)"
         $cliArgs = Session-Args $dirArgs '' $script:sessionId
