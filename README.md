@@ -87,8 +87,8 @@ the merge of a parallel group lands there too.
   task's brief, and nothing of the conversation that set the queue up.
 - The queue stops at the first task whose report does not start with `DONE`. The window then shows a
   red **STOPPED** line with the command that opens that session.
-- After a stop, fix the cause and run `run.ps1` again: finished tasks are skipped, and the stopped one
-  starts over with a pointer to its earlier report.
+- After a stop, fix the cause and continue the queue from the monitor (or run `run.ps1` again): finished
+  tasks are skipped, and the stopped one starts over with a pointer to its earlier report.
 - Sessions cannot run background commands, because a headless session's background commands die when
   it ends; slow commands such as a full test suite get up to 60 minutes instead. A session that ends
   without writing its report is resumed once to write it.
@@ -103,19 +103,25 @@ the merge of a parallel group lands there too.
 - A merge conflict starts a conflict session that resolves it, tests what it touched and commits the
   merge. If it cannot, that merge is undone, the queue stops, and the branches and worktrees not yet
   merged are kept.
-- If a task of a group fails, the others finish, nothing is merged and the queue stops. Running
-  `run.ps1` again continues the failed task in its own worktree.
+- If a task of a group fails, the others finish, nothing is merged and the queue stops. Continuing
+  the queue continues the failed task in its own worktree.
 - While a group runs, the window shows only start and finish lines for its tasks; the monitor and
   `logs\NN.jsonl` show the rest. The design record is in
   [task-queue/docs/parallel-tasks](task-queue/docs/parallel-tasks/).
 
 ### The monitor
 
-A read-only page at <http://127.0.0.1:4747/> for every queue under `%USERPROFILE%\.claude-queues`. Each
+A page at <http://127.0.0.1:4747/> for every queue under `%USERPROFILE%\.claude-queues`. Each
 task is a pixel-art worker in an office: waiting in line, typing at the desk, celebrating in the done
 zone, or in the red alert corner when it stops. The page also shows the running session's activity, the
 reports, the commits made during the run, and browser notifications when a task finishes or the queue
 stops. It runs only on this computer and exits after two idle hours with no queue running.
+
+For an unfinished queue the monitor can stop it, pause it after the current task, continue it, skip a
+task not yet started, retry a failed or stopped task (resuming its session or starting over, with a
+note), and edit the brief of a task not yet started. A queue is better continued from the monitor than
+by hand: a run lock makes a second runner of the same run folder exit at once. The design record is in
+[task-queue/docs/monitor-admin](task-queue/docs/monitor-admin/).
 
 The queue starts the monitor by itself. To start it by hand:
 

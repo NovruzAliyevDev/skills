@@ -89,7 +89,7 @@ Start it in its own window, so it outlives this session and the user can watch i
 Start-Process powershell.exe -ArgumentList '-NoExit', '-NoProfile', '-File', '"<run folder>\run.ps1"'
 ```
 
-Then start the monitor, a read-only web page for every queue under `%USERPROFILE%\.claude-queues` at `http://127.0.0.1:4747/`. It opens the browser. If the monitor is already running, the new process only opens the browser and exits.
+Then start the monitor, a web page for every queue under `%USERPROFILE%\.claude-queues` at `http://127.0.0.1:4747/`. It opens the browser. If the monitor is already running, the new process only opens the browser and exits.
 
 ```powershell
 Start-Process node -ArgumentList '"<this skill''s folder>\monitor\server.mjs"', '--open' -WindowStyle Hidden
@@ -97,10 +97,10 @@ Start-Process node -ArgumentList '"<this skill''s folder>\monitor\server.mjs"', 
 
 Then tell the user, briefly:
 
-- the monitor at `http://127.0.0.1:4747/`: tasks and their states, the running session's activity, reports, commits, and browser notifications when a task finishes or the queue stops. It runs only on this computer and stops by itself after two idle hours with no queue running. To start it again: `node "<this skill's folder>\monitor\server.mjs" --open`;
+- the monitor at `http://127.0.0.1:4747/`: tasks and their states, the running session's activity, reports, commits, and browser notifications when a task finishes or the queue stops. For an unfinished queue it can also stop it (killing its sessions), pause it after the current task, continue it, skip a task not yet started, retry a failed or stopped task (resuming its session or starting over, with a note), and edit the brief of a task not yet started: buttons under the run header and in a task's panel, or a right-click on a worker. It runs only on this computer and stops by itself after two idle hours with no queue running. To start it again: `node "<this skill's folder>\monitor\server.mjs" --open`;
 - the run folder; `progress.log` there is the running record, `results\NN.md` each task's report, `logs\NN.jsonl` each session's full stream;
 - the window shows each session's messages and tool calls live, and a red **STOPPED** line with the resume command when a task fails;
-- after a stop: fix the cause, then run `run.ps1` again; finished tasks are skipped;
+- after a stop: fix the cause, then continue the queue from the monitor (Continue, or Retry on the failed task) rather than running `run.ps1` by hand; finished tasks are skipped either way, and the run lock makes a second runner of the same run folder exit at once;
 - the user leaves the repository alone until the queue finishes: the sessions work in this same working tree, and a group's merge lands there too.
 
 When there are groups, also tell them:
@@ -108,4 +108,4 @@ When there are groups, also tell them:
 - each task of a group works in its own worktree under `wt\` in the run folder, on its own branch; once the group is merged, its worktrees and branches are removed;
 - while a group runs, the window shows only start and finish lines for its tasks; the monitor shows the rest, and `logs\NN.jsonl` still holds each full stream;
 - a merge conflict starts a conflict session that resolves it, tests what it touched and commits the merge, reporting in `results\merge-<first id>-<last id>.md`. If it cannot, that merge is undone, the queue stops, and the branches and worktrees not yet merged are kept;
-- when a task of a group fails, the others finish, nothing is merged and the queue stops; running `run.ps1` again continues the failed task in its own worktree.
+- when a task of a group fails, the others finish, nothing is merged and the queue stops; continuing the queue from the monitor continues the failed task in its own worktree.
