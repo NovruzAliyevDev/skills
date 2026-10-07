@@ -82,8 +82,9 @@ function Read-Status([string]$path) {
 $tasks = @($queue.tasks)
 $total = $tasks.Count
 
-# The user's standing commands, written whole by the monitor only. The runner reads them before each
-# sequential task and before each group, never while a session runs.
+# The user's standing commands, written whole by the monitor only: `pause`, and `skip`, the task ids to
+# pass over. The runner reads them before each sequential task and before each group, never while a
+# session runs.
 $controlFile = Join-Path $root 'control.json'
 $controlVersion = 1
 $script:controlIgnored = $null
@@ -183,6 +184,26 @@ function Test-Done($task) {
         $worktree = Worktree-Of $task
         if ((Test-Path $worktree) -and (Test-Branch $task) -and @(Get-Uncommitted $worktree).Count) { return $false }
     }
+    return $true
+}
+
+# A task the user skipped has a report whose first line is SKIPPED; it counts as finished, as DONE does.
+function Test-Skipped($task) { return (Read-Status (Result-Of $task)) -eq 'SKIPPED' }
+
+# Passes over a task that is not DONE when the user skipped it: it already has its SKIPPED report, or the
+# control file lists it, and it gets that report now. Returns whether the task is skipped.
+function Skip-Task($task, $control) {
+    $label = Label-Of $task
+    if (Test-Skipped $task) {
+        Say "$label - already SKIPPED, passed over" 'DarkGray'
+        return $true
+    }
+    if (-not $control -or @($control.skip | ForEach-Object { "$_" }) -notcontains "$($task.id)") { return $false }
+    $resultFile = Result-Of $task
+    if (Test-Path $resultFile) { Move-Item -Force $resultFile (Join-Path $resultsDir "$($task.id).previous.md") }
+    [System.IO.File]::WriteAllText($resultFile, "SKIPPED`r`n`r`nSkipped by the user from the monitor, before the queue reached this task. The task was not run.`r`n", $utf8)
+    Say "admin: skip applied (task $($task.id))" 'Yellow'
+    Say "$label - SKIPPED (by the user)" 'Yellow'
     return $true
 }
 
@@ -300,6 +321,11 @@ function Session-Note {
     return "session $($script:sessionId)$costNote"
 }
 
+# The tasks of a group the user did not skip, in queue order.
+function Members-Of($group) {
+    return @($group.ids | ForEach-Object { $tasks[$position[$_]] } | Where-Object { -not (Test-Skipped $_) })
+}
+
 # Runs one task: its session, the single resume when the session ends without a report, and the
 # verdict. Writes the task's progress lines and returns whether the task is DONE. A parallel task
 # runs in its worktree, quietly, and must leave nothing uncommitted there.
@@ -333,7 +359,7 @@ function Run-Task($task) {
     }
     $parallelNote = ''
     if ($group) {
-        $beside = @($group.ids | Where-Object { $_ -ne "$($task.id)" } | ForEach-Object { "task $($position[$_] + 1) ('$($tasks[$position[$_]].title)')" }) -join ', '
+        $beside = @(Members-Of $group | Where-Object { $_.id -ne $task.id } | ForEach-Object { "task $($position["$($_.id)"] + 1) ('$($_.title)')" }) -join ', '
         $parallelNote = @"
 
 
@@ -433,7 +459,7 @@ Before you finish, write $resultFile again, so that it covers this conflict and 
         if (Test-Path $previousFile) {
             $retryNote = "`nThe report of an earlier conflict session for this group is $previousFile."
         }
-        $members = @($group.ids | ForEach-Object { $tasks[$position[$_]] })
+        $members = @(Members-Of $group)
         $beside = @($members | ForEach-Object { "task $($position["$($_.id)"] + 1) ('$($_.title)')" }) -join ', '
         $briefs = @($members | ForEach-Object { '  ' + (Join-Path $root "tasks\$($_.id).md") }) -join "`n"
         $reports = @($members | ForEach-Object { '  ' + (Result-Of $_) }) -join "`n"
@@ -503,11 +529,25 @@ Before you finish, write $resultFile. Its first line is exactly DONE or FAILED. 
     return "conflict merging task $($task.id), branch $branch; $ending"
 }
 
-# Runs a parallel group: every task that is not done yet in its own worktree and branch, at most
-# $maxParallel at a time, then the merge step. Returns when the group is done and merged, and
-# stops the queue otherwise.
-function Run-Group($group) {
+# Applies the user's skips to a group about to start, once: the tasks it lists that are not DONE get
+# their SKIPPED report. A group that started in an earlier run (a branch of it, or a report other than
+# SKIPPED) reads no skips again; its skipped tasks stay skipped. Returns the tasks left.
+function Skip-Members($group) {
     $members = @($group.ids | ForEach-Object { $tasks[$position[$_]] })
+    $started = @($members | Where-Object { (Test-Branch $_) -or ((Read-Status (Result-Of $_)) -and -not (Test-Skipped $_)) }).Count
+    $control = $null
+    if (-not $started) { $control = Read-Control }
+    foreach ($id in $group.ids) {
+        $task = $tasks[$position[$id]]
+        if (-not (Test-Done $task)) { Skip-Task $task $control | Out-Null }
+    }
+    return @(Members-Of $group)
+}
+
+# Runs a parallel group of two or more tasks the user did not skip, $members: every task that is not done
+# yet in its own worktree and branch, at most $maxParallel at a time, then the merge step. Returns when
+# the group is done and merged, and stops the queue otherwise.
+function Run-Group($group, $members) {
     $todo = @($members | Where-Object { -not (Test-Done $_) })
     foreach ($task in $members) {
         if ($todo -notcontains $task) { Say "$(Label-Of $task) - already DONE, skipped" 'DarkGray' }
@@ -526,7 +566,7 @@ function Run-Group($group) {
     }
 
     if ($todo.Count) {
-        Say "Group $($group.label) - starting (tasks $($group.ids -join ', '))" 'Cyan'
+        Say "Group $($group.label) - starting (tasks $(@($members | ForEach-Object { $_.id }) -join ', '))" 'Cyan'
         Run-Git $queue.workDir @('worktree', 'prune') | Out-Null
         foreach ($task in $todo) {
             $worktree = Worktree-Of $task
@@ -673,7 +713,20 @@ try {
         $group = $groupOf["$($task.id)"]
         if ($group) {
             Test-Pause "before group $($group.label)"
-            Run-Group $group
+            # A group left with one task runs it as a sequential task, in the main checkout; a group left
+            # with none is passed over, with no merge step.
+            $left = @(Skip-Members $group)
+            if ($left.Count -ge 2) { Run-Group $group $left }
+            elseif ($left.Count -eq 1) {
+                $alone = $left[0]
+                $groupOf.Remove("$($alone.id)")
+                if (Test-Done $alone) { Say "$(Label-Of $alone) - already DONE, skipped" 'DarkGray' }
+                elseif (-not (Run-Task $alone)) {
+                    Say "Fix the cause, then run this file again: finished tasks are skipped and this one starts over." 'Yellow'
+                    exit 1
+                }
+            }
+            else { Say "Group $($group.label) - passed over (all its tasks skipped)" 'DarkGray' }
             Test-Pause "after group $($group.label)"
             $i += $group.ids.Count - 1
             continue
@@ -682,6 +735,7 @@ try {
             Say "$(Label-Of $task) - already DONE, skipped" 'DarkGray'
             continue
         }
+        if (Skip-Task $task (Read-Control)) { continue }
         Test-Pause "before task $($task.id)"
         if (-not (Run-Task $task)) {
             Say "Fix the cause, then run this file again: finished tasks are skipped and this one starts over." 'Yellow'
@@ -689,7 +743,10 @@ try {
         }
     }
 
-    Say "All $total tasks DONE. Reports: $resultsDir" 'Green'
+    # A queue that finished with skipped tasks is not "all DONE".
+    $skipped = @($tasks | Where-Object { Test-Skipped $_ }).Count
+    if ($skipped) { Say "Finished, $skipped skipped: $($total - $skipped) of $total tasks DONE. Reports: $resultsDir" 'Green' }
+    else { Say "All $total tasks DONE. Reports: $resultsDir" 'Green' }
 }
 finally {
     # A runner killed outright leaves its lock behind, naming a process that is gone.

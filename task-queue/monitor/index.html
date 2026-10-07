@@ -57,6 +57,9 @@ button { font: inherit; color: inherit; }
 .s-failed, .s-stopped, .s-preflight-failed { background: var(--bad); }
 .s-interrupted, .s-no-session, .s-paused { background: var(--warn); }
 .s-pausing { background: var(--accent); }
+/* A skipped task is grey, as a pending one, with a dashed edge; a queue finished with skips is not "DONE". */
+.s-skipped { border-style: dashed; border-color: rgba(0, 0, 0, .35); }
+.s-finished-with-skips { background: var(--ok); }
 .muted { color: var(--muted); }
 .empty { color: var(--muted); font-style: italic; }
 .btn { padding: 3px 10px; font-size: 11px; font-weight: 700; cursor: pointer; background: var(--panel); border: 2px solid var(--frame); box-shadow: 2px 2px 0 var(--shadow); }
@@ -139,6 +142,9 @@ pre.plain { margin: 0; max-height: 50vh; overflow: auto; padding: 8px 10px; back
 .tag.open { background: var(--accent); color: #fff; }
 /* A parallel group's worker: its name tag is framed in the group's colour. */
 .tag.grouped { border-color: var(--group); box-shadow: inset 0 -2px 0 var(--group); }
+/* A skipped task's tag, and the tag of one marked to be skipped, are greyed like its desk or figure. */
+.tag.skipped { color: var(--muted); border-color: var(--line); border-style: dashed; }
+.tag.skipped.open { color: #fff; }
 .worker { position: absolute; padding: 0; margin: 0; border: 0; background: transparent; cursor: pointer; }
 /* Helpers have a hover target over each sprite, and a "+N" marker for those not drawn; neither is in the Tab order. */
 .helper { position: absolute; cursor: pointer; }
@@ -187,6 +193,19 @@ pre.plain { margin: 0; max-height: 50vh; overflow: auto; padding: 8px 10px; back
 .drawer-close { flex: none; width: 28px; height: 28px; padding: 0; font-size: 16px; line-height: 1; }
 .drawer .task-facts { display: flex; flex-wrap: wrap; gap: 2px 16px; font-size: 13px; }
 .drawer .task-facts div { display: flex; gap: 6px; }
+/* The task's actions, under its facts: only those the run answer allows now. */
+.task-actions { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; margin-top: 8px; }
+.skip-note { margin: 6px 0 0; color: var(--muted); font-size: 13px; font-weight: 600; }
+
+/* The confirmation dialog, in the page's pixel style. */
+.confirm { max-width: min(420px, calc(100vw - 32px)); padding: 14px 16px; color: var(--text); background: var(--panel);
+  border: 2px solid var(--frame); box-shadow: 2px 2px 0 var(--shadow), 4px 4px 0 var(--shadow); }
+.confirm::backdrop { background: rgba(0, 0, 0, .35); }
+.confirm h2 { margin: 0 0 8px; font-size: 13px; }
+.confirm p { margin: 0 0 12px; overflow-wrap: anywhere; }
+.confirm-buttons { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
+.btn.danger { color: #fff; background: var(--bad); border-color: var(--frame); }
+.btn.danger:hover { filter: brightness(1.1); }
 .tabs { display: flex; gap: 6px; padding: 0 14px; border-bottom: 2px solid var(--frame); }
 .tabs [role="tab"] { margin-bottom: -2px; padding: 4px 10px; font-size: 11px; font-weight: 700; cursor: pointer;
   color: var(--muted); background: var(--bg); border: 2px solid var(--frame); }
@@ -272,6 +291,10 @@ details.agent > summary { cursor: pointer; font-size: 12px; color: var(--muted);
         <button type="button" class="btn drawer-close" aria-label="Close">&times;</button>
       </div>
       <div class="drawer-facts"></div>
+      <div class="task-actions" hidden>
+        <div class="control-buttons" role="group" aria-label="Task actions"></div>
+        <p class="admin-msg" role="status"></p>
+      </div>
     </div>
     <div class="tabs" role="tablist" aria-label="Task">
       <button type="button" role="tab" id="tab-activity" data-tab="activity" aria-controls="panel-activity" aria-selected="true">Activity</button>
@@ -282,6 +305,16 @@ details.agent > summary { cursor: pointer; font-size: 12px; color: var(--muted);
     <div class="tab-panel" id="panel-report" role="tabpanel" aria-labelledby="tab-report" tabindex="0" hidden></div>
     <div class="tab-panel" id="panel-brief" role="tabpanel" aria-labelledby="tab-brief" tabindex="0" hidden></div>
   </section>
+  <dialog class="confirm" id="confirm" aria-labelledby="confirm-title" aria-describedby="confirm-text">
+    <form method="dialog">
+      <h2 id="confirm-title"></h2>
+      <p id="confirm-text"></p>
+      <div class="confirm-buttons">
+        <button type="submit" class="btn" value="cancel" autofocus>Cancel</button>
+        <button type="submit" class="btn danger" value="ok" id="confirm-ok"></button>
+      </div>
+    </form>
+  </dialog>
 </div>
 </body>
 </html>

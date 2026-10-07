@@ -172,6 +172,9 @@ function readControl(runDir) {
     return { control: { ...NO_COMMANDS, ...control }, problem: null };
 }
 
+// The task ids the control file lists to skip, as text.
+const skipList = control => (Array.isArray(control.skip) ? control.skip : []).map(String);
+
 // The server is the only writer of the control file, and replaces it whole: the runner never reads half
 // of it.
 function writeControl(runDir, control) {
@@ -218,7 +221,7 @@ function launchRunner(runDir) {
 // --- progress.log -> run and task states. ---
 
 const LINE_RE = /^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})  (.*)$/;
-const LABEL_RE = /^\[(\d+)\/(\d+)\] (.*?) - (starting|session (\S+)|DONE \(session (\S+?)(?:, cost \$([\d.]+))?\)|STOPPED \((.*)\)|already DONE, skipped)$/;
+const LABEL_RE = /^\[(\d+)\/(\d+)\] (.*?) - (starting|session (\S+)|DONE \(session (\S+?)(?:, cost \$([\d.]+))?\)|STOPPED \((.*)\)|already DONE, skipped|SKIPPED \(by the user\)|already SKIPPED, passed over)$/;
 
 function parseLocal(stamp) {
     const [d, t] = stamp.split(' ');
@@ -261,6 +264,7 @@ const conflictIdOf = group => `merge-${group}`;
 // starts a new conflict session at its first conflict; a later conflict of the same step resumes it. A
 // merge step that ends without a conflict leaves no conflict session from an earlier attempt to show.
 function applyGroupLine(group, conflicts, time, rest) {
+    group.seen = true;
     if (rest.startsWith('starting (')) { group.merge = 'waiting'; group.reason = null; return; }
     if (rest === 'merging') { Object.assign(group, { merge: 'merging', merged: [], reason: null, freshStep: true }); return; }
     if (rest === 'merge DONE') {
@@ -313,12 +317,15 @@ function addFileFacts(runDir, entry) {
 // progress, except the pause.
 const isAdminLine = message => message.startsWith('admin: ');
 const PAUSED_LINE = 'Queue - PAUSED (by the user)';
+// The final line of a queue that finished with skipped tasks, in place of "All N tasks DONE".
+const FINISHED_WITH_SKIPS_RE = /^Finished, \d+ skipped: /;
 
-// `control` is the run's control file (see readControl): a pause asked of a live runner makes it pausing.
+// `control` is the run's control file (see readControl): a pause asked of a live runner makes it pausing,
+// and a pending task it lists to skip is `skipPending`.
 function deriveRun(runDir, queue, lines, runner, control = NO_COMMANDS) {
     const groups = groupsOf(queue);
     const groupOf = new Map(groups.flatMap(g => g.tasks.map(id => [id, g.id])));
-    const merges = new Map(groups.map(g => [g.id, { id: g.id, merge: 'waiting', merged: [], reason: null, conflictTask: null, freshStep: false }]));
+    const merges = new Map(groups.map(g => [g.id, { id: g.id, merge: 'waiting', merged: [], reason: null, conflictTask: null, freshStep: false, seen: false }]));
     const conflicts = new Map();               // conflict session id -> its entry, in the order they started
     const tasks = (queue.tasks || []).map((t, i) => ({
         index: i + 1, id: t.id, title: t.title, state: 'pending',
@@ -343,6 +350,7 @@ function deriveRun(runDir, queue, lines, runner, control = NO_COMMANDS) {
         if (message.startsWith('Preflight: model')) { preflight = message.slice('Preflight: '.length); continue; }
         if (message.startsWith('Preflight: asked')) { runState = 'preflight-failed'; preflight = message; continue; }
         if (message.startsWith('All ') && message.includes(' tasks DONE')) { runState = 'done'; continue; }
+        if (FINISHED_WITH_SKIPS_RE.test(message)) { runState = 'finished-with-skips'; continue; }
         if (message.startsWith('Fix the cause')) { runState = 'stopped'; continue; }
         // A re-run starts a group again: a task of it still open from an earlier, killed run waits for its
         // child process (maybe for a free slot) and writes its starting line again when it gets one.
@@ -368,6 +376,18 @@ function deriveRun(runDir, queue, lines, runner, control = NO_COMMANDS) {
             Object.assign(task, { state: /report status 'FAILED'/.test(reason) ? 'failed' : 'stopped', end: time, reason });
         }
         else if (what.startsWith('already DONE')) { if (task.state !== 'done') task.state = 'done'; }
+        else if (what.startsWith('SKIPPED') || what.startsWith('already SKIPPED')) task.state = 'skipped';
+    }
+
+    // A group left with fewer than two tasks by skips has no merge step, and the task left runs as a
+    // sequential task, in the runner's own process.
+    const byId = new Map(tasks.map(t => [t.id, t]));
+    const alone = [];                          // the task left in such a group
+    for (const g of groups) {
+        const left = g.tasks.filter(id => byId.get(id).state !== 'skipped');
+        if (left.length > 1) continue;
+        merges.get(g.id).merge = 'skipped';
+        for (const id of left) { groupOf.delete(id); alone.push(byId.get(id)); }
     }
 
     // A task that started but has no final line is running only while its runner and session live: for a
@@ -398,7 +418,15 @@ function deriveRun(runDir, queue, lines, runner, control = NO_COMMANDS) {
         addFileFacts(runDir, t);
     }
     for (const c of conflicts.values()) addFileFacts(runDir, c);
-    const finishedAt = ['done', 'stopped', 'preflight-failed', 'interrupted', 'paused'].includes(runState) && runLines.length ? runLines[runLines.length - 1].time : null;
+    const finishedAt = ['done', 'finished-with-skips', 'stopped', 'preflight-failed', 'interrupted', 'paused'].includes(runState) && runLines.length ? runLines[runLines.length - 1].time : null;
+    const toSkip = new Set(skipList(control));
+    for (const t of tasks) t.skipPending = t.state === 'pending' && toSkip.has(t.id);
+    // A group has started once the runner wrote a line of it or one of its tasks left the queue line.
+    const started = new Set(groups.filter(g => merges.get(g.id).seen ||
+        g.tasks.some(id => !['pending', 'skipped'].includes(byId.get(id).state))).map(g => g.id));
+    for (const t of tasks) t.groupStarted = !!t.group && started.has(t.group);
+    // The task left alone runs as a sequential task, so it is shown without its group.
+    for (const t of alone) t.group = null;
     // Runs with groups also answer each group's merge step, and the conflict sessions: task-like entries
     // that are not tasks, so they are left out of the tasks and their counts.
     const parallel = groups.length ? {
@@ -433,15 +461,32 @@ function snapshotOf(runDir, queue) {
     const runner = runnerOf(runDir, supported);
     const { control, problem } = readControl(runDir);
     const detail = deriveRun(runDir, queue, lines, runner, control);
-    return { lines, runner, control, problem, detail, admin: adminOf(runDir, supported, detail, runner, control) };
+    const admin = adminOf(runDir, supported, detail, runner, control);
+    for (const t of detail.tasks) delete t.groupStarted;
+    return { lines, runner, control, problem, detail, admin };
 }
 
-const FINISHED = new Set(['done']);
+const FINISHED = new Set(['done', 'finished-with-skips']);
 
-// The run-level admin actions allowed now, each with why it is not when it is not. The page shows these;
-// the admin endpoint judges each request by the same rules.
+// Why a task action is not allowed now, or null when it is. Skip needs a task that has not started, in no
+// group that has started; un-skip a task marked to be skipped that has no SKIPPED report yet.
+function taskRefusal(action, task, finished, control) {
+    if (finished) return 'the run is finished';
+    if (task.state === 'skipped') return 'the task is skipped: it has its SKIPPED report';
+    const marked = skipList(control).includes(task.id);
+    if (action === 'unskip') return marked ? null : 'the task is not marked to be skipped';
+    if (marked) return 'the task is already marked to be skipped';
+    if (task.state !== 'pending') return 'the task has started';
+    if (task.groupStarted) return "the task's group has started";
+    return null;
+}
+
+// The run-level admin actions allowed now, each with why it is not when it is not, and the same per task
+// (`taskRefusals` by task id; each task's `actions` lists its allowed ones). The page shows these; the
+// admin endpoint judges each request by the same rules.
 function adminOf(runDir, supported, detail, runner, control) {
-    if (!supported) return { supported: false, actions: [], refusals: {} };
+    for (const t of detail.tasks) t.actions = [];
+    if (!supported) return { supported: false, actions: [], refusals: {}, taskRefusals: {} };
     const finished = FINISHED.has(detail.state);
     const launching = starting(runDir, runner);
     const alive = launching || (runner.known && runner.alive);
@@ -454,7 +499,12 @@ function adminOf(runDir, supported, detail, runner, control) {
         : !runner.known && !launching ? 'the process check is still pending'
         : launching ? 'the runner is starting' : alive ? 'a runner of this run is alive' : null);
     const actions = RUN_ACTIONS.filter(a => !refusals[a]);
-    return { supported: true, actions, refusals };
+    const taskRefusals = {};
+    for (const t of detail.tasks) {
+        taskRefusals[t.id] = Object.fromEntries(TASK_ACTIONS.map(a => [a, taskRefusal(a, t, finished, control)]).filter(([, why]) => why));
+        t.actions = TASK_ACTIONS.filter(a => !taskRefusals[t.id][a]);
+    }
+    return { supported: true, actions, refusals, taskRefusals };
 }
 
 // A run with groups also answers how many merges have conflicted so far, so the page can notify each one.
@@ -582,9 +632,10 @@ function moduleFile(pathname) {
     return statOrNull(file)?.isFile() ? file : null;
 }
 
-// --- Admin actions: POST /api/admin { project, run, action }. ---
+// --- Admin actions: POST /api/admin { project, run, action }, with `task` for a task action. ---
 
 const RUN_ACTIONS = ['pause', 'cancel-pause', 'continue'];
+const TASK_ACTIONS = ['skip', 'unskip'];
 
 // The body as text; it rejects a body over BODY_MAX once it has been read to its end and dropped, so that
 // the sender gets the answer instead of a reset connection.
@@ -615,21 +666,24 @@ async function handleAdmin(req, res) {
     let body;
     try { body = JSON.parse(text); } catch { return send(res, 400, { error: 'the request is not JSON' }); }
     if (!body || typeof body !== 'object') return send(res, 400, { error: 'the request is not a JSON object' });
-    const { project, run, action } = body;
+    const { project, run, action, task } = body;
     if (typeof project !== 'string' || typeof run !== 'string' || !NAME_RE.test(project) || !NAME_RE.test(run)) return send(res, 400, { error: 'no valid project and run' });
-    if (!RUN_ACTIONS.includes(action)) return send(res, 400, { error: `unknown action '${String(action)}'` });
+    const forTask = TASK_ACTIONS.includes(action);
+    if (!forTask && !RUN_ACTIONS.includes(action)) return send(res, 400, { error: `unknown action '${String(action)}'` });
+    if (forTask && (typeof task !== 'string' || !TASK_ID_RE.test(task))) return send(res, 400, { error: 'no valid task' });
     const runDir = runDirFrom(new URLSearchParams({ project, run }));
     if (!runDir) return send(res, 404, { error: 'unknown run' });
     const queue = readQueue(runDir);
     if (!queue) return send(res, 404, { error: 'unreadable queue.json' });
+    if (forTask && !(queue.tasks || []).some(t => t.id === task)) return send(res, 400, { error: `unknown task '${task}'` });
 
     await refreshLiveness();
     const { control, problem, admin } = snapshotOf(runDir, queue);
     if (!admin.supported) return send(res, 409, { error: "this run folder's runner copy predates admin actions" });
     if (problem) appendProgress(runDir, `admin: control.json ignored (${problem})`);
-    const refusal = admin.refusals[action];
+    const refusal = forTask ? admin.taskRefusals[task][action] : admin.refusals[action];
     if (refusal) {
-        appendProgress(runDir, `admin: ${action} refused (${refusal})`);
+        appendProgress(runDir, `admin: ${action} refused (${forTask ? `task ${task}: ` : ''}${refusal})`);
         return send(res, 409, { error: refusal });
     }
 
@@ -644,6 +698,12 @@ async function handleAdmin(req, res) {
         if (control.pause) writeControl(runDir, { ...control, pause: false });
         appendProgress(runDir, 'admin: continue - run.ps1 launched in a new window');
         launchRunner(runDir);
+    } else if (action === 'skip') {
+        writeControl(runDir, { ...control, skip: [...skipList(control), task] });
+        appendProgress(runDir, `admin: skip requested (task ${task})`);
+    } else if (action === 'unskip') {
+        writeControl(runDir, { ...control, skip: skipList(control).filter(id => id !== task) });
+        appendProgress(runDir, `admin: unskip requested (task ${task})`);
     }
     return send(res, 200, { ok: true, action });
 }

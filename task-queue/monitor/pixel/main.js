@@ -2,7 +2,7 @@
 // task drawer, the running tasks' helpers, notifications and the permission button, the tab title, the
 // offline marker, the theme listener and the keyboard.
 import { onOffline, postAdmin, readFeed, watchRun, watchRuns } from './api.js';
-import { ACTION_LABEL, BAD, STATE_LABEL, createDrawer, entryOf, esc, onRunChosen, onRunControl, renderCommits, renderProgress, renderRunControls, renderRunHeader, renderRunList, runKey } from './panel.js';
+import { ACTION_LABEL, BAD, STATE_LABEL, confirmAction, createDrawer, entryOf, esc, onRunChosen, onRunControl, renderCommits, renderProgress, renderRunControls, renderRunHeader, renderRunList, runKey } from './panel.js';
 import { resetSprites } from './sprites.js';
 import { createHelperList, createOffice, helperTasksOf } from './workers.js';
 import { createScene } from './scene.js';
@@ -41,6 +41,18 @@ const drawer = createDrawer(document.getElementById('drawer'), {
     scene?.setOpen(null);
     if (hadFocus && opener?.isConnected) opener.focus();
     opener = null;
+  },
+  // Skip asks for confirmation first; Un-skip does not. The page then shows what happened from its next poll.
+  async onAction(selection, task, action) {
+    if (action === 'skip' && !await confirmAction({
+      title: `Skip task ${String(task.index).padStart(2, '0')}?`,
+      text: `"${task.title}" will not run: when the queue reaches it, it passes over it and writes a SKIPPED report. You can un-skip it until then.`,
+      ok: 'Skip task',
+    })) return null;
+    const result = await postAdmin(selection, action, { task: task.id });
+    runPoll.refresh();
+    runsPoll.refresh();
+    return result;
   },
 });
 
@@ -152,7 +164,7 @@ addEventListener('hashchange', () => {
 
 function updateTitle() {
   const done = detail.tasks.filter(t => t.state === 'done').length;
-  const icon = detail.state === 'done' ? '✓' : BAD.has(detail.state) ? '✗' : detail.state === 'paused' ? '⏸'
+  const icon = ['done', 'finished-with-skips'].includes(detail.state) ? '✓' : BAD.has(detail.state) ? '✗' : detail.state === 'paused' ? '⏸'
     : ['running', 'pausing'].includes(detail.state) ? '▶' : '·';
   const label = BAD.has(detail.state) ? ` ${STATE_LABEL[detail.state]}` : '';
   document.title = `${icon} ${done}/${detail.tasks.length}${label} · ${selected.project}`;
@@ -171,6 +183,7 @@ function notifyChanges(list) {
       }
       if ((r.conflicts || 0) > (before.conflicts || 0)) notify('Merge conflict', key);
       if (r.state !== before.state && r.state === 'done') notify(`Queue finished: all ${r.total} tasks DONE`, key);
+      if (r.state !== before.state && r.state === 'finished-with-skips') notify(`Queue finished, ${r.counts.skipped || 0} skipped: ${r.counts.done || 0} of ${r.total} tasks DONE`, key);
       if (r.state !== before.state && BAD.has(r.state)) notify(`Queue ${STATE_LABEL[r.state]}`, key);
       if (r.state !== before.state && r.state === 'paused') notify('Queue paused', key);
     }
@@ -200,8 +213,8 @@ matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
   scene?.redraw();
 });
 
-// Esc closes the tooltip first, then the drawer.
+// Esc closes the tooltip first, then the drawer; while the confirmation dialog is open, only the dialog.
 addEventListener('keydown', e => {
-  if (e.key !== 'Escape' || scene?.dismiss()) return;
+  if (e.key !== 'Escape' || document.getElementById('confirm').open || scene?.dismiss()) return;
   drawer.close();
 });

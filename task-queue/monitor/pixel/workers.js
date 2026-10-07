@@ -12,8 +12,10 @@ const STATES = {
   'done': { place: 'done', anim: 'idle', marker: 'check' },
   'failed': { place: 'alert', anim: 'alarm', marker: 'alert' },
   'stopped': { place: 'alert', anim: 'alarm', marker: 'alert' },
+  // A skipped task has no worker at work: only its desk, grey and empty, in a row of its own.
+  'skipped': { place: 'skipped', anim: 'idle', marker: null },
 };
-const PLACE_NAME = { done: 'done zone', alert: 'alert corner' };
+const PLACE_NAME = { done: 'done zone', alert: 'alert corner', skipped: 'skipped desk' };
 // A run of more than LONG_RUN tasks keeps only its DONE_SHOWN most recently finished workers in the done
 // zone; the other finished tasks fold into the "+N done" counter.
 const LONG_RUN = 12;
@@ -44,7 +46,7 @@ function officeOf(run, desks) {
   const done = run.tasks.filter(t => t.state === 'done');
   const shown = new Set(run.tasks.length > LONG_RUN ? [...done].sort(byRecency).slice(0, DONE_SHOWN) : done);
   const groupIndex = new Map((run.groups || []).map((g, i) => [g.id, i]));
-  const taken = { queue: 0, done: 0, alert: 0 };
+  const taken = { queue: 0, done: 0, alert: 0, skipped: 0 };
   const workers = [], collapsed = [];
   for (const task of entriesOf(run)) {
     const conflict = task.kind === 'conflict';
@@ -59,8 +61,11 @@ function officeOf(run, desks) {
     const group = task.group ?? null;
     const parts = conflict ? ['Conflict session', `merge of group ${group}`, task.state, where] : [number, task.title, task.state, where];
     if (group && !conflict) parts.push(`group ${group}`);
+    // A task marked to be skipped waits in the queue line, greyed, until the queue reaches it.
+    const skipPending = !!task.skipPending;
+    if (skipPending) parts.splice(3, 0, 'marked to be skipped');
     workers.push({
-      id: task.id, number, title: task.title, state: task.state, place, slot, anim, marker, task, conflict,
+      id: task.id, number, title: task.title, state: task.state, place, slot, anim, marker, task, conflict, skipPending,
       group, groupIndex: group ? groupIndex.get(group) ?? 0 : null,
       look: lookOf(task.id), label: parts.join(' · '),
     });

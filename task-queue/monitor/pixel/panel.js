@@ -6,6 +6,7 @@ export const STATE_LABEL = {
   'pending': 'pending', 'running': 'running', 'done': 'DONE', 'failed': 'FAILED', 'stopped': 'STOPPED',
   'interrupted': 'interrupted', 'no-session': 'runner has no session', 'not-started': 'not started',
   'preflight-failed': 'preflight failed', 'pausing': 'pausing', 'paused': 'PAUSED',
+  'skipped': 'SKIPPED', 'finished-with-skips': 'finished with skips',
 };
 export const BAD = new Set(['failed', 'stopped', 'interrupted', 'no-session', 'preflight-failed']);
 
@@ -20,6 +21,10 @@ marked.use({
 export function esc(s) { return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
 function md(text) { return `<div class="md">${marked.parse(text || '')}</div>`; }
 export function badge(state) { return `<span class="badge s-${esc(state)}">${esc(STATE_LABEL[state] || state)}</span>`; }
+// A run's badge: a queue that finished with skipped tasks says how many, never "DONE".
+export function runBadge(state, skipped) {
+  return state === 'finished-with-skips' ? `<span class="badge s-${esc(state)}">finished, ${esc(String(skipped || 0))} skipped</span>` : badge(state);
+}
 export function money(v) { return v ? `$${v.toFixed(2)}` : ''; }
 export function parseLocal(stamp) { if (!stamp) return null; const [d, t] = stamp.split(' '); const [y, mo, da] = d.split('-').map(Number); const [h, mi, s] = t.split(':').map(Number); return new Date(y, mo - 1, da, h, mi, s); }
 function hm(stamp) { return stamp ? stamp.slice(11, 16) : ''; }
@@ -50,7 +55,8 @@ export function taskFacts(task) {
   if (task.reason) rows.push(['Stop reason', task.reason]);
   const facts = rows.map(([label, value]) => `<div><dt>${label}</dt><dd>${esc(value)}</dd></div>`).join('');
   return (facts ? `<dl class="task-facts">${facts}</dl>` : '') +
-    (task.hasPrevious ? '<p class="note">Earlier attempt failed (previous report kept).</p>' : '');
+    (task.hasPrevious ? '<p class="note">Earlier attempt failed (previous report kept).</p>' : '') +
+    (task.skipPending ? '<p class="skip-note">Marked to be skipped: the queue will pass over it.</p>' : '');
 }
 
 const rendered = new WeakMap();
@@ -74,7 +80,7 @@ export function renderRunList(el, runs, selectedKey) {
       : '';
     return `<button type="button" class="run-item" data-key="${esc(key)}"${key === selectedKey ? ' aria-current="true"' : ''}>
       <span class="name">${esc(r.project)} <span class="muted">${esc(r.run)}</span>${missing}</span>
-      <span class="meta">${badge(r.state)}<span>${r.counts.done || 0}/${r.total} done</span><span>${money(r.cost)}</span></span>
+      <span class="meta">${runBadge(r.state, r.counts.skipped)}<span>${r.counts.done || 0}/${r.total} done</span><span>${money(r.cost)}</span></span>
     </button>`;
   }).join('') || '<p class="empty">No runs found.</p>';
   const focused = el.contains(document.activeElement) ? document.activeElement.dataset.key : null;
@@ -98,7 +104,8 @@ export function renderRunHeader(el, detail, selection) {
   let process = 'process check pending';
   if (r.known) process = r.alive ? `runner pid ${r.pid}${r.session ? ', session alive' : ', no session process'}` : 'no runner process';
   const missing = detail.tasks.filter(t => !t.hasBrief).map(t => t.id);
-  setHtml(el, `<h2 class="run-title">${esc(selection.project)} <span class="muted">${esc(selection.run)}</span> ${badge(detail.state)}</h2>
+  const skipped = detail.tasks.filter(t => t.state === 'skipped').length;
+  setHtml(el, `<h2 class="run-title">${esc(selection.project)} <span class="muted">${esc(selection.run)}</span> ${runBadge(detail.state, skipped)}</h2>
     <div class="run-facts">
       <span>model <b>${esc(s.model || 'default')}</b></span><span>effort <b>${esc(s.effort || 'default')}</b></span>
       <span>mode <b>${esc(s.permissionMode)}</b></span><span>workDir <b>${esc(s.workDir)}</b></span>
@@ -113,8 +120,21 @@ export function renderRunHeader(el, detail, selection) {
 // --- Queue controls: for an unfinished run whose runner supports admin actions, Pause (Cancel pause while
 // pausing) and Continue, each usable when the run answer allows it. ---
 
-export const ACTION_LABEL = { 'pause': 'Pause', 'cancel-pause': 'Cancel pause', 'continue': 'Continue' };
-const FINISHED = new Set(['done']);
+export const ACTION_LABEL = { 'pause': 'Pause', 'cancel-pause': 'Cancel pause', 'continue': 'Continue', 'skip': 'Skip', 'unskip': 'Un-skip' };
+const FINISHED = new Set(['done', 'finished-with-skips']);
+
+// Asks the user to confirm in the page's dialog: `title`, `text`, and `ok`, the confirming button's label.
+// Resolves to whether they confirmed. Cancel has the focus first; Esc cancels; the focus goes back to where
+// it was.
+export function confirmAction({ title, text, ok }) {
+  const dialog = document.getElementById('confirm');
+  dialog.querySelector('#confirm-title').textContent = title;
+  dialog.querySelector('#confirm-text').textContent = text;
+  dialog.querySelector('#confirm-ok').textContent = ok;
+  dialog.returnValue = '';
+  dialog.showModal();
+  return new Promise(resolve => dialog.addEventListener('close', () => resolve(dialog.returnValue === 'ok'), { once: true }));
+}
 
 // `busy` is the action whose request is on its way. A control that cannot be used now keeps its place and
 // its focus, greyed (aria-disabled), so polling never moves the keyboard focus.
@@ -164,12 +184,18 @@ export function renderProgress(el, note, progress) {
 
 // --- The task drawer: the task's number, title, state and facts, then three tabs. Activity follows the
 // session log as it grows, Report reloads when the report changes, Brief loads when its tab is shown.
-// A conflict session opens in it like a task, without the Brief tab: it has no brief.
+// A conflict session opens in it like a task, without the Brief tab: it has no brief. Under the facts, the
+// task's actions that the run answer allows now; `onAction(selection, task, action)` sends one and resolves
+// to `{ ok, error }`, or to null when the user did not confirm it.
 // `onClose(hadFocus)` is called when it closes. ---
 
-export function createDrawer(root, { onClose }) {
+export function createDrawer(root, { onClose, onAction }) {
   const title = root.querySelector('.drawer-title');
   const facts = root.querySelector('.drawer-facts');
+  const actionBox = root.querySelector('.task-actions');
+  const actionButtons = actionBox.querySelector('.control-buttons');
+  const actionMessage = actionBox.querySelector('.admin-msg');
+  let busy = null;                              // the task action whose request is on its way
   const tabs = [...root.querySelectorAll('[role="tab"]')];
   const panels = Object.fromEntries(tabs.map(t => [t.dataset.tab, document.getElementById(t.getAttribute('aria-controls'))]));
   const feed = panels.activity;
@@ -213,7 +239,33 @@ export function createDrawer(root, { onClose }) {
       : `<b>${esc(String(task.index).padStart(2, '0'))}</b> ${esc(task.title)}`;
     setHtml(title, `${head} ${badge(task.state)}`);
     setHtml(facts, taskFacts(task));
+    renderActions();
   }
+
+  // Skip and Un-skip share a slot, so the focus stays on the button as one turns into the other. A button
+  // whose request is on its way stays focusable, greyed.
+  function renderActions() {
+    const actions = task.actions || [];
+    actionBox.hidden = !actions.length && !actionMessage.textContent;
+    const html = actions.map(action => `<button type="button" class="btn" data-slot="${action === 'unskip' ? 'skip' : action}" data-action="${action}"` +
+      ` aria-disabled="${!!busy}">${ACTION_LABEL[action] || action}${busy === action ? '…' : ''}</button>`).join('');
+    const focused = actionButtons.contains(document.activeElement) ? document.activeElement.dataset.slot : null;
+    if (setHtml(actionButtons, html) && focused) (actionButtons.querySelector(`[data-slot="${focused}"]`) || root).focus();
+  }
+
+  actionButtons.addEventListener('click', async e => {
+    const button = e.target.closest('[data-action]');
+    if (!button || button.getAttribute('aria-disabled') === 'true' || busy) return;
+    const action = button.dataset.action, asked = generation;
+    busy = action;
+    actionMessage.textContent = '';
+    renderActions();
+    const result = await onAction(selection, task, action);
+    if (asked !== generation) return;
+    busy = null;
+    if (result && !result.ok) actionMessage.textContent = `${ACTION_LABEL[action] || action} refused: ${result.error}`;
+    renderActions();
+  });
 
   function onFeed({ items, reset, missing }) {
     if (reset) { feed.replaceChildren(); groups = new Map(); }
@@ -265,6 +317,8 @@ export function createDrawer(root, { onClose }) {
       stopFeed?.();
       generation++;
       selection = sel;
+      busy = null;
+      actionMessage.textContent = '';
       reportKey = null;
       groups = new Map();
       following = true;

@@ -41,6 +41,11 @@ const DONE = { x: 236, y: 118, step: 20, perRow: 4 };    // the "+N done" counte
 // The alert corner holds two workers a row; a corner of more rows pushes the done zone down by as many.
 const ALERT = { x: 292, y: 66, step: 20, perRow: 2 };
 const ALERT_ZONE = { x: 264, y: WALL_H, w: WORLD_W - 264, h: 46 };
+// Skipped tasks: a grey, empty desk each, in rows under the queue line, left of the workers' lane. `y` is
+// how far under the queue line's last row the first row of desks stands.
+const SKIPPED = { x: 8, y: 10, step: 54, perRow: 2 };
+const SKIPPED_DESK = { w: 44, h: 13 };                  // the desk sprite's size
+const SKIPPED_LOOK = { filter: 'grayscale(1)', alpha: 0.55 };
 // Group marks, one colour per group in the run's order: a band under the feet of a group's workers in the
 // queue line, a plaque on the desk of each of its workers, and their name tags' border.
 const GROUP_COLORS = 4;                                 // the --scene-group-N tokens of index.html, in both themes
@@ -84,17 +89,30 @@ const queueSlots = office => office.workers.filter(w => w.place === 'queue').len
 const doneWorkers = office => office.workers.filter(w => w.place === 'done').length;
 const doneSlots = office => doneWorkers(office) + (office.collapsed.length ? 1 : 0);
 const alertSlots = office => office.workers.filter(w => w.place === 'alert').length;
+const skippedSlots = office => office.workers.filter(w => w.place === 'skipped').length;
 
-// How the office is laid out for an office snapshot: its desks, its alert corner's rows, and where the
-// done zone starts under them.
+// How the office is laid out for an office snapshot: its desks, its alert corner's rows, where the done
+// zone starts under them, and where the skipped desks start under the queue line.
 function layoutOf(office) {
   const alertRows = Math.max(1, Math.ceil(alertSlots(office) / ALERT.perRow));
-  return { desks: office.desks || 1, alertRows, doneY: DONE.y + (alertRows - 1) * ROW };
+  return { desks: office.desks || 1, alertRows, doneY: DONE.y + (alertRows - 1) * ROW,
+    skippedY: zoneBottom(QUEUE, queueSlots(office)) + SKIPPED.y };
 }
 
-// Where a worker stands, and how wide its name tag may be.
+// The grey desk of skipped slot `slot`: its top left corner.
+function skippedDesk(slot, layout) {
+  const row = Math.floor(slot / SKIPPED.perRow), col = slot % SKIPPED.perRow;
+  return { x: SKIPPED.x + col * SKIPPED.step, y: layout.skippedY + row * ROW };
+}
+
+// Where a worker stands, and how wide its name tag may be. A skipped task has no figure: its spot is at
+// the middle of its grey desk's top, so its name tag sits above the desk and its button over it.
 function spotOf(worker, layout) {
   const { place, slot } = worker;
+  if (place === 'skipped') {
+    const desk = skippedDesk(slot, layout);
+    return { x: desk.x + (SKIPPED_DESK.w - SPRITE) / 2, y: desk.y - 2, tagWidth: SKIPPED.step - 6 };
+  }
   if (place === 'queue') {
     const row = Math.floor(slot / QUEUE.perRow), col = slot % QUEUE.perRow;
     const fromDesk = row % 2 ? QUEUE.perRow - 1 - col : col;
@@ -119,8 +137,10 @@ function zoneBottom(zone, slots, top = zone.y) {
 
 // The world grows taller for long queues and for more desks instead of shrinking the workers.
 function worldHeight(office, layout) {
+  const skipped = skippedSlots(office);
   return Math.max(MIN_WORLD_H, zoneBottom(QUEUE, queueSlots(office)), zoneBottom(DONE, doneSlots(office), layout.doneY),
-    DESK_FRONT + 28 + deskDown(layout.desks - 1));
+    DESK_FRONT + 28 + deskDown(layout.desks - 1),
+    skipped ? layout.skippedY + Math.ceil(skipped / SKIPPED.perRow) * ROW : 0);
 }
 
 // Device pixels per world pixel: the largest whole number that fits the width, so every world pixel is
@@ -304,9 +324,10 @@ function drawRoom(ctx, height, office, layout) {
   ctx.drawImage(sceneSprite('plant'), PLANT.x, PLANT.y);
 }
 
-// Corner brackets around the worker whose drawer is open. The top ones sit just under its name tag.
-function drawHighlight(ctx, x, y) {
-  const left = x - 2, right = x + SPRITE + 1, top = y, bottom = y + SPRITE + 1, arm = 4;
+// Corner brackets around the worker whose drawer is open, or around a skipped task's desk (`size`). The
+// top ones sit just under its name tag.
+function drawHighlight(ctx, x, y, size = { w: SPRITE, h: SPRITE }) {
+  const left = x - 2, right = x + size.w + 1, top = y, bottom = y + size.h + 1, arm = 4;
   ctx.fillStyle = color('--accent');
   for (const [cx, cy, dx, dy] of [[left, top, 1, 1], [right, top, -1, 1], [left, bottom, 1, -1], [right, bottom, -1, -1]]) {
     ctx.fillRect(dx > 0 ? cx : cx - arm + 1, cy, arm, 1);
@@ -655,11 +676,31 @@ export function createScene(host, { onOpen }) {
     return t % BOB_EVERY >= BOB_EVERY - BOB_FOR ? 'bob' : blinking(t) ? 'blink' : 'stand';
   }
 
+  // A worker marked to be skipped is drawn greyed, as a skipped task's desk is.
   function drawWorker(worker, figure, now) {
     const x = Math.round(figure.x), y = Math.round(figure.y);
+    if (worker.skipPending) greyed(true);
     if (walking(figure)) ctx.drawImage(workerSprite(worker.look, walkFrame(figure), figure.facing < 0), x, y);
     else if (figure.cheer) ctx.drawImage(workerSprite(worker.look, 'cheer'), x, y - hop(now - figure.cheer.at));
     else ctx.drawImage(workerSprite(worker.look, restFrame(worker, now)), x, y);
+    if (worker.skipPending) greyed(false);
+  }
+
+  // Draws what follows in grey and faded, until called with false.
+  function greyed(on) {
+    if (!on) return ctx.restore();
+    ctx.save();
+    ctx.filter = SKIPPED_LOOK.filter;
+    ctx.globalAlpha = SKIPPED_LOOK.alpha;
+  }
+
+  // A skipped task's desk: the desk and its dark screen, grey and empty, with no chair and no worker.
+  function drawSkippedDesk(worker) {
+    const { x, y } = skippedDesk(worker.slot, layout);
+    greyed(true);
+    ctx.drawImage(sceneSprite('desk'), x, y);
+    ctx.drawImage(sceneSprite('monitor'), x + MONITOR.x - DESK.x, y + MONITOR.y - DESK.y);
+    greyed(false);
   }
 
   function drawHelper(id, figure, now) {
@@ -733,6 +774,7 @@ export function createScene(host, { onOpen }) {
     drawQueueBands();
     for (let desk = 0; desk < layout.desks; desk++) ctx.drawImage(sceneSprite('chair'), CHAIR.x, CHAIR.y + deskDown(desk));
     const layers = office.workers.map(worker => {
+      if (worker.place === 'skipped') return { feet: skippedDesk(worker.slot, layout).y + SKIPPED_DESK.h, paint: () => drawSkippedDesk(worker) };
       const figure = walkers.get(worker.id);
       return { feet: figure.y + SPRITE, paint: () => drawWorker(worker, figure, now) };
     });
@@ -742,8 +784,11 @@ export function createScene(host, { onOpen }) {
     for (const layer of layers) layer.paint();
     for (const worker of office.workers) drawMarker(worker, walkers.get(worker.id), now);
     drawConfetti(now);
-    const open = walkers.get(openId);
-    if (open) drawHighlight(ctx, Math.round(open.x), Math.round(open.y));
+    const open = walkers.get(openId), openWorker = workerOf(openId);
+    if (openWorker?.place === 'skipped') {
+      const desk = skippedDesk(openWorker.slot, layout);
+      drawHighlight(ctx, desk.x, desk.y, SKIPPED_DESK);
+    } else if (open) drawHighlight(ctx, Math.round(open.x), Math.round(open.y));
   }
 
   function resize() {
@@ -768,7 +813,9 @@ export function createScene(host, { onOpen }) {
       const figure = walkers.get(worker.id), { button, tag } = elements.get(worker.id);
       const x = Math.round(figure.x), y = Math.round(figure.y);
       const tagWidth = walking(figure) ? Math.min(NARROW_TAG, figure.spot.tagWidth) : figure.spot.tagWidth;
-      Object.assign(button.style, { left: px(x), top: px(y), width: px(SPRITE), height: px(SPRITE) });
+      // A skipped task's button covers its desk.
+      const box = worker.place === 'skipped' ? { ...skippedDesk(worker.slot, layout), ...SKIPPED_DESK } : { x, y, w: SPRITE, h: SPRITE };
+      Object.assign(button.style, { left: px(box.x), top: px(box.y), width: px(box.w), height: px(box.h) });
       Object.assign(tag.style, { left: px(x + SPRITE / 2), top: px(y - 1), maxWidth: px(tagWidth) });
     }
     for (const [id, target] of targets) {
@@ -810,6 +857,7 @@ export function createScene(host, { onOpen }) {
       const marked = !!worker.group && (worker.place === 'queue' || worker.place === 'desk');
       el.tag.classList.toggle('grouped', marked);
       if (marked) el.tag.style.setProperty('--group', `var(${groupToken(worker)})`);
+      el.tag.classList.toggle('skipped', worker.place === 'skipped' || worker.skipPending);
     }
     keepOrder(crew, [...office.workers.map(w => elements.get(w.id).button), counter, list]);
     keepOrder(tags, office.workers.map(w => elements.get(w.id).tag));
@@ -884,8 +932,9 @@ export function createScene(host, { onOpen }) {
       let figure = walkers.get(worker.id);
       // A worker whose spot moved with the layout (the done zone under a deeper alert corner) walks there too.
       const shifted = figure && (figure.spot.x !== spot.x || figure.spot.y !== spot.y);
+      // A skipped task's worker never walks to its desk: the desk only shows there, empty.
       if (!figure) walkers.set(worker.id, figure = figureOn([spot]));
-      else if (!live) setRoute(figure, [spot]);
+      else if (!live || worker.place === 'skipped') setRoute(figure, [spot]);
       else if (worker.moved || shifted) {
         setRoute(figure, workerRoute(figure, spot, worker.place === 'desk' ? worker.slot : 0));
         figure.cheer = null;
@@ -990,7 +1039,8 @@ export function createScene(host, { onOpen }) {
       const preflight = office.preflightError ? `<span class="sr-only">. ${esc(office.preflightError)}</span>` : '';
       sign.className = `sign s-${office.state}`;
       sign.hidden = false;
-      setHtml(sign, `<span class="sr-only">Run state: </span>${esc(STATE_LABEL[office.state] || office.state)}${preflight}`);
+      const state = office.state === 'finished-with-skips' ? `finished, ${skippedSlots(office)} skipped` : STATE_LABEL[office.state] || office.state;
+      setHtml(sign, `<span class="sr-only">Run state: </span>${esc(state)}${preflight}`);
       syncElements();
       resize();
       positionOverlay();
