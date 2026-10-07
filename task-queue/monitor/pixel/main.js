@@ -22,6 +22,7 @@ const controls = document.getElementById('run-controls');
 const controlButtons = document.getElementById('control-buttons');
 const adminMessage = document.getElementById('admin-msg');
 let busyAction = null;        // the queue control whose request is on its way
+let sceneBusy = false;        // whether a Skip or Un-skip of the scene's menu is on its way
 let runs = [];
 let selected = null;
 let detail = null;            // the selected run's last snapshot
@@ -35,6 +36,21 @@ function hashKey() {
   try { return decodeURIComponent(location.hash.slice(1)); } catch { return ''; }
 }
 
+// Sends a task action, from the drawer or the scene's menu, and resolves to `{ ok, error }`, or to null when
+// the user did not confirm it. Skip asks for confirmation first; Un-skip, Retry and Edit brief do not. The page
+// then shows what happened from its next poll.
+async function sendTaskAction(selection, task, action, extra = {}) {
+  if (action === 'skip' && !await confirmAction({
+    title: `Skip task ${String(task.index).padStart(2, '0')}?`,
+    text: `"${task.title}" will not run: when the queue reaches it, it passes over it and writes a SKIPPED report. You can un-skip it until then.`,
+    ok: 'Skip task',
+  })) return null;
+  const result = await postAdmin(selection, action, { ...extra, task: task.id });
+  runPoll.refresh();
+  runsPoll.refresh();
+  return result;
+}
+
 const drawer = createDrawer(document.getElementById('drawer'), {
   onClose(hadFocus) {
     layout.classList.remove('drawer-open');
@@ -42,20 +58,27 @@ const drawer = createDrawer(document.getElementById('drawer'), {
     if (hadFocus && opener?.isConnected) opener.focus();
     opener = null;
   },
-  // Skip asks for confirmation first; Un-skip, Retry and Edit brief do not. The page then shows what happened from its
-  // next poll.
-  async onAction(selection, task, action, extra = {}) {
-    if (action === 'skip' && !await confirmAction({
-      title: `Skip task ${String(task.index).padStart(2, '0')}?`,
-      text: `"${task.title}" will not run: when the queue reaches it, it passes over it and writes a SKIPPED report. You can un-skip it until then.`,
-      ok: 'Skip task',
-    })) return null;
-    const result = await postAdmin(selection, action, { ...extra, task: task.id });
-    runPoll.refresh();
-    runsPoll.refresh();
-    return result;
-  },
+  onAction: sendTaskAction,
 });
+
+// An item of a worker's menu in the scene. Retry and Edit brief open the task's drawer on the retry form and
+// on the open editor. Skip and Un-skip are sent from here, one at a time; a refusal opens the drawer, which shows
+// the reason under the task's actions.
+async function onSceneAction(id, action) {
+  const task = detail && entryOf(detail, id);
+  if (!task) return;
+  if (action === 'retry' || action === 'edit-brief') {
+    openTask(id, action === 'edit-brief' ? 'brief' : undefined);
+    return action === 'retry' ? drawer.retry() : drawer.editBrief();
+  }
+  if (sceneBusy) return;
+  const asked = selected;
+  sceneBusy = true;
+  const result = await sendTaskAction(asked, task, action).finally(() => { sceneBusy = false; });
+  if (!result || result.ok || selected !== asked) return;
+  openTask(id);
+  drawer.report(`${ACTION_LABEL[action]} refused: ${result.error}`);
+}
 
 // `tab` picks the drawer's tab; without it, an open drawer keeps its own. `id` names a task or a conflict
 // session.
@@ -83,7 +106,7 @@ function select(run) {
   sceneTitle.innerHTML = `Office <span class="muted">${esc(run.project)} ${esc(run.run)}</span>`;
   scene?.destroy();
   office = createOffice();
-  scene = createScene(sceneHost, { onOpen: openTask });
+  scene = createScene(sceneHost, { onOpen: openTask, onAction: onSceneAction });
   renderRunList(runList, runs, runKey(selected));
   runPoll.refresh();
 }
@@ -220,7 +243,8 @@ matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
   scene?.redraw();
 });
 
-// Esc closes the tooltip first, then the drawer; while the confirmation dialog is open, only the dialog.
+// Esc closes a worker's menu or the tooltip first, then the drawer; while the confirmation dialog is open,
+// only the dialog.
 addEventListener('keydown', e => {
   if (e.key !== 'Escape' || document.getElementById('confirm').open || scene?.dismiss()) return;
   drawer.close();

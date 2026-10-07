@@ -188,7 +188,8 @@ export function renderProgress(el, note, progress) {
 // task's actions that the run answer allows now; `onAction(selection, task, action, extra)` sends one and
 // resolves to `{ ok, error }`, or to null when the user did not confirm it. Retry opens a form first, for
 // the mode and a note; its request carries them in `extra`. Edit brief turns the Brief tab into a text box,
-// whose Save sends the text as `extra.brief`.
+// whose Save sends the text as `extra.brief`. `retry()`, `editBrief()` and `report(message)` serve the scene's
+// menu: they open the retry form, open the brief editor, and show a refusal under the actions.
 // `onClose(hadFocus)` is called when it closes. ---
 
 export function createDrawer(root, { onClose, onAction }) {
@@ -525,7 +526,24 @@ export function createDrawer(root, { onClose, onAction }) {
     onClose(hadFocus);
   }
 
-  return { open, update, close, get taskId() { return task ? task.id : null; } };
+  // The retry form of the task shown, opened as its Retry button opens it; one already open gets the focus.
+  function retry() {
+    if (!task || !(task.actions || []).includes('retry')) return;
+    if (retryForm.hidden) openRetryForm();
+    else retryForm.querySelector('input[name="retry-mode"]:checked')?.focus();
+  }
+
+  function editBrief() {
+    if (task && (task.actions || []).includes('edit-brief')) openBriefEditor();
+  }
+
+  function report(message) {
+    if (!task) return;
+    actionMessage.textContent = message;
+    renderActions();
+  }
+
+  return { open, update, close, retry, editBrief, report, get taskId() { return task ? task.id : null; } };
 }
 
 // A task of the run snapshot, or one of its conflict sessions, by id.

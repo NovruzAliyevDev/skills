@@ -4,7 +4,7 @@
 // per desk, the run-state sign with a merge sign per parallel group under it, the "+N done" counter with
 // its list, and the tooltip. The overlay is the only way in; the canvas is hidden from assistive technology.
 import { color, confettiSprite, handsSprite, helperSprite, sceneSprite, workerSprite } from './sprites.js';
-import { STATE_LABEL, badge, esc, money, setHtml, taskDuration, taskFacts } from './panel.js';
+import { ACTION_LABEL, STATE_LABEL, badge, esc, money, setHtml, taskDuration, taskFacts } from './panel.js';
 
 // World geometry, in world pixels. Worker rows are 30 apart: a 16 px sprite and room for its name tag.
 const WORLD_W = 320;
@@ -64,6 +64,7 @@ const SIGNS_WIDTH = 180;
 const MERGE_LABEL = { waiting: 'waiting', merging: 'merging', resolving: 'resolving a conflict', merged: 'merged', failed: 'failed' };
 const GAP = 6;                                          // CSS pixels between a tooltip or list and what it belongs to
 const HIDE_DELAY_MS = 150;                              // time to move the pointer from a worker onto its tooltip
+const KEY_MENU_MS = 500;                                // a key's own contextmenu event comes within this of its keydown
 
 // Motion. Speeds are world pixels per millisecond; a walk frame lasts STRIDE_PX world pixels.
 const WORKER_SPEED = 48 / 1000;
@@ -354,9 +355,14 @@ function placeBeside(box, anchor, preferAbove) {
   box.style.top = `${clamp(top, GAP, viewH - height - GAP)}px`;
 }
 
+// The task actions a worker's menu offers, in this order, when the run answer allows them for its task.
+const MENU_ACTIONS = ['skip', 'unskip', 'retry', 'edit-brief'];
+const menuActionsOf = worker => MENU_ACTIONS.filter(a => (worker?.task.actions || []).includes(a));
+
 // `onOpen(taskId, tab)` is called when a worker, an entry of the "+N done" list, a helper (with tab
 // 'activity'), or a merge sign whose group has a conflict session (with its id) is activated.
-export function createScene(host, { onOpen }) {
+// `onAction(taskId, action)` is called when an item of a worker's menu is picked.
+export function createScene(host, { onOpen, onAction }) {
   const stage = document.createElement('div');
   const canvas = document.createElement('canvas');
   const board = document.createElement('div');
@@ -392,7 +398,11 @@ export function createScene(host, { onOpen }) {
   tip.id = 'scene-tip';
   tip.setAttribute('role', 'tooltip');
   tip.hidden = true;
-  stage.append(canvas, board, tags, helperLayer, crew, tip);
+  const menu = document.createElement('div');
+  menu.className = 'scene-menu';
+  menu.setAttribute('role', 'menu');
+  menu.hidden = true;
+  stage.append(canvas, board, tags, helperLayer, crew, tip, menu);
   host.replaceChildren(stage);
 
   const ctx = canvas.getContext('2d');
@@ -467,7 +477,8 @@ export function createScene(host, { onOpen }) {
   function showTip() {
     if (hovered && !hovered.isConnected) hovered = null;
     if (focused && !focused.isConnected) focused = null;
-    const target = dismissed ? null : byFocus ? focused || hovered : hovered || focused;
+    // No tooltip while a worker's menu is open.
+    const target = dismissed || !menu.hidden ? null : byFocus ? focused || hovered : hovered || focused;
     const html = target && tipHtml(target);
     if (!html) return hideTip();
     if (shownFor !== target) shownFor?.removeAttribute('aria-describedby');
@@ -608,9 +619,121 @@ export function createScene(host, { onOpen }) {
     if (e.relatedTarget && !list.contains(e.relatedTarget) && e.relatedTarget !== counter) closeList(false);
   });
 
-  const onViewport = () => { placeTip(); placeList(); };
-  addEventListener('scroll', onViewport, true);
-  addEventListener('resize', onViewport);
+  // --- A worker's menu: the task actions the run answer allows for its task now, opened by a right-click on
+  // the worker, or by Shift+F10 or the context-menu key on a focused one. A task with none gets no menu, and
+  // never the browser's own either. Picking an item, or Esc, closes it and gives the focus back to the
+  // worker; a pointer outside it, Tab, scrolling or resizing close it too. ---
+
+  let menuFor = null;                            // the task whose menu is open
+  let menuAt = null;                             // where the pointer opened it; null when a key did, beside its worker
+  let keyOpenedAt = -Infinity;                   // a key's own contextmenu event, after its keydown, is not a second opening
+
+  function openMenu(id, at) {
+    closeMenu(false);
+    const actions = menuActionsOf(workerOf(id));
+    if (!actions.length) return;
+    menuFor = id;
+    menuAt = at;
+    renderMenu(actions);
+    menu.hidden = false;
+    showTip();                                   // hides it while the menu is open
+    placeMenu();
+    menu.querySelector('[role="menuitem"]').focus();
+    document.addEventListener('pointerdown', onPointerOutsideMenu, true);
+  }
+
+  // A focused item gets its focus back after a rewrite, or the first item when its action is gone.
+  function renderMenu(actions) {
+    const worker = workerOf(menuFor);
+    const label = `Actions of task ${worker.number} ${worker.title}`;
+    if (menu.getAttribute('aria-label') !== label) menu.setAttribute('aria-label', label);
+    const html = actions.map(a => `<button type="button" role="menuitem" tabindex="-1" data-action="${a}">${ACTION_LABEL[a]}</button>`).join('');
+    const focusedItem = menu.contains(document.activeElement) ? document.activeElement.dataset.action : null;
+    if (setHtml(menu, html) && focusedItem) (menu.querySelector(`[data-action="${focusedItem}"]`) || menu.querySelector('button')).focus();
+  }
+
+  // Returns whether the menu was open. `refocus` gives the focus back to its worker.
+  function closeMenu(refocus) {
+    if (menu.hidden) return false;
+    const id = menuFor;
+    menu.hidden = true;
+    menuFor = null;
+    document.removeEventListener('pointerdown', onPointerOutsideMenu, true);
+    if (refocus) elements.get(id)?.button.focus();
+    return true;
+  }
+
+  function onPointerOutsideMenu(e) {
+    if (!menu.contains(e.target)) closeMenu(false);
+  }
+
+  // At the pointer, inside the window; opened by a key, below its worker when there is room, else above.
+  function placeMenu() {
+    if (menu.hidden) return;
+    if (!menuAt) return placeBeside(menu, elements.get(menuFor).button.getBoundingClientRect(), false);
+    const width = menu.offsetWidth, height = menu.offsetHeight;
+    const viewW = document.documentElement.clientWidth, viewH = document.documentElement.clientHeight;
+    const top = menuAt.y + height + GAP <= viewH ? menuAt.y : menuAt.y - height;
+    menu.style.left = `${clamp(menuAt.x, GAP, viewW - width - GAP)}px`;
+    menu.style.top = `${clamp(top, GAP, viewH - height - GAP)}px`;
+  }
+
+  crew.addEventListener('contextmenu', e => {
+    const worker = e.target.closest('.worker');
+    if (!worker) return;
+    e.preventDefault();
+    if (performance.now() - keyOpenedAt < KEY_MENU_MS) return;
+    // A contextmenu event from the keyboard has no pointer position: the menu goes beside the worker.
+    openMenu(worker.dataset.id, e.clientX || e.clientY ? { x: e.clientX, y: e.clientY } : null);
+  });
+  crew.addEventListener('keydown', e => {
+    const worker = e.target.closest('.worker');
+    if (!worker || !(e.key === 'ContextMenu' || (e.key === 'F10' && e.shiftKey))) return;
+    e.preventDefault();
+    keyOpenedAt = performance.now();
+    openMenu(worker.dataset.id, null);
+  });
+  // Up and down arrows move through the items, round, and Home and End go to the first and last. Esc closes
+  // only the menu, not the drawer. Tab leaves it from its worker.
+  menu.addEventListener('keydown', e => {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
+      return closeMenu(true);
+    }
+    if (e.key === 'Tab') return closeMenu(true);
+    const items = [...menu.querySelectorAll('[role="menuitem"]')];
+    const i = items.indexOf(document.activeElement);
+    const next = { ArrowDown: i + 1, ArrowUp: i - 1, Home: 0, End: items.length - 1 }[e.key];
+    if (next === undefined) return;
+    e.preventDefault();
+    items[(next + items.length) % items.length].focus();
+  });
+  menu.addEventListener('click', e => {
+    const item = e.target.closest('[data-action]');
+    if (!item) return;
+    const id = menuFor;
+    closeMenu(true);
+    onAction(id, item.dataset.action);
+  });
+  menu.addEventListener('focusout', e => {
+    if (e.relatedTarget && !menu.contains(e.relatedTarget)) closeMenu(false);
+  });
+
+  // Scrolling the page or the scene closes the menu; a box scrolling elsewhere, such as the drawer's
+  // Activity following its feed, does not.
+  function onScroll(e) {
+    if (e.target === document || e.target.contains?.(stage)) closeMenu(false);
+    placeTip();
+    placeList();
+  }
+  function onResize() {
+    closeMenu(false);
+    placeTip();
+    placeList();
+  }
+  addEventListener('scroll', onScroll, true);
+  addEventListener('resize', onResize);
 
   // --- Drawing: on the next animation frame, once for however many changes come before it. While
   // something walks or celebrates, every frame is drawn; while figures only loop in place, a frame
@@ -829,6 +952,7 @@ export function createScene(host, { onOpen }) {
     Object.assign(counter.style, { left: px(slot.x), top: px(slot.y + 3) });
     placeTip();
     placeList();
+    placeMenu();
   }
 
   // One button and one tag per task, kept across updates so focus survives a move; buttons stay in task
@@ -850,6 +974,11 @@ export function createScene(host, { onOpen }) {
         elements.set(worker.id, el);
       }
       if (el.button.getAttribute('aria-label') !== worker.label) el.button.setAttribute('aria-label', worker.label);
+      // A worker whose task has actions says how to open its menu.
+      const keys = menuActionsOf(worker).length ? 'Shift+F10 ContextMenu' : null;
+      if (el.button.getAttribute('aria-keyshortcuts') !== keys) {
+        if (keys) el.button.setAttribute('aria-keyshortcuts', keys); else el.button.removeAttribute('aria-keyshortcuts');
+      }
       const [number, title] = el.tag.children;
       if (number.textContent !== worker.number) number.textContent = worker.number;
       if (title.textContent !== worker.title) title.textContent = worker.title;
@@ -1042,6 +1171,12 @@ export function createScene(host, { onOpen }) {
       const state = office.state === 'finished-with-skips' ? `finished, ${skippedSlots(office)} skipped` : STATE_LABEL[office.state] || office.state;
       setHtml(sign, `<span class="sr-only">Run state: </span>${esc(state)}${preflight}`);
       syncElements();
+      // An open menu follows its task's actions: it closes when none is left, or when its worker left.
+      if (menuFor) {
+        const actions = menuActionsOf(workerOf(menuFor));
+        if (actions.length) renderMenu(actions);
+        else closeMenu(menu.contains(document.activeElement));
+      }
       resize();
       positionOverlay();
       showTip();                                 // new facts for the tooltip shown, or none if its target left
@@ -1058,9 +1193,10 @@ export function createScene(host, { onOpen }) {
       markOpen();
       requestDraw();
     },
-    // Esc: hides the tooltip if one shows, else closes the "+N done" list if it is open. Returns whether
-    // it did either.
+    // Esc: closes a worker's menu if one is open, else hides the tooltip if one shows, else closes the
+    // "+N done" list if it is open. Returns whether it did any.
     dismiss() {
+      if (closeMenu(true)) return true;
       if (tip.hidden) return closeList(true);
       dismissed = true;
       hideTip();
@@ -1075,8 +1211,9 @@ export function createScene(host, { onOpen }) {
       motion.removeEventListener('change', onMotion);
       document.removeEventListener('visibilitychange', onVisibility);
       closeList(false);
-      removeEventListener('scroll', onViewport, true);
-      removeEventListener('resize', onViewport);
+      closeMenu(false);
+      removeEventListener('scroll', onScroll, true);
+      removeEventListener('resize', onResize);
       stage.remove();
     },
   };
