@@ -1,6 +1,6 @@
 ---
 name: delegate
-description: Break a big task into independent pieces and run each in its own subagent, keeping the main agent's context light. Use when: delegate, split this up, use subagents, fan out, parallelize, orchestrate.
+description: "Break a big task into independent pieces and run each in its own subagent, keeping the main agent's context light. Use when: delegate, split this up, use subagents, fan out, parallelize, orchestrate."
 ---
 
 # Delegate

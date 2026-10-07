@@ -1,0 +1,7 @@
+{
+  "name": "novruzaliyev-skills",
+  "version": "1.0.0",
+  "description": "task-queue (run a list of tasks in fresh unattended sessions, with a local monitor), queue-monitor (start that monitor again) and delegate (split big work across subagents).",
+  "author": { "name": "Novruz Aliyev" },
+  "repository": "https://github.com/NovruzAliyevDev/skills"
+}

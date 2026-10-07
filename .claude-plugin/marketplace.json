@@ -1,0 +1,14 @@
+{
+  "name": "novruzaliyev",
+  "owner": {
+    "name": "Novruz Aliyev"
+  },
+  "description": "Novruz Aliyev's Claude Code skills.",
+  "plugins": [
+    {
+      "name": "novruzaliyev-skills",
+      "source": "./",
+      "description": "task-queue, queue-monitor and delegate."
+    }
+  ]
+}

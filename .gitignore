@@ -1,9 +1,0 @@
-# This repository holds only the skills listed below. The other folders here are skills installed
-# from elsewhere (most are junctions into ~/.agents/skills) and stay out. To add a skill, add a
-# "!/<name>/" line.
-/*
-!/.gitignore
-!/README.md
-!/delegate/
-!/queue-monitor/
-!/task-queue/

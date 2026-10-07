@@ -1,35 +1,31 @@
 # Skills
 
-Claude Code skills, kept in `~/.claude/skills`. Each folder is one skill: a `SKILL.md` with its
-instructions, plus any files it needs.
+Claude Code skills, packaged as one plugin, `novruzaliyev-skills`, in the marketplace `novruzaliyev`.
+Each folder under `skills/` is one skill: a `SKILL.md` with its instructions, plus any files it needs.
 
 | Skill | What it does | How it starts |
 |---|---|---|
-| [task-queue](task-queue/) | Runs a list of tasks in order, each in its own fresh, unattended Claude Code session, with tasks you mark as a group running in parallel, and shows the queue on a local web page. | You type `/task-queue`. |
-| [delegate](delegate/) | Splits a big task into independent pieces, runs each in its own subagent, and keeps the main session's context light. | Claude uses it when you ask to delegate, split up, fan out or parallelize work; you can also type `/delegate`. |
-| [queue-monitor](queue-monitor/) | Starts the task-queue monitor again (it exits after two idle hours) and opens it in the browser. | You type `/queue-monitor`. |
+| [task-queue](skills/task-queue/) | Runs a list of tasks in order, each in its own fresh, unattended Claude Code session, with tasks you mark as a group running in parallel, and shows the queue on a local web page. | You type `/novruzaliyev-skills:task-queue`. |
+| [delegate](skills/delegate/) | Splits a big task into independent pieces, runs each in its own subagent, and keeps the main session's context light. | Claude uses it when you ask to delegate, split up, fan out or parallelize work; you can also type `/novruzaliyev-skills:delegate`. |
+| [queue-monitor](skills/queue-monitor/) | Starts the task-queue monitor again (it exits after two idle hours) and opens it in the browser. | You type `/novruzaliyev-skills:queue-monitor`. |
 
 ## Install
 
-The repository is meant to be the `~/.claude/skills` folder itself. It is private, so clone it with
-an account that has access.
-
-If there is no `~/.claude/skills` yet:
+The repository is private: install with a GitHub account that has access to it. Claude Code uses your
+git credentials (for example `gh auth login`).
 
 ```powershell
-git clone https://github.com/NovruzAliyevDev/skills "$env:USERPROFILE\.claude\skills"
+claude plugin marketplace add NovruzAliyevDev/skills
+claude plugin install novruzaliyev-skills@novruzaliyev
 ```
 
-If `~/.claude/skills` already exists, clone the repository elsewhere and link each skill folder into it:
+Or, inside a session: `/plugin marketplace add NovruzAliyevDev/skills`, then
+`/plugin install novruzaliyev-skills@novruzaliyev`. New sessions pick the skills up.
 
-```powershell
-git clone https://github.com/NovruzAliyevDev/skills C:\src\skills
-New-Item -ItemType Junction -Path "$env:USERPROFILE\.claude\skills\task-queue" -Target C:\src\skills\task-queue
-New-Item -ItemType Junction -Path "$env:USERPROFILE\.claude\skills\delegate" -Target C:\src\skills\delegate
-New-Item -ItemType Junction -Path "$env:USERPROFILE\.claude\skills\queue-monitor" -Target C:\src\skills\queue-monitor
-```
-
-New Claude Code sessions pick the skills up.
+To update: `claude plugin marketplace update novruzaliyev`, then
+`claude plugin update novruzaliyev-skills@novruzaliyev`. Queues already written keep their own copy of
+the runner, so an update does not touch them; a monitor already running keeps its old code until it
+is started again with `/novruzaliyev-skills:queue-monitor`.
 
 ## task-queue
 
@@ -49,7 +45,7 @@ page shows how far the queue has got.
 
 1. Open Claude Code in the repository the tasks are about. That session's working directory becomes
    the queue's working directory.
-2. Type `/task-queue` and send the list: one task per item, in the order they must run, with as much
+2. Type `/novruzaliyev-skills:task-queue` and send the list: one task per item, in the order they must run, with as much
    detail per item as you like. You can also set:
    - **permission mode**: `auto` (the default), `acceptEdits` or `bypassPermissions`. `default` and
      `manual` cannot run unattended, since nothing would approve a prompt.
@@ -109,7 +105,7 @@ the merge of a parallel group lands there too.
   the queue continues the failed task in its own worktree.
 - While a group runs, the window shows only start and finish lines for its tasks; the monitor and
   `logs\NN.jsonl` show the rest. The design record is in
-  [task-queue/docs/parallel-tasks](task-queue/docs/parallel-tasks/).
+  [skills/task-queue/docs/parallel-tasks](skills/task-queue/docs/parallel-tasks/).
 
 ### The monitor
 
@@ -123,16 +119,19 @@ For an unfinished queue the monitor can stop it, pause it after the current task
 task not yet started, retry a failed or stopped task (resuming its session or starting over, with a
 note), and edit the brief of a task not yet started. A queue is better continued from the monitor than
 by hand: a run lock makes a second runner of the same run folder exit at once. The design record is in
-[task-queue/docs/monitor-admin](task-queue/docs/monitor-admin/).
+[skills/task-queue/docs/monitor-admin](skills/task-queue/docs/monitor-admin/).
 
-The queue starts the monitor by itself. To start it again, type `/queue-monitor`, or by hand:
+The queue starts the monitor by itself. To start it again, type `/novruzaliyev-skills:queue-monitor`, or by hand:
 
 ```powershell
-node "$env:USERPROFILE\.claude\skills\task-queue\monitor\server.mjs" --open
+node "<plugin folder>\skills\task-queue\monitor\server.mjs" --open
 ```
 
+The plugin folder is under `%USERPROFILE%\.claude\plugins\cache\novruzaliyev\novruzaliyev-skills\`, one
+subfolder per installed version.
+
 `TASK_QUEUE_MONITOR_PORT` and `TASK_QUEUE_ROOT` change the port and the queue folder. The monitor's
-design record, a spec and three tickets, is in [task-queue/docs/pixel-monitor](task-queue/docs/pixel-monitor/).
+design record, a spec and three tickets, is in [skills/task-queue/docs/pixel-monitor](skills/task-queue/docs/pixel-monitor/).
 
 ## delegate
 
@@ -147,10 +146,9 @@ different files or sources, or one agent would run out of room. Otherwise it doe
 says so. Subagents never spawn their own, agents that write get files of their own (or all stay
 read-only), and a round has about 6 agents, at most 2 rounds.
 
-Ask Claude to delegate, split up, fan out or parallelize a task, or type `/delegate`.
+Ask Claude to delegate, split up, fan out or parallelize a task, or type `/novruzaliyev-skills:delegate`.
 
 ## Adding a skill
 
-`.gitignore` tracks only the folders it lists, because the other folders in `~/.claude/skills` are
-skills installed from elsewhere, most of them junctions into `~/.agents/skills`. To add a skill of your
-own, put it in its own folder with a `SKILL.md`, add a `!/<folder>/` line to `.gitignore`, and commit.
+Put it in its own folder under `skills/` with a `SKILL.md`, check the plugin with
+`claude plugin validate .`, raise `version` in `.claude-plugin/plugin.json`, and commit.
