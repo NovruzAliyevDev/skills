@@ -5,7 +5,7 @@ import { getFile, readFeed } from './api.js';
 export const STATE_LABEL = {
   'pending': 'pending', 'running': 'running', 'done': 'DONE', 'failed': 'FAILED', 'stopped': 'STOPPED',
   'interrupted': 'interrupted', 'no-session': 'runner has no session', 'not-started': 'not started',
-  'preflight-failed': 'preflight failed',
+  'preflight-failed': 'preflight failed', 'pausing': 'pausing', 'paused': 'PAUSED',
 };
 export const BAD = new Set(['failed', 'stopped', 'interrupted', 'no-session', 'preflight-failed']);
 
@@ -108,6 +108,36 @@ export function renderRunHeader(el, detail, selection) {
     </div>
     ${detail.preflight ? `<div class="run-facts"><span>preflight: <b>${esc(detail.preflight)}</b></span></div>` : ''}
     ${missing.length ? `<div class="warning">⚠ Missing briefs: ${esc(missing.join(', '))}</div>` : ''}`);
+}
+
+// --- Queue controls: for an unfinished run whose runner supports admin actions, Pause (Cancel pause while
+// pausing) and Continue, each usable when the run answer allows it. ---
+
+export const ACTION_LABEL = { 'pause': 'Pause', 'cancel-pause': 'Cancel pause', 'continue': 'Continue' };
+const FINISHED = new Set(['done']);
+
+// `busy` is the action whose request is on its way. A control that cannot be used now keeps its place and
+// its focus, greyed (aria-disabled), so polling never moves the keyboard focus.
+export function renderRunControls(box, buttons, detail, busy) {
+  const admin = detail?.admin;
+  box.hidden = !admin?.supported || FINISHED.has(detail.state);
+  if (box.hidden) return setHtml(buttons, '');
+  const pausing = admin.actions.includes('cancel-pause') || detail.state === 'pausing';
+  const slots = [['pause', pausing ? 'cancel-pause' : 'pause'], ['continue', 'continue']];
+  const html = slots.map(([slot, action]) => {
+    const usable = admin.actions.includes(action) && !busy;
+    return `<button type="button" class="btn" data-slot="${slot}" data-action="${action}" aria-disabled="${!usable}">${ACTION_LABEL[action]}${busy === action ? '…' : ''}</button>`;
+  }).join('');
+  const focused = buttons.contains(document.activeElement) ? document.activeElement.dataset.slot : null;
+  if (setHtml(buttons, html) && focused) buttons.querySelector(`[data-slot="${focused}"]`)?.focus();
+}
+
+// `act(action)` is called for a usable control.
+export function onRunControl(buttons, act) {
+  buttons.addEventListener('click', e => {
+    const button = e.target.closest('[data-action]');
+    if (button && button.getAttribute('aria-disabled') !== 'true') act(button.dataset.action);
+  });
 }
 
 // `note` is the section summary's short status.

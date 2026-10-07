@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Task Queue Monitor</title>
+<meta name="admin-token" content="">
 <script src="/marked.min.js"></script>
 <style>
 :root {
@@ -54,7 +55,8 @@ button { font: inherit; color: inherit; }
 .s-running { background: var(--accent); }
 .s-done { background: var(--ok); }
 .s-failed, .s-stopped, .s-preflight-failed { background: var(--bad); }
-.s-interrupted, .s-no-session { background: var(--warn); }
+.s-interrupted, .s-no-session, .s-paused { background: var(--warn); }
+.s-pausing { background: var(--accent); }
 .muted { color: var(--muted); }
 .empty { color: var(--muted); font-style: italic; }
 .btn { padding: 3px 10px; font-size: 11px; font-weight: 700; cursor: pointer; background: var(--panel); border: 2px solid var(--frame); box-shadow: 2px 2px 0 var(--shadow); }
@@ -88,6 +90,14 @@ main { padding: 16px 20px 40px; min-width: 0; }
 .run-facts + .run-facts { margin-top: 4px; }
 .run-facts b { color: var(--text); font-weight: 600; overflow-wrap: anywhere; }
 .warning { color: var(--warn); font-size: 13px; font-weight: 600; margin-top: 6px; }
+/* Queue controls under the run header. An action not allowed now stays in the Tab order, greyed. */
+.run-controls { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; margin-top: 10px; padding-top: 10px; border-top: 2px solid var(--line); }
+.control-buttons { display: flex; flex-wrap: wrap; gap: 8px; }
+.btn[aria-disabled="true"] { opacity: .45; cursor: not-allowed; box-shadow: none; }
+.btn[aria-disabled="true"]:hover { background: var(--panel); }
+.btn[aria-disabled="true"]:active { transform: none; }
+.admin-msg { margin: 0; color: var(--bad); font-size: 13px; font-weight: 600; overflow-wrap: anywhere; }
+.admin-msg:empty { display: none; }
 
 /* Collapsible run sections. */
 .section { padding: 0; }
@@ -235,7 +245,13 @@ details.agent > summary { cursor: pointer; font-size: 12px; color: var(--muted);
   </aside>
   <main>
     <div class="offline" id="offline" role="status"></div>
-    <section class="panel" id="head" aria-label="Run"><p class="empty">Select a run.</p></section>
+    <section class="panel" aria-label="Run">
+      <div id="head"><p class="empty">Select a run.</p></div>
+      <div class="run-controls" id="run-controls" hidden>
+        <div class="control-buttons" id="control-buttons" role="group" aria-label="Queue controls"></div>
+        <p class="admin-msg" id="admin-msg" role="status"></p>
+      </div>
+    </section>
     <section class="panel scene-panel" aria-labelledby="scene-title">
       <h2 id="scene-title">Office</h2>
       <div class="scene" id="scene"></div>

@@ -5,7 +5,12 @@
 # Tasks that queue.json puts in a parallel group run at the same time, each in its own git worktree
 # and branch; when all of them are DONE, their branches are merged into the queue's branch in task order.
 # A merge that conflicts is resolved by a session of its own, the conflict session.
+# The monitor administers the queue through control.json beside this file (see Read-Control), and
+# runner.lock keeps a second runner of the same run folder from starting.
 # Windows PowerShell 5.1 compatible.
+
+# The monitor reads this marker in a run folder's copy: it offers admin actions only to runners that have it.
+# task-queue control contract: 1
 
 # -ParallelTask is set by the runner itself: it starts one copy of this file per task of a parallel group.
 param([string]$ParallelTask)
@@ -76,6 +81,39 @@ function Read-Status([string]$path) {
 
 $tasks = @($queue.tasks)
 $total = $tasks.Count
+
+# The user's standing commands, written whole by the monitor only. The runner reads them before each
+# sequential task and before each group, never while a session runs.
+$controlFile = Join-Path $root 'control.json'
+$controlVersion = 1
+$script:controlIgnored = $null
+
+# The control file's commands, or $null when there are none: no file, or one this runner cannot read,
+# which an admin line names (once, until the problem changes).
+function Read-Control {
+    if (-not (Test-Path $controlFile)) { return $null }
+    $problem = $null
+    try {
+        $control = Get-Content -Raw -Encoding UTF8 $controlFile | ConvertFrom-Json
+        if ($null -eq $control) { $problem = 'it is empty' }
+        elseif ("$($control.version)" -ne "$controlVersion") { $problem = "version '$($control.version)' is not one this runner knows" }
+    }
+    catch { $problem = 'it is not valid JSON' }
+    if (-not $problem) { $script:controlIgnored = $null; return $control }
+    if ($script:controlIgnored -ne $problem) { Say "admin: control.json ignored ($problem)" 'Yellow' }
+    $script:controlIgnored = $problem
+    return $null
+}
+
+# Ends the run cleanly here when the user asked for a pause; $where names the place for the admin line.
+# Exit code 0 tells a pause from a stop.
+function Test-Pause([string]$where) {
+    $control = Read-Control
+    if (-not ($control -and $control.pause -eq $true)) { return }
+    Say "admin: pause applied ($where)" 'Yellow'
+    Say 'Queue - PAUSED (by the user)' 'Yellow'
+    exit 0
+}
 
 # Runs git in a directory and returns its output lines; the exit code is left in $script:gitExit.
 # Git reports progress on stderr, which must not stop the script.
@@ -562,49 +600,98 @@ function Run-Group($group) {
     if ((Test-Path $worktrees) -and -not @(Get-ChildItem -Force $worktrees).Count) { Remove-Item -Force $worktrees }
 }
 
-$host.UI.RawUI.WindowTitle = "Task queue: $($queue.project) ($total tasks)"
-Say "Queue $root - $total tasks, project $($queue.project), permission mode $($queue.permissionMode)" 'Cyan'
-if ($queueProblem) { Stop-Queue "queue.json: $queueProblem." }
-if ($hasGroups) { Assert-QueueBranch }
+# The run lock: one runner per run folder. A lock naming a live runner stops this one before it writes
+# anything; a lock left by a process that is gone, or reused by another program, does not.
+$lockFile = Join-Path $root 'runner.lock'
+function Get-LockHolder {
+    if (-not (Test-Path $lockFile)) { return $null }
+    $holder = "$(Get-Content -Raw $lockFile)".Trim()
+    if ($holder -notmatch '^\d+$' -or $holder -eq "$PID") { return $null }
+    try { $process = Get-CimInstance Win32_Process -Filter "ProcessId=$holder" } catch { return $null }
+    if (-not $process -or $process.Name -notmatch '^(powershell|pwsh)\.exe$') { return $null }
+    # A runner of this run folder runs this very file by its full path, as the skill and the monitor start it.
+    $line = "$($process.CommandLine)"
+    if ($line -match '-ParallelTask' -or -not $line.ToLower().Contains($PSCommandPath.ToLower())) { return $null }
+    return $holder
+}
 
-# A model without the requested mode (Haiku has no auto mode) silently starts in 'default',
-# where an unattended session is denied every write. Check once before spending a task on it.
-Push-Location $queue.workDir
-try {
-    $preflightArgs = @('-p', '--output-format', 'stream-json', '--verbose', '--no-session-persistence',
-                       '--permission-mode', $queue.permissionMode, '--permission-prompts', 'none') + (Model-Args)
-    $script:actualMode = $null
-    $script:actualModel = $null
-    'Reply with just OK' | & claude @preflightArgs | ForEach-Object {
-        try { $evt = "$_" | ConvertFrom-Json } catch { return }
-        if ($evt.subtype -eq 'init') { $script:actualMode = $evt.permissionMode; $script:actualModel = $evt.model }
+# Takes the lock: creates it, or replaces one whose holder is gone. Of two runners starting at once, the
+# one whose process id the file holds afterwards goes on.
+function Lock-Run {
+    try {
+        $stream = [System.IO.FileStream]::new($lockFile, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write)
+        try { $bytes = $utf8.GetBytes("$PID"); $stream.Write($bytes, 0, $bytes.Length) } finally { $stream.Dispose() }
+        return $null
+    }
+    catch [System.IO.IOException] {
+        $holder = Get-LockHolder
+        if ($holder) { return $holder }
+        [System.IO.File]::WriteAllText($lockFile, "$PID")
+        Start-Sleep -Milliseconds 200
+        $now = "$(Get-Content -Raw $lockFile)".Trim()
+        if ($now -ne "$PID") { return $now }
+        return $null
     }
 }
-finally {
-    Pop-Location
-}
-if ($script:actualMode -ne $queue.permissionMode) {
-    Say "Preflight: asked for permission mode '$($queue.permissionMode)', the session started in '$($script:actualMode)' (model $($script:actualModel)). Change the model or the mode in queue.json and run again." 'Red'
+$holder = Lock-Run
+if ($holder) {
+    Write-Host "Another runner of this run folder is alive (process $holder), so this one exits. Continue the queue from the monitor once that runner has stopped." -ForegroundColor Red
     exit 1
 }
-Say "Preflight: model $($script:actualModel), permission mode $($script:actualMode)" 'DarkGray'
 
-for ($i = 0; $i -lt $total; $i++) {
-    $task = $tasks[$i]
-    $group = $groupOf["$($task.id)"]
-    if ($group) {
-        Run-Group $group
-        $i += $group.ids.Count - 1
-        continue
+try {
+    $host.UI.RawUI.WindowTitle = "Task queue: $($queue.project) ($total tasks)"
+    Say "Queue $root - $total tasks, project $($queue.project), permission mode $($queue.permissionMode)" 'Cyan'
+    Test-Pause 'at start'
+    if ($queueProblem) { Stop-Queue "queue.json: $queueProblem." }
+    if ($hasGroups) { Assert-QueueBranch }
+
+    # A model without the requested mode (Haiku has no auto mode) silently starts in 'default',
+    # where an unattended session is denied every write. Check once before spending a task on it.
+    Push-Location $queue.workDir
+    try {
+        $preflightArgs = @('-p', '--output-format', 'stream-json', '--verbose', '--no-session-persistence',
+                           '--permission-mode', $queue.permissionMode, '--permission-prompts', 'none') + (Model-Args)
+        $script:actualMode = $null
+        $script:actualModel = $null
+        'Reply with just OK' | & claude @preflightArgs | ForEach-Object {
+            try { $evt = "$_" | ConvertFrom-Json } catch { return }
+            if ($evt.subtype -eq 'init') { $script:actualMode = $evt.permissionMode; $script:actualModel = $evt.model }
+        }
     }
-    if (Test-Done $task) {
-        Say "$(Label-Of $task) - already DONE, skipped" 'DarkGray'
-        continue
+    finally {
+        Pop-Location
     }
-    if (-not (Run-Task $task)) {
-        Say "Fix the cause, then run this file again: finished tasks are skipped and this one starts over." 'Yellow'
+    if ($script:actualMode -ne $queue.permissionMode) {
+        Say "Preflight: asked for permission mode '$($queue.permissionMode)', the session started in '$($script:actualMode)' (model $($script:actualModel)). Change the model or the mode in queue.json and run again." 'Red'
         exit 1
     }
-}
+    Say "Preflight: model $($script:actualModel), permission mode $($script:actualMode)" 'DarkGray'
 
-Say "All $total tasks DONE. Reports: $resultsDir" 'Green'
+    for ($i = 0; $i -lt $total; $i++) {
+        $task = $tasks[$i]
+        $group = $groupOf["$($task.id)"]
+        if ($group) {
+            Test-Pause "before group $($group.label)"
+            Run-Group $group
+            Test-Pause "after group $($group.label)"
+            $i += $group.ids.Count - 1
+            continue
+        }
+        if (Test-Done $task) {
+            Say "$(Label-Of $task) - already DONE, skipped" 'DarkGray'
+            continue
+        }
+        Test-Pause "before task $($task.id)"
+        if (-not (Run-Task $task)) {
+            Say "Fix the cause, then run this file again: finished tasks are skipped and this one starts over." 'Yellow'
+            exit 1
+        }
+    }
+
+    Say "All $total tasks DONE. Reports: $resultsDir" 'Green'
+}
+finally {
+    # A runner killed outright leaves its lock behind, naming a process that is gone.
+    if ((Test-Path $lockFile) -and "$(Get-Content -Raw $lockFile)".Trim() -eq "$PID") { Remove-Item -Force $lockFile }
+}

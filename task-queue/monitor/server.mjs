@@ -1,6 +1,8 @@
-// Read-only web monitor for task-queue runs. No npm packages.
+// Web monitor for task-queue runs. It shows every run, and administers those whose runner copy supports it
+// through one admin endpoint. No npm packages.
 // Usage: node server.mjs [--open]    Root: $TASK_QUEUE_ROOT or ~/.claude-queues
 import http from 'node:http';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -17,6 +19,11 @@ const LIVENESS_MS = 10_000;
 const FEED_TEXT_MAX = 4000;
 const NAME_RE = /^[A-Za-z0-9._-]+$/;
 const TASK_ID_RE = /^[A-Za-z0-9_-]+$/;
+// Admin requests must carry this server start's token, which the page gets with itself, and come from
+// the page's own origin.
+const TOKEN = crypto.randomBytes(24).toString('hex');
+const ORIGINS = new Set([`http://${HOST}:${PORT}`, `http://localhost:${PORT}`]);
+const BODY_MAX = 1024 * 1024;
 
 let lastRequestAt = Date.now();
 
@@ -106,11 +113,17 @@ const PARALLEL_TASK_RE = /-ParallelTask\s+"?([A-Za-z0-9_-]+)"?/i;
 // belongs to the sequential task it runs (`main`), one of a parallel task's child process to that task
 // (`tasks`). `tasks` lists the parallel tasks whose child process lives, each with whether its session does.
 // Only the first four fields are answered by the API.
-function runnerOf(runDir) {
+// A runner with the run lock (`locked`) is the process its lock names: the window the skill opens outlives
+// the script in it (-NoExit), but the script removes its lock when it ends.
+function runnerOf(runDir, locked = false) {
     if (!liveness.at) return { known: false };
     const script = path.join(runDir, 'run.ps1').toLowerCase();
-    const scripts = liveness.processes.filter(p => /^(powershell|pwsh)\.exe$/i.test(p.Name) && (p.CommandLine || '').toLowerCase().includes(script));
-    const runner = scripts.find(p => !PARALLEL_TASK_RE.test(p.CommandLine));
+    const isShell = p => /^(powershell|pwsh)\.exe$/i.test(p.Name);
+    const scripts = liveness.processes.filter(p => isShell(p) && (p.CommandLine || '').toLowerCase().includes(script));
+    const holder = locked ? lockHolder(runDir) : null;
+    const runner = locked
+        ? scripts.find(p => p.ProcessId === holder && !PARALLEL_TASK_RE.test(p.CommandLine))
+        : scripts.find(p => !PARALLEL_TASK_RE.test(p.CommandLine));
     if (!runner) return { known: true, alive: false };
     const sessionOf = parent => liveness.processes.some(p => /^claude\.exe$/i.test(p.Name) && p.ParentProcessId === parent);
     const main = sessionOf(runner.ProcessId);
@@ -126,6 +139,81 @@ function runnerOf(runDir) {
 
 // The runner facts /api/run answers, as before groups; the per-task facts show in the task states.
 const publicRunner = ({ known, alive, session, pid }) => ({ known, alive, session, pid });
+
+// --- Run folder files of the admin actions: the runner's marker, its lock, the control file. ---
+
+// The control contract this server speaks; a run folder whose runner copy names it gets admin actions.
+const CONTROL_VERSION = 1;
+const MARKER_RE = /^# task-queue control contract: (\d+)\s*$/m;
+
+function supportsAdmin(runDir) {
+    const runner = readText(path.join(runDir, 'run.ps1'));
+    return Number(MARKER_RE.exec(runner || '')?.[1]) === CONTROL_VERSION;
+}
+
+// The process id that runner.lock names, or null.
+function lockHolder(runDir) {
+    const text = readText(path.join(runDir, 'runner.lock'));
+    return text && /^\s*\d+\s*$/.test(text) ? Number(text) : null;
+}
+
+const NO_COMMANDS = { version: CONTROL_VERSION, pause: false, skip: [], retry: {}, resume: {} };
+
+// The user's standing commands. A missing control file means none; so does an unreadable one, and
+// `problem` then says why it was ignored.
+function readControl(runDir) {
+    const text = readText(path.join(runDir, 'control.json'));
+    if (text === null) return { control: { ...NO_COMMANDS }, problem: null };
+    let control = null;
+    try { control = text.trim() ? JSON.parse(text) : null; } catch { return { control: { ...NO_COMMANDS }, problem: 'it is not valid JSON' }; }
+    if (!control || typeof control !== 'object') return { control: { ...NO_COMMANDS }, problem: 'it is empty' };
+    // Compared as text, as the runner compares it.
+    if (String(control.version) !== String(CONTROL_VERSION)) return { control: { ...NO_COMMANDS }, problem: `version '${control.version}' is not one this monitor knows` };
+    return { control: { ...NO_COMMANDS, ...control }, problem: null };
+}
+
+// The server is the only writer of the control file, and replaces it whole: the runner never reads half
+// of it.
+function writeControl(runDir, control) {
+    const file = path.join(runDir, 'control.json');
+    const temp = `${file}.${process.pid}.tmp`;
+    fs.writeFileSync(temp, JSON.stringify({ ...control, version: CONTROL_VERSION }, null, 2));
+    withRetry(() => fs.renameSync(temp, file));
+}
+
+function stamp(date = new Date()) {
+    const p = n => String(n).padStart(2, '0');
+    return `${date.getFullYear()}-${p(date.getMonth() + 1)}-${p(date.getDate())} ${p(date.getHours())}:${p(date.getMinutes())}:${p(date.getSeconds())}`;
+}
+
+// Appends a line to progress.log in the runner's format.
+function appendProgress(runDir, message) {
+    withRetry(() => fs.appendFileSync(path.join(runDir, 'progress.log'), `${stamp()}  ${message}\r\n`));
+}
+
+// Runners that Continue launched, by run folder: until a process snapshot taken after the launch shows the
+// new runner, it counts as alive, so a second Continue cannot launch another. A runner that never shows
+// up (its window failed to start) stops counting after STARTING_MS.
+const launches = new Map();
+const STARTING_MS = 30_000;
+
+function starting(runDir, runner) {
+    const at = launches.get(runDir);
+    if (at && Date.now() - at < STARTING_MS && !(liveness.at > at && runner.alive)) return true;
+    launches.delete(runDir);
+    return false;
+}
+
+// Opens the run folder's runner in a new visible window, as the skill does. The hidden PowerShell that
+// starts it ends at once. It must not be detached: without a console of its own, its Start-Process opens
+// nothing.
+function launchRunner(runDir) {
+    const script = path.join(runDir, 'run.ps1').replace(/'/g, "''");
+    const command = `Start-Process powershell.exe -ArgumentList '-NoExit', '-NoProfile', '-File', '"${script}"'`;
+    spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(command, 'utf16le').toString('base64')],
+        { stdio: 'ignore', windowsHide: true }).unref();
+    launches.set(runDir, Date.now());
+}
 
 // --- progress.log -> run and task states. ---
 
@@ -221,7 +309,13 @@ function addFileFacts(runDir, entry) {
     entry.lastActivity = log ? log.mtimeMs : null;
 }
 
-function deriveRun(runDir, queue, lines, runner) {
+// Admin lines record what the user asked and what was applied; they say nothing about the run's own
+// progress, except the pause.
+const isAdminLine = message => message.startsWith('admin: ');
+const PAUSED_LINE = 'Queue - PAUSED (by the user)';
+
+// `control` is the run's control file (see readControl): a pause asked of a live runner makes it pausing.
+function deriveRun(runDir, queue, lines, runner, control = NO_COMMANDS) {
     const groups = groupsOf(queue);
     const groupOf = new Map(groups.flatMap(g => g.tasks.map(id => [id, g.id])));
     const merges = new Map(groups.map(g => [g.id, { id: g.id, merge: 'waiting', merged: [], reason: null, conflictTask: null, freshStep: false }]));
@@ -231,10 +325,13 @@ function deriveRun(runDir, queue, lines, runner) {
         start: null, end: null, sessionId: null, cost: null, reason: null,
         ...(groups.length ? { group: groupOf.get(t.id) ?? null } : {}),
     }));
-    let runState = lines.length ? 'running' : 'not-started';
-    let startedAt = lines.length ? lines[0].time : null;
+    // A run whose log holds only admin lines (a Continue not taken up yet) has not started.
+    const runLines = lines.filter(l => !isAdminLine(l.message));
+    let runState = runLines.length ? 'running' : 'not-started';
+    let startedAt = runLines.length ? runLines[0].time : null;
     let preflight = null;
-    for (const { time, message } of lines) {
+    for (const { time, message } of runLines) {
+        if (message === PAUSED_LINE) { runState = 'paused'; continue; }
         if (message.startsWith('Queue ')) {
             runState = 'running';
             // A re-run tries a merge that did not end again, and a conflict session still open was cut off with
@@ -294,13 +391,14 @@ function deriveRun(runDir, queue, lines, runner) {
         }
     }
     if (runState !== 'running' && runState !== 'no-session') for (const t of [...open, ...openConflicts]) t.state = 'interrupted';
+    if ((runState === 'running' || runState === 'no-session') && control.pause === true) runState = 'pausing';
 
     for (const t of tasks) {
         t.hasBrief = !!statOrNull(path.join(runDir, 'tasks', `${t.id}.md`));
         addFileFacts(runDir, t);
     }
     for (const c of conflicts.values()) addFileFacts(runDir, c);
-    const finishedAt = ['done', 'stopped', 'preflight-failed', 'interrupted'].includes(runState) && lines.length ? lines[lines.length - 1].time : null;
+    const finishedAt = ['done', 'stopped', 'preflight-failed', 'interrupted', 'paused'].includes(runState) && runLines.length ? runLines[runLines.length - 1].time : null;
     // Runs with groups also answer each group's merge step, and the conflict sessions: task-like entries
     // that are not tasks, so they are left out of the tasks and their counts.
     const parallel = groups.length ? {
@@ -327,10 +425,41 @@ function listRuns() {
     return runs.sort((a, b) => (b.run.localeCompare(a.run)) || a.project.localeCompare(b.project));
 }
 
+// Everything known about a run folder now: its log lines, runner, control file, derived states, and the
+// admin actions it allows.
+function snapshotOf(runDir, queue) {
+    const lines = parseProgress(readText(path.join(runDir, 'progress.log')));
+    const supported = supportsAdmin(runDir);
+    const runner = runnerOf(runDir, supported);
+    const { control, problem } = readControl(runDir);
+    const detail = deriveRun(runDir, queue, lines, runner, control);
+    return { lines, runner, control, problem, detail, admin: adminOf(runDir, supported, detail, runner, control) };
+}
+
+const FINISHED = new Set(['done']);
+
+// The run-level admin actions allowed now, each with why it is not when it is not. The page shows these;
+// the admin endpoint judges each request by the same rules.
+function adminOf(runDir, supported, detail, runner, control) {
+    if (!supported) return { supported: false, actions: [], refusals: {} };
+    const finished = FINISHED.has(detail.state);
+    const launching = starting(runDir, runner);
+    const alive = launching || (runner.known && runner.alive);
+    const refusals = {};
+    const refuse = (action, reason) => { if (reason) refusals[action] = reason; };
+    const noRunner = !runner.known && !launching ? 'the process check is still pending' : !alive ? 'no runner of this run is alive' : null;
+    refuse('pause', finished ? 'the run is finished' : noRunner || (control.pause ? 'a pause is already asked for' : null));
+    refuse('cancel-pause', finished ? 'the run is finished' : noRunner || (!control.pause ? 'no pause is asked for' : null));
+    refuse('continue', finished ? 'the run is finished'
+        : !runner.known && !launching ? 'the process check is still pending'
+        : launching ? 'the runner is starting' : alive ? 'a runner of this run is alive' : null);
+    const actions = RUN_ACTIONS.filter(a => !refusals[a]);
+    return { supported: true, actions, refusals };
+}
+
 // A run with groups also answers how many merges have conflicted so far, so the page can notify each one.
 function summarize(project, run, runDir, queue) {
-    const lines = parseProgress(readText(path.join(runDir, 'progress.log')));
-    const detail = deriveRun(runDir, queue, lines, runnerOf(runDir));
+    const { lines, detail } = snapshotOf(runDir, queue);
     const counts = {};
     for (const t of detail.tasks) counts[t.state] = (counts[t.state] || 0) + 1;
     const missingBriefs = detail.tasks.filter(t => !t.hasBrief).map(t => t.id);
@@ -439,7 +568,6 @@ function runDirFrom(query) {
 }
 
 const STATIC = {
-    '/': ['index.html', 'text/html; charset=utf-8'],
     '/marked.min.js': ['marked.min.js', 'text/javascript; charset=utf-8'],
 };
 
@@ -454,13 +582,89 @@ function moduleFile(pathname) {
     return statOrNull(file)?.isFile() ? file : null;
 }
 
+// --- Admin actions: POST /api/admin { project, run, action }. ---
+
+const RUN_ACTIONS = ['pause', 'cancel-pause', 'continue'];
+
+// The body as text; it rejects a body over BODY_MAX once it has been read to its end and dropped, so that
+// the sender gets the answer instead of a reset connection.
+function readBody(req) {
+    return new Promise((resolve, reject) => {
+        const chunks = [];
+        let size = 0;
+        req.on('data', chunk => {
+            size += chunk.length;
+            if (size <= BODY_MAX) chunks.push(chunk);
+        });
+        req.on('end', () => size > BODY_MAX ? reject(new Error('too large')) : resolve(Buffer.concat(chunks).toString('utf8')));
+        req.on('error', reject);
+    });
+}
+
+function sameToken(given) {
+    const a = Buffer.from(String(given || '')), b = Buffer.from(TOKEN);
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+// Every action leaves an admin line, a refused one too. Runs that do not support admin actions are not
+// touched at all.
+async function handleAdmin(req, res) {
+    if (!sameToken(req.headers['x-admin-token']) || !ORIGINS.has(req.headers.origin)) return send(res, 403, { error: 'forbidden' });
+    let text;
+    try { text = await readBody(req); } catch { return send(res, 413, { error: 'the request is too large' }); }
+    let body;
+    try { body = JSON.parse(text); } catch { return send(res, 400, { error: 'the request is not JSON' }); }
+    if (!body || typeof body !== 'object') return send(res, 400, { error: 'the request is not a JSON object' });
+    const { project, run, action } = body;
+    if (typeof project !== 'string' || typeof run !== 'string' || !NAME_RE.test(project) || !NAME_RE.test(run)) return send(res, 400, { error: 'no valid project and run' });
+    if (!RUN_ACTIONS.includes(action)) return send(res, 400, { error: `unknown action '${String(action)}'` });
+    const runDir = runDirFrom(new URLSearchParams({ project, run }));
+    if (!runDir) return send(res, 404, { error: 'unknown run' });
+    const queue = readQueue(runDir);
+    if (!queue) return send(res, 404, { error: 'unreadable queue.json' });
+
+    await refreshLiveness();
+    const { control, problem, admin } = snapshotOf(runDir, queue);
+    if (!admin.supported) return send(res, 409, { error: "this run folder's runner copy predates admin actions" });
+    if (problem) appendProgress(runDir, `admin: control.json ignored (${problem})`);
+    const refusal = admin.refusals[action];
+    if (refusal) {
+        appendProgress(runDir, `admin: ${action} refused (${refusal})`);
+        return send(res, 409, { error: refusal });
+    }
+
+    if (action === 'pause') {
+        writeControl(runDir, { ...control, pause: true });
+        appendProgress(runDir, 'admin: pause requested');
+    } else if (action === 'cancel-pause') {
+        writeControl(runDir, { ...control, pause: false });
+        appendProgress(runDir, 'admin: pause cancelled');
+    } else if (action === 'continue') {
+        // The new runner must not pause at once on a pause the user asked of the one before.
+        if (control.pause) writeControl(runDir, { ...control, pause: false });
+        appendProgress(runDir, 'admin: continue - run.ps1 launched in a new window');
+        launchRunner(runDir);
+    }
+    return send(res, 200, { ok: true, action });
+}
+
 async function handle(req, res) {
     const url = new URL(req.url, URL_BASE);
-    if (req.method !== 'GET') return send(res, 405, { error: 'read-only' });
+    const isAdmin = url.pathname === '/api/admin';
+    if (req.method !== (isAdmin ? 'POST' : 'GET')) return send(res, 405, { error: isAdmin ? 'POST only' : 'read-only' });
     // Only same-machine pages may call the API: refuse requests whose Host is not ours (DNS rebinding).
     if (!/^(127\.0\.0\.1|localhost)(:\d+)?$/i.test(req.headers.host || '')) return send(res, 403, { error: 'forbidden host' });
     lastRequestAt = Date.now();
+    if (isAdmin) return handleAdmin(req, res);
 
+    // The page carries the admin token.
+    if (url.pathname === '/') {
+        const page = fs.readFileSync(path.join(HERE, 'index.html'), 'utf8');
+        const slot = '<meta name="admin-token" content="">';
+        // A page without the slot would send every admin request without a token.
+        if (!page.includes(slot)) return send(res, 500, { error: 'index.html has no admin-token meta tag' });
+        return send(res, 200, page.replace(slot, `<meta name="admin-token" content="${TOKEN}">`), 'text/html; charset=utf-8');
+    }
     const asset = STATIC[url.pathname];
     if (asset) return send(res, 200, fs.readFileSync(path.join(HERE, asset[0])), asset[1]);
     if (url.pathname.startsWith('/pixel/')) {
@@ -479,15 +683,14 @@ async function handle(req, res) {
     if (!queue) return send(res, 404, { error: 'unreadable queue.json' });
 
     if (url.pathname === '/api/run') {
-        const lines = parseProgress(readText(path.join(runDir, 'progress.log')));
-        const runner = runnerOf(runDir);
-        const detail = deriveRun(runDir, queue, lines, runner);
+        const { lines, runner, detail, admin } = snapshotOf(runDir, queue);
         let commits = null;
         if (detail.startedAt && queue.workDir) {
             commits = await commitsFor(queue.workDir, detail.startedAt, detail.finishedAt, `${runDir}|${detail.finishedAt}`);
         }
         const settings = { workDir: queue.workDir, permissionMode: queue.permissionMode, model: queue.model, effort: queue.effort };
-        return send(res, 200, { ...detail, settings, runner: publicRunner(runner), livenessAt: liveness.at, commits, progress: lines });
+        return send(res, 200, { ...detail, settings, runner: publicRunner(runner), admin: { supported: admin.supported, actions: admin.actions },
+            livenessAt: liveness.at, commits, progress: lines });
     }
 
     // A task of the queue, or the conflict session of one of its groups, whose log and report are named

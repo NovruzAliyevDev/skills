@@ -1,8 +1,8 @@
 // Wiring: the pollers, run selection and the URL hash, the selected run's header, office, sections and
 // task drawer, the running tasks' helpers, notifications and the permission button, the tab title, the
 // offline marker, the theme listener and the keyboard.
-import { onOffline, readFeed, watchRun, watchRuns } from './api.js';
-import { BAD, STATE_LABEL, createDrawer, entryOf, esc, onRunChosen, renderCommits, renderProgress, renderRunHeader, renderRunList, runKey } from './panel.js';
+import { onOffline, postAdmin, readFeed, watchRun, watchRuns } from './api.js';
+import { ACTION_LABEL, BAD, STATE_LABEL, createDrawer, entryOf, esc, onRunChosen, onRunControl, renderCommits, renderProgress, renderRunControls, renderRunHeader, renderRunList, runKey } from './panel.js';
 import { resetSprites } from './sprites.js';
 import { createHelperList, createOffice, helperTasksOf } from './workers.js';
 import { createScene } from './scene.js';
@@ -18,6 +18,10 @@ const progress = document.getElementById('progress');
 const progressNote = document.getElementById('progress-note');
 const offlineMarker = document.getElementById('offline');
 const notifyButton = document.getElementById('notify-btn');
+const controls = document.getElementById('run-controls');
+const controlButtons = document.getElementById('control-buttons');
+const adminMessage = document.getElementById('admin-msg');
+let busyAction = null;        // the queue control whose request is on its way
 let runs = [];
 let selected = null;
 let detail = null;            // the selected run's last snapshot
@@ -59,6 +63,9 @@ function select(run) {
   followDesks([]);
   selected = { project: run.project, run: run.run };
   detail = null;
+  busyAction = null;
+  adminMessage.textContent = '';
+  renderRunControls(controls, controlButtons, null, null);
   history.replaceState(null, '', `#${encodeURIComponent(runKey(selected))}`);
   sceneTitle.innerHTML = `Office <span class="muted">${esc(run.project)} ${esc(run.run)}</span>`;
   scene?.destroy();
@@ -97,6 +104,7 @@ const runPoll = watchRun(() => selected, next => {
   detail = next;
   followDesks(helperTasksOf(detail));
   renderRunHeader(runHead, detail, selected);
+  renderRunControls(controls, controlButtons, detail, busyAction);
   showOffice();
   drawer.update(detail);
   renderCommits(commits, commitsNote, detail.commits);
@@ -104,7 +112,7 @@ const runPoll = watchRun(() => selected, next => {
   updateTitle();
 });
 
-watchRuns(data => {
+const runsPoll = watchRuns(data => {
   document.getElementById('root').textContent = data.root;
   runs = data.runs;
   notifyChanges(runs);
@@ -118,6 +126,23 @@ onRunChosen(runList, key => {
   if (run) select(run);
 });
 
+// A queue control sends its action; a refusal shows its reason beside the controls. The page then shows
+// what happened from its next poll, at once.
+onRunControl(controlButtons, async action => {
+  if (busyAction || !selected) return;
+  const asked = selected;
+  busyAction = action;
+  adminMessage.textContent = '';
+  renderRunControls(controls, controlButtons, detail, busyAction);
+  const result = await postAdmin(asked, action);
+  if (selected !== asked) return;
+  busyAction = null;
+  if (!result.ok) adminMessage.textContent = `${ACTION_LABEL[action]} refused: ${result.error}`;
+  renderRunControls(controls, controlButtons, detail, busyAction);
+  runPoll.refresh();
+  runsPoll.refresh();
+});
+
 addEventListener('hashchange', () => {
   const run = runs.find(r => runKey(r) === hashKey());
   if (run) select(run);
@@ -127,7 +152,8 @@ addEventListener('hashchange', () => {
 
 function updateTitle() {
   const done = detail.tasks.filter(t => t.state === 'done').length;
-  const icon = detail.state === 'done' ? '✓' : BAD.has(detail.state) ? '✗' : detail.state === 'running' ? '▶' : '·';
+  const icon = detail.state === 'done' ? '✓' : BAD.has(detail.state) ? '✗' : detail.state === 'paused' ? '⏸'
+    : ['running', 'pausing'].includes(detail.state) ? '▶' : '·';
   const label = BAD.has(detail.state) ? ` ${STATE_LABEL[detail.state]}` : '';
   document.title = `${icon} ${done}/${detail.tasks.length}${label} · ${selected.project}`;
 }
@@ -146,6 +172,7 @@ function notifyChanges(list) {
       if ((r.conflicts || 0) > (before.conflicts || 0)) notify('Merge conflict', key);
       if (r.state !== before.state && r.state === 'done') notify(`Queue finished: all ${r.total} tasks DONE`, key);
       if (r.state !== before.state && BAD.has(r.state)) notify(`Queue ${STATE_LABEL[r.state]}`, key);
+      if (r.state !== before.state && r.state === 'paused') notify('Queue paused', key);
     }
   }
   previousRuns = now;

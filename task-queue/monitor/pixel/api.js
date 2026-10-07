@@ -64,6 +64,28 @@ export function watchRun(selected, onRun) {
   }, RUN_EVERY_MS, track('run'));
 }
 
+// The admin token this server start handed out with the page.
+const adminToken = document.querySelector('meta[name="admin-token"]')?.content || '';
+
+// Asks the server for an admin action on a run. Answers `{ ok: true }`, or `{ ok: false, error }` with the
+// reason the action was refused or failed. The page learns the result from its next poll, not from this.
+export async function postAdmin(selection, action, extra = {}) {
+  let response;
+  try {
+    response = await fetch('/api/admin', {
+      method: 'POST', cache: 'no-store',
+      headers: { 'Content-Type': 'application/json', 'X-Admin-Token': adminToken },
+      body: JSON.stringify({ ...selection, action, ...extra }),
+    });
+  } catch {
+    return { ok: false, error: 'the monitor server did not answer' };
+  }
+  if (response.ok) return { ok: true };
+  if (response.status === 403) return { ok: false, error: 'the monitor server was restarted; reload the page' };
+  const data = await response.json().catch(() => ({}));
+  return { ok: false, error: data.error || `the server answered ${response.status}` };
+}
+
 // A task's brief, report or earlier attempt's report (`kind` brief, result or previous): its text, or null
 // when the server has none.
 export async function getFile(selection, task, kind) {
