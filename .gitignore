@@ -5,4 +5,5 @@
 !/.gitignore
 !/README.md
 !/delegate/
+!/queue-monitor/
 !/task-queue/

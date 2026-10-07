@@ -7,6 +7,7 @@ instructions, plus any files it needs.
 |---|---|---|
 | [task-queue](task-queue/) | Runs a list of tasks in order, each in its own fresh, unattended Claude Code session, with tasks you mark as a group running in parallel, and shows the queue on a local web page. | You type `/task-queue`. |
 | [delegate](delegate/) | Splits a big task into independent pieces, runs each in its own subagent, and keeps the main session's context light. | Claude uses it when you ask to delegate, split up, fan out or parallelize work; you can also type `/delegate`. |
+| [queue-monitor](queue-monitor/) | Starts the task-queue monitor again (it exits after two idle hours) and opens it in the browser. | You type `/queue-monitor`. |
 
 ## Install
 
@@ -25,6 +26,7 @@ If `~/.claude/skills` already exists, clone the repository elsewhere and link ea
 git clone https://github.com/NovruzAliyevDev/skills C:\src\skills
 New-Item -ItemType Junction -Path "$env:USERPROFILE\.claude\skills\task-queue" -Target C:\src\skills\task-queue
 New-Item -ItemType Junction -Path "$env:USERPROFILE\.claude\skills\delegate" -Target C:\src\skills\delegate
+New-Item -ItemType Junction -Path "$env:USERPROFILE\.claude\skills\queue-monitor" -Target C:\src\skills\queue-monitor
 ```
 
 New Claude Code sessions pick the skills up.
@@ -123,7 +125,7 @@ note), and edit the brief of a task not yet started. A queue is better continued
 by hand: a run lock makes a second runner of the same run folder exit at once. The design record is in
 [task-queue/docs/monitor-admin](task-queue/docs/monitor-admin/).
 
-The queue starts the monitor by itself. To start it by hand:
+The queue starts the monitor by itself. To start it again, type `/queue-monitor`, or by hand:
 
 ```powershell
 node "$env:USERPROFILE\.claude\skills\task-queue\monitor\server.mjs" --open
