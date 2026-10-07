@@ -206,6 +206,7 @@ pre.plain { margin: 0; max-height: 50vh; overflow: auto; padding: 8px 10px; back
 .confirm-buttons { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
 .btn.danger { color: #fff; background: var(--bad); border-color: var(--frame); }
 .btn.danger:hover { filter: brightness(1.1); }
+.btn.danger[aria-disabled="true"], .btn.danger[aria-disabled="true"]:hover { background: var(--bad); filter: none; }
 .tabs { display: flex; gap: 6px; padding: 0 14px; border-bottom: 2px solid var(--frame); }
 .tabs [role="tab"] { margin-bottom: -2px; padding: 4px 10px; font-size: 11px; font-weight: 700; cursor: pointer;
   color: var(--muted); background: var(--bg); border: 2px solid var(--frame); }

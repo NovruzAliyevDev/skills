@@ -117,10 +117,10 @@ export function renderRunHeader(el, detail, selection) {
     ${missing.length ? `<div class="warning">⚠ Missing briefs: ${esc(missing.join(', '))}</div>` : ''}`);
 }
 
-// --- Queue controls: for an unfinished run whose runner supports admin actions, Pause (Cancel pause while
-// pausing) and Continue, each usable when the run answer allows it. ---
+// --- Queue controls: for an unfinished run whose runner supports admin actions, Stop, Pause (Cancel pause
+// while pausing) and Continue, each usable when the run answer allows it. ---
 
-export const ACTION_LABEL = { 'pause': 'Pause', 'cancel-pause': 'Cancel pause', 'continue': 'Continue', 'skip': 'Skip', 'unskip': 'Un-skip' };
+export const ACTION_LABEL = { 'stop': 'Stop', 'pause': 'Pause', 'cancel-pause': 'Cancel pause', 'continue': 'Continue', 'skip': 'Skip', 'unskip': 'Un-skip' };
 const FINISHED = new Set(['done', 'finished-with-skips']);
 
 // Asks the user to confirm in the page's dialog: `title`, `text`, and `ok`, the confirming button's label.
@@ -143,10 +143,10 @@ export function renderRunControls(box, buttons, detail, busy) {
   box.hidden = !admin?.supported || FINISHED.has(detail.state);
   if (box.hidden) return setHtml(buttons, '');
   const pausing = admin.actions.includes('cancel-pause') || detail.state === 'pausing';
-  const slots = [['pause', pausing ? 'cancel-pause' : 'pause'], ['continue', 'continue']];
+  const slots = [['stop', 'stop'], ['pause', pausing ? 'cancel-pause' : 'pause'], ['continue', 'continue']];
   const html = slots.map(([slot, action]) => {
     const usable = admin.actions.includes(action) && !busy;
-    return `<button type="button" class="btn" data-slot="${slot}" data-action="${action}" aria-disabled="${!usable}">${ACTION_LABEL[action]}${busy === action ? '…' : ''}</button>`;
+    return `<button type="button" class="btn${action === 'stop' ? ' danger' : ''}" data-slot="${slot}" data-action="${action}" aria-disabled="${!usable}">${ACTION_LABEL[action]}${busy === action ? '…' : ''}</button>`;
   }).join('');
   const focused = buttons.contains(document.activeElement) ? document.activeElement.dataset.slot : null;
   if (setHtml(buttons, html) && focused) buttons.querySelector(`[data-slot="${focused}"]`)?.focus();

@@ -82,9 +82,9 @@ function Read-Status([string]$path) {
 $tasks = @($queue.tasks)
 $total = $tasks.Count
 
-# The user's standing commands, written whole by the monitor only: `pause`, and `skip`, the task ids to
-# pass over. The runner reads them before each sequential task and before each group, never while a
-# session runs.
+# The user's standing commands, written whole by the monitor only: `pause`; `skip`, the task ids to
+# pass over; and `resume`, per task id the session a hard stop cut off. The runner reads them before each
+# sequential task, before each group and before each task's session starts, never while a session runs.
 $controlFile = Join-Path $root 'control.json'
 $controlVersion = 1
 $script:controlIgnored = $null
@@ -104,6 +104,25 @@ function Read-Control {
     if ($script:controlIgnored -ne $problem) { Say "admin: control.json ignored ($problem)" 'Yellow' }
     $script:controlIgnored = $problem
     return $null
+}
+
+# One-shot entries of the control file (`resume`) are applied at most once: an entry whose id the runner's
+# admin line for applying it names (`admin: <what> applied (task <id>, entry <id>)`) is used.
+function Test-EntryUsed([string]$entryId) {
+    if (-not (Test-Path $progressLog)) { return $false }
+    $pattern = '  admin: \S+ applied \(task [A-Za-z0-9_-]+, entry ' + [regex]::Escape($entryId) + '\)\r?$'
+    return [regex]::IsMatch("$(Get-Content -Raw -Encoding UTF8 $progressLog)", $pattern, 'Multiline')
+}
+
+# The unused `resume` entry the monitor wrote for a task its hard stop cut off, or $null: the session to
+# resume (`session`) and the entry's id (`id`).
+function Get-ResumeEntry($task) {
+    $control = Read-Control
+    if (-not $control -or -not $control.resume) { return $null }
+    $entry = $control.resume."$($task.id)"
+    if (-not $entry -or "$($entry.id)" -notmatch '^[A-Za-z0-9-]+$' -or "$($entry.session)" -notmatch '^[A-Za-z0-9-]+$') { return $null }
+    if (Test-EntryUsed "$($entry.id)") { return $null }
+    return $entry
 }
 
 # Ends the run cleanly here when the user asked for a pause; $where names the place for the admin line.
@@ -371,6 +390,13 @@ The main checkout is $($queue.workDir). Files the repository does not track (tic
 "@
     }
 
+    # How every prompt of a task ends, a resumed session's too.
+    $closing = @"
+This session is headless: it ends with your final answer, and nothing wakes it up again. Background commands are turned off, so run every command in the foreground and wait for it; give slow ones, such as a full test suite, a timeout of up to $bashMaxMinutes minutes.
+
+Before you finish, write $resultFile. Its first line is exactly DONE or FAILED. After it: what you did, how you verified it, and anything the next task or the user must know.
+"@
+
     $sessionName = "$($queue.project) - $($task.title)" -replace '"', "'"
     $prompt = @"
 You are task $index of $total in an unattended queue. Nobody is watching this session and nobody can answer a question. The session is already named '$sessionName'.
@@ -380,9 +406,7 @@ Reports from earlier tasks in this queue are in: $resultsDir$retryNote$parallelN
 
 Do the task completely, following this repository's own instructions (CLAUDE.md and what it points to). Where the task leaves a choice open, take the sensible default and record it in your report. If you reach a decision only the user can make, or something blocks you, stop there instead of guessing.$commitNote
 
-This session is headless: it ends with your final answer, and nothing wakes it up again. Background commands are turned off, so run every command in the foreground and wait for it; give slow ones, such as a full test suite, a timeout of up to $bashMaxMinutes minutes.
-
-Before you finish, write $resultFile. Its first line is exactly DONE or FAILED. After it: what you did, how you verified it, and anything the next task or the user must know.
+$closing
 "@
 
     # --add-dir: the task file and the reports live outside the working directory, and an
@@ -391,10 +415,26 @@ Before you finish, write $resultFile. Its first line is exactly DONE or FAILED. 
     $dirArgs = @('--add-dir', $root)
     if ($group) { $dirArgs += @('--add-dir', $queue.workDir) }
 
-    Say "$label - starting" 'Cyan'
+    # A task the user's hard stop cut off resumes its own session, told why it stopped.
+    $cliArgs = Session-Args $dirArgs $sessionName
     $script:sessionId = $null
+    $resume = Get-ResumeEntry $task
+    if ($resume) {
+        Say "admin: resume applied (task $($task.id), entry $($resume.id))" 'Yellow'
+        $script:sessionId = "$($resume.session)"
+        $cliArgs = Session-Args $dirArgs '' $script:sessionId
+        $prompt = @"
+The user stopped the queue from the monitor while you were working on your task, and has now continued it. Everything that was running in this session when it stopped was killed: a command may not have finished, and a file may have been left half-written. Check the working tree before you go on.
+
+Carry on with your task where you left off; it is in $taskFile.$commitNote
+
+$closing
+"@
+    }
+
+    Say "$label - starting" 'Cyan'
     $script:cost = $null
-    $reason = Run-Session $label $prompt (Session-Args $dirArgs $sessionName) $dirArgs $logFile $resultFile $sessionDir ([bool]$group)
+    $reason = Run-Session $label $prompt $cliArgs $dirArgs $logFile $resultFile $sessionDir ([bool]$group)
     if (-not $reason -and $group) {
         $uncommitted = @(Get-Uncommitted (Worktree-Of $task)).Count
         if ($uncommitted) { $reason = "report status 'DONE', but $uncommitted uncommitted change(s) left in the worktree" }

@@ -138,11 +138,17 @@ onRunChosen(runList, key => {
   if (run) select(run);
 });
 
-// A queue control sends its action; a refusal shows its reason beside the controls. The page then shows
-// what happened from its next poll, at once.
+// A queue control sends its action; Stop asks for confirmation first. A refusal shows its reason beside the
+// controls. The page then shows what happened from its next poll, at once.
 onRunControl(controlButtons, async action => {
   if (busyAction || !selected) return;
   const asked = selected;
+  if (action === 'stop' && !await confirmAction({
+    title: 'Stop the queue now?',
+    text: 'Every running session of this queue is killed at once, and a merge in progress is undone. Continue later resumes each cut-off task in its own session.',
+    ok: 'Stop queue',
+  })) return;
+  if (busyAction || selected !== asked) return;
   busyAction = action;
   adminMessage.textContent = '';
   renderRunControls(controls, controlButtons, detail, busyAction);

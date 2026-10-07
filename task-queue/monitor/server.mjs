@@ -195,14 +195,19 @@ function appendProgress(runDir, message) {
 }
 
 // Runners that Continue launched, by run folder: until a process snapshot taken after the launch shows the
-// new runner, it counts as alive, so a second Continue cannot launch another. A runner that never shows
-// up (its window failed to start) stops counting after STARTING_MS.
+// new runner, it counts as alive, so a second Continue cannot launch another. It stops counting when a
+// snapshot taken after its `Queue` line in `lines` does not show it (it started and is gone already, killed
+// before any snapshot saw it), or after STARTING_MS (its window failed to start).
 const launches = new Map();
 const STARTING_MS = 30_000;
 
-function starting(runDir, runner) {
+function starting(runDir, runner, lines) {
     const at = launches.get(runDir);
-    if (at && Date.now() - at < STARTING_MS && !(liveness.at > at && runner.alive)) return true;
+    // Log stamps have whole seconds: the line was written before the end of its second.
+    const startedAt = at && lines.filter(l => l.message.startsWith('Queue ') && l.message !== PAUSED_LINE && l.message !== STOPPED_LINE)
+        .map(l => parseLocal(l.time)).find(t => t >= Math.floor(at / 1000) * 1000);
+    const gone = startedAt && liveness.at >= startedAt + 1000 && !runner.alive;
+    if (at && Date.now() - at < STARTING_MS && !(liveness.at > at && runner.alive) && !gone) return true;
     launches.delete(runDir);
     return false;
 }
@@ -317,6 +322,9 @@ function addFileFacts(runDir, entry) {
 // progress, except the pause.
 const isAdminLine = message => message.startsWith('admin: ');
 const PAUSED_LINE = 'Queue - PAUSED (by the user)';
+// The server's own last line of a hard stop: the runner is dead by then.
+const STOPPED_LINE = 'Queue - STOPPED (by the user)';
+const STOPPED_REASON = 'stopped by the user from the monitor';
 // The final line of a queue that finished with skipped tasks, in place of "All N tasks DONE".
 const FINISHED_WITH_SKIPS_RE = /^Finished, \d+ skipped: /;
 
@@ -339,6 +347,13 @@ function deriveRun(runDir, queue, lines, runner, control = NO_COMMANDS) {
     let preflight = null;
     for (const { time, message } of runLines) {
         if (message === PAUSED_LINE) { runState = 'paused'; continue; }
+        // A hard stop cut off every open task and conflict session, and the merge step in progress.
+        if (message === STOPPED_LINE) {
+            runState = 'stopped';
+            for (const t of [...tasks, ...conflicts.values()]) if (t.state === 'running') Object.assign(t, { state: 'stopped', end: time, reason: STOPPED_REASON });
+            for (const g of merges.values()) if (['merging', 'resolving'].includes(g.merge)) Object.assign(g, { merge: 'failed', reason: STOPPED_REASON });
+            continue;
+        }
         if (message.startsWith('Queue ')) {
             runState = 'running';
             // A re-run tries a merge that did not end again, and a conflict session still open was cut off with
@@ -461,7 +476,7 @@ function snapshotOf(runDir, queue) {
     const runner = runnerOf(runDir, supported);
     const { control, problem } = readControl(runDir);
     const detail = deriveRun(runDir, queue, lines, runner, control);
-    const admin = adminOf(runDir, supported, detail, runner, control);
+    const admin = adminOf(runDir, supported, detail, runner, control, lines);
     for (const t of detail.tasks) delete t.groupStarted;
     return { lines, runner, control, problem, detail, admin };
 }
@@ -484,15 +499,17 @@ function taskRefusal(action, task, finished, control) {
 // The run-level admin actions allowed now, each with why it is not when it is not, and the same per task
 // (`taskRefusals` by task id; each task's `actions` lists its allowed ones). The page shows these; the
 // admin endpoint judges each request by the same rules.
-function adminOf(runDir, supported, detail, runner, control) {
+function adminOf(runDir, supported, detail, runner, control, lines) {
     for (const t of detail.tasks) t.actions = [];
     if (!supported) return { supported: false, actions: [], refusals: {}, taskRefusals: {} };
     const finished = FINISHED.has(detail.state);
-    const launching = starting(runDir, runner);
+    const launching = starting(runDir, runner, lines);
     const alive = launching || (runner.known && runner.alive);
     const refusals = {};
     const refuse = (action, reason) => { if (reason) refusals[action] = reason; };
     const noRunner = !runner.known && !launching ? 'the process check is still pending' : !alive ? 'no runner of this run is alive' : null;
+    // A hard stop kills a runner seen in the process table; one still starting is not there yet.
+    refuse('stop', finished ? 'the run is finished' : noRunner || (!(runner.known && runner.alive) ? 'the runner is starting' : null));
     refuse('pause', finished ? 'the run is finished' : noRunner || (control.pause ? 'a pause is already asked for' : null));
     refuse('cancel-pause', finished ? 'the run is finished' : noRunner || (!control.pause ? 'no pause is asked for' : null));
     refuse('continue', finished ? 'the run is finished'
@@ -634,7 +651,7 @@ function moduleFile(pathname) {
 
 // --- Admin actions: POST /api/admin { project, run, action }, with `task` for a task action. ---
 
-const RUN_ACTIONS = ['pause', 'cancel-pause', 'continue'];
+const RUN_ACTIONS = ['stop', 'pause', 'cancel-pause', 'continue'];
 const TASK_ACTIONS = ['skip', 'unskip'];
 
 // The body as text; it rejects a body over BODY_MAX once it has been read to its end and dropped, so that
@@ -657,6 +674,16 @@ function sameToken(given) {
     return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
+// The admin requests of each run folder, one at a time: a Stop takes seconds, and no other action may judge
+// the run or write its control file meanwhile.
+const adminTurns = new Map();
+
+function inTurn(runDir, act) {
+    const turn = (adminTurns.get(runDir) || Promise.resolve()).then(act, act);
+    adminTurns.set(runDir, turn.catch(() => {}));
+    return turn;
+}
+
 // Every action leaves an admin line, a refused one too. Runs that do not support admin actions are not
 // touched at all.
 async function handleAdmin(req, res) {
@@ -676,7 +703,10 @@ async function handleAdmin(req, res) {
     const queue = readQueue(runDir);
     if (!queue) return send(res, 404, { error: 'unreadable queue.json' });
     if (forTask && !(queue.tasks || []).some(t => t.id === task)) return send(res, 400, { error: `unknown task '${task}'` });
+    return inTurn(runDir, () => applyAdmin(res, runDir, queue, action, task, forTask));
+}
 
+async function applyAdmin(res, runDir, queue, action, task, forTask) {
     await refreshLiveness();
     const { control, problem, admin } = snapshotOf(runDir, queue);
     if (!admin.supported) return send(res, 409, { error: "this run folder's runner copy predates admin actions" });
@@ -687,6 +717,7 @@ async function handleAdmin(req, res) {
         return send(res, 409, { error: refusal });
     }
 
+    if (action === 'stop') return hardStop(res, runDir, queue);
     if (action === 'pause') {
         writeControl(runDir, { ...control, pause: true });
         appendProgress(runDir, 'admin: pause requested');
@@ -706,6 +737,147 @@ async function handleAdmin(req, res) {
         appendProgress(runDir, `admin: unskip requested (task ${task})`);
     }
     return send(res, 200, { ok: true, action });
+}
+
+// --- Hard stop: the runner's process tree is killed at once. ---
+
+// A process snapshot taken after now: one already on its way may have started before.
+async function freshLiveness() {
+    if (livenessPending) await livenessPending;
+    return refreshLiveness();
+}
+
+function runCommand(file, args, cwd) {
+    return new Promise(resolve => execFile(file, args, { cwd, windowsHide: true, timeout: 30_000, maxBuffer: 16 * 1024 * 1024 },
+        (err, stdout, stderr) => resolve({ ok: !err, out: `${stdout || ''}${stderr || ''}`.trim() })));
+}
+
+// Every process now, with its creation time. The liveness snapshot lists only PowerShell and claude; a
+// session's own commands are other programs.
+async function processTable() {
+    const script = 'Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId, ' +
+        "@{ n = 'Created'; e = { $_.CreationDate.ToFileTimeUtc() } } | ConvertTo-Json -Compress";
+    const { ok, out } = await runCommand('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script]);
+    if (!ok) return null;
+    try { const parsed = JSON.parse(out); return Array.isArray(parsed) ? parsed : [parsed]; } catch { return null; }
+}
+
+// The processes of `roots` (pid -> creation time) and every process under them, by pid -> creation time.
+// Windows reuses process ids: a process is a child only when it was created after its parent, so a process
+// whose parent id now names a newer process is not taken along.
+function descendants(table, roots) {
+    const tree = new Map(roots);
+    const queue = [...roots.keys()];
+    while (queue.length) {
+        const parent = queue.shift();
+        for (const p of table) {
+            if (p.ParentProcessId !== parent || tree.has(p.ProcessId) || p.Created < tree.get(parent)) continue;
+            tree.set(p.ProcessId, p.Created);
+            queue.push(p.ProcessId);
+        }
+    }
+    return tree;
+}
+
+// Kills the runner and every process under it: its parallel children, their sessions and the sessions'
+// own commands. The runner goes first, so that it starts nothing more; a process started meanwhile is
+// found by the next pass. Answers `{ alive, table }`: the process ids still alive afterwards, and the last
+// process table read; or null when the process table could not be read.
+async function killTree(runnerPid) {
+    let table = await processTable();
+    const runner = table?.find(p => p.ProcessId === runnerPid);
+    if (!runner) return table && { gone: true, alive: [], table };
+    let tree = new Map([[runnerPid, runner.Created]]);
+    for (let pass = 1; pass <= 3; pass++) {
+        tree = descendants(table, tree);
+        const alive = [...tree].filter(([pid, created]) => table.some(p => p.ProcessId === pid && p.Created === created)).map(([pid]) => pid);
+        if (!alive.length || pass === 3) return { alive, table };
+        await runCommand('taskkill', ['/F', ...alive.flatMap(pid => ['/PID', String(pid)])]);
+        table = await processTable();
+        if (!table) return null;
+    }
+}
+
+// Undoes the merge a group's merge step left in progress in the main checkout, as the runner undoes a
+// failed one: the merge is aborted, and whatever the conflict session left there is removed, since the
+// runner merges only into a clean checkout. Returns the admin line, or null when no merge was in progress.
+async function undoMerge(workDir) {
+    if (!(await runCommand('git', ['-C', workDir, 'rev-parse', '--verify', '--quiet', 'MERGE_HEAD'])).ok) return null;
+    const aborted = await runCommand('git', ['-C', workDir, 'merge', '--abort']);
+    const lastLine = result => result.out.split(/\r?\n/).at(-1);
+    if (!aborted.ok) return `admin: stop - the merge could not be undone (${lastLine(aborted)})`;
+    const status = await runCommand('git', ['-C', workDir, 'status', '--porcelain']);
+    if (status.out) {
+        const reset = await runCommand('git', ['-C', workDir, 'reset', '--hard', 'HEAD']);
+        const cleaned = reset.ok && await runCommand('git', ['-C', workDir, 'clean', '-fd']);
+        if (!cleaned?.ok) return `admin: stop - the merge could not be undone (${lastLine(cleaned || reset)})`;
+    }
+    return 'admin: stop - merge undone (git merge --abort)';
+}
+
+// The session of a task's current attempt, from its lines in the log: the one its last `starting` line
+// started, or the session a resume line just before that line resumed; null when the attempt has not named
+// one yet. A task's sessionId in the run answer may still be an earlier attempt's.
+function attemptSession(lines, task) {
+    let session = null, resumed = false;
+    for (const { message } of lines) {
+        if (message.startsWith(`admin: resume applied (task ${task.id}, `)) { resumed = true; continue; }
+        const m = LABEL_RE.exec(message);
+        // The lines of the other tasks of a group may come in between.
+        if (!m || Number(m[1]) !== task.index) continue;
+        if (m[4] === 'starting') { if (!resumed) session = null; }
+        else if (m[5]) session = m[5];
+        resumed = false;
+    }
+    return session;
+}
+
+// Kills the runner, its parallel children and their sessions; writes a `resume` entry for each task cut
+// off with a session, undoes a merge step's merge in progress, then writes the admin lines and the
+// STOPPED line. The snapshot that allowed the stop says what was running.
+async function hardStop(res, runDir, queue) {
+    const { lines, runner, detail } = snapshotOf(runDir, queue);
+    const atWork = t => t.state === 'running' || t.state === 'no-session';
+    const cutOff = detail.tasks.filter(atWork);
+    const conflicts = (detail.conflicts || []).filter(atWork);
+    const merging = (detail.groups || []).some(g => ['merging', 'resolving'].includes(g.merge));
+
+    const killed = await killTree(runner.pid);
+    // The runner ended by itself since the snapshot: there was nothing to stop.
+    if (killed?.gone) {
+        appendProgress(runDir, 'admin: stop refused (no runner of this run is alive)');
+        return send(res, 409, { error: 'no runner of this run is alive' });
+    }
+    if (!killed || killed.alive.length) {
+        const why = killed ? `processes ${killed.alive.join(', ')} of the queue are still alive` : 'the process table could not be read';
+        appendProgress(runDir, `admin: stop incomplete (${why})`);
+        await freshLiveness();
+        return send(res, 500, { error: why });
+    }
+    // The page's next poll must not see the killed runner alive: the snapshot loses what the table lacks,
+    // once a snapshot already on its way, taken before the kill, is in.
+    await livenessPending;
+    const now = new Set(killed.table.map(p => p.ProcessId));
+    liveness = { ...liveness, processes: liveness.processes.filter(p => now.has(p.ProcessId)) };
+
+    // An entry the runner applied is used; it is dropped, and a task cut off again gets a new one.
+    const used = id => lines.some(l => /^admin: \S+ applied \(task [A-Za-z0-9_-]+, entry /.test(l.message) && l.message.endsWith(`, entry ${id})`));
+    const { control } = readControl(runDir);
+    const resume = Object.fromEntries(Object.entries(control.resume && typeof control.resume === 'object' ? control.resume : {})
+        .filter(([, e]) => e && !used(e.id)));
+    const stopLines = [`admin: stop requested - the runner (process ${runner.pid}) and its sessions were killed`];
+    for (const t of cutOff) {
+        const session = attemptSession(lines, t);
+        if (!session) { stopLines.push(`admin: stop - task ${t.id} cut off, with no session to resume`); delete resume[t.id]; continue; }
+        resume[t.id] = { session, id: crypto.randomBytes(6).toString('hex') };
+        stopLines.push(`admin: stop - task ${t.id} cut off, to resume on Continue (session ${session}, entry ${resume[t.id].id})`);
+    }
+    for (const c of conflicts) stopLines.push(`admin: stop - conflict session of group ${c.group} cut off; Continue tries the merge again`);
+    writeControl(runDir, { ...control, resume });
+    const undone = merging && queue.workDir ? await undoMerge(queue.workDir) : null;
+    if (undone) stopLines.push(undone);
+    for (const line of [...stopLines, STOPPED_LINE]) appendProgress(runDir, line);
+    return send(res, 200, { ok: true, action: 'stop' });
 }
 
 async function handle(req, res) {
