@@ -120,7 +120,7 @@ export function renderRunHeader(el, detail, selection) {
 // --- Queue controls: for an unfinished run whose runner supports admin actions, Stop, Pause (Cancel pause
 // while pausing) and Continue, each usable when the run answer allows it. ---
 
-export const ACTION_LABEL = { 'stop': 'Stop', 'pause': 'Pause', 'cancel-pause': 'Cancel pause', 'continue': 'Continue', 'skip': 'Skip', 'unskip': 'Un-skip', 'retry': 'Retry' };
+export const ACTION_LABEL = { 'stop': 'Stop', 'pause': 'Pause', 'cancel-pause': 'Cancel pause', 'continue': 'Continue', 'skip': 'Skip', 'unskip': 'Un-skip', 'retry': 'Retry', 'edit-brief': 'Edit brief' };
 const FINISHED = new Set(['done', 'finished-with-skips']);
 
 // Asks the user to confirm in the page's dialog: `title`, `text`, and `ok`, the confirming button's label.
@@ -187,7 +187,8 @@ export function renderProgress(el, note, progress) {
 // A conflict session opens in it like a task, without the Brief tab: it has no brief. Under the facts, the
 // task's actions that the run answer allows now; `onAction(selection, task, action, extra)` sends one and
 // resolves to `{ ok, error }`, or to null when the user did not confirm it. Retry opens a form first, for
-// the mode and a note; its request carries them in `extra`.
+// the mode and a note; its request carries them in `extra`. Edit brief turns the Brief tab into a text box,
+// whose Save sends the text as `extra.brief`.
 // `onClose(hadFocus)` is called when it closes. ---
 
 export function createDrawer(root, { onClose, onAction }) {
@@ -202,6 +203,13 @@ export function createDrawer(root, { onClose, onAction }) {
   const retryHint = retryForm.querySelector('.retry-hint');
   const retrySubmit = retryForm.querySelector('[type="submit"]');
   const retryMessage = retryForm.querySelector('.admin-msg');
+  const briefBar = root.querySelector('.brief-bar');
+  const briefEdit = briefBar.querySelector('.brief-edit');
+  const briefView = root.querySelector('.brief-view');
+  const briefForm = root.querySelector('.brief-editor');
+  const briefText = briefForm.querySelector('textarea');
+  const briefSave = briefForm.querySelector('[type="submit"]');
+  const briefMessage = briefForm.querySelector('.admin-msg');
   const tabs = [...root.querySelectorAll('[role="tab"]')];
   const panels = Object.fromEntries(tabs.map(t => [t.dataset.tab, document.getElementById(t.getAttribute('aria-controls'))]));
   const feed = panels.activity;
@@ -247,6 +255,7 @@ export function createDrawer(root, { onClose, onAction }) {
     setHtml(facts, taskFacts(task));
     renderActions();
     renderRetryForm();
+    renderBriefEditor();
   }
 
   // Skip and Un-skip share a slot, so the focus stays on the button as one turns into the other. A button
@@ -256,6 +265,7 @@ export function createDrawer(root, { onClose, onAction }) {
     actionBox.hidden = !actions.length && !actionMessage.textContent;
     const html = actions.map(action => `<button type="button" class="btn" data-slot="${action === 'unskip' ? 'skip' : action}" data-action="${action}"` +
       (action === 'retry' ? ` aria-expanded="${!retryForm.hidden}" aria-controls="retry-form"` : '') +
+      (action === 'edit-brief' ? ` aria-expanded="${!briefForm.hidden}" aria-controls="brief-editor"` : '') +
       ` aria-disabled="${!!busy}">${ACTION_LABEL[action] || action}${busy === action ? '…' : ''}</button>`).join('');
     const focused = actionButtons.contains(document.activeElement) ? document.activeElement.dataset.slot : null;
     if (setHtml(actionButtons, html) && focused) (actionButtons.querySelector(`[data-slot="${focused}"]`) || root).focus();
@@ -333,6 +343,7 @@ export function createDrawer(root, { onClose, onAction }) {
     const button = e.target.closest('[data-action]');
     if (!button || button.getAttribute('aria-disabled') === 'true' || busy) return;
     if (button.dataset.action === 'retry') return retryForm.hidden ? openRetryForm() : closeRetryForm(false);
+    if (button.dataset.action === 'edit-brief') return openBriefEditor();
     const action = button.dataset.action, asked = generation;
     busy = action;
     actionMessage.textContent = '';
@@ -383,8 +394,80 @@ export function createDrawer(root, { onClose, onAction }) {
     const asked = generation;
     const text = await getFile(selection, task.id, 'brief').catch(() => undefined);
     if (text === undefined || asked !== generation) return;
-    setHtml(panels.brief, text === null ? '<p class="empty">No brief file for this task.</p>' : md(text));
+    setHtml(briefView, text === null ? '<p class="empty">No brief file for this task.</p>' : md(text));
   }
+
+  // --- The brief editor, for a task the run answer allows it (`edit-brief`). It loads the brief as it is now
+  // and stays open, with the text, until it is saved, cancelled, or the drawer shows another task: a task that
+  // starts meanwhile keeps the editor, and its save is refused with the reason. ---
+
+  function renderBriefEditor() {
+    briefBar.hidden = !(task.actions || []).includes('edit-brief') || !briefForm.hidden;
+    briefEdit.setAttribute('aria-expanded', String(!briefForm.hidden));
+    briefSave.setAttribute('aria-disabled', String(busy === 'edit-brief'));
+    briefSave.textContent = busy === 'edit-brief' ? 'Save…' : 'Save';
+  }
+
+  async function openBriefEditor() {
+    show('brief');
+    if (!briefForm.hidden) return briefText.focus();
+    const asked = generation;
+    const text = await getFile(selection, task.id, 'brief').catch(() => undefined);
+    if (asked !== generation || !briefForm.hidden) return;
+    if (text === undefined) {
+      actionMessage.textContent = 'Edit brief failed: the brief could not be read';
+      return renderActions();
+    }
+    briefText.value = text ?? '';
+    briefMessage.textContent = '';
+    briefForm.hidden = false;
+    briefView.hidden = true;
+    renderActions();
+    renderBriefEditor();
+    briefText.focus();
+    briefText.setSelectionRange(0, 0);
+    briefText.scrollTop = 0;
+  }
+
+  // `focusBack`: the focus goes back to an Edit button, or to the drawer when none is left.
+  function closeBriefEditor(focusBack) {
+    briefForm.hidden = true;
+    briefView.hidden = false;
+    briefText.value = '';
+    briefMessage.textContent = '';
+    renderActions();
+    renderBriefEditor();
+    if (focusBack) (!briefBar.hidden ? briefEdit : actionButtons.querySelector('[data-action="edit-brief"]') || root).focus();
+  }
+
+  briefEdit.addEventListener('click', openBriefEditor);
+  // While a save is on its way the editor stays, so that a refusal is seen. Esc closes the editor only, not
+  // the drawer.
+  briefForm.querySelector('.brief-cancel').addEventListener('click', () => { if (busy !== 'edit-brief') closeBriefEditor(true); });
+  briefForm.addEventListener('keydown', e => {
+    if (e.key !== 'Escape') return;
+    e.stopPropagation();
+    if (busy !== 'edit-brief') closeBriefEditor(true);
+  });
+  briefForm.addEventListener('submit', async e => {
+    e.preventDefault();
+    if (busy) return;
+    const asked = generation;
+    busy = 'edit-brief';
+    briefMessage.textContent = '';
+    renderActions();
+    renderBriefEditor();
+    const result = await onAction(selection, task, 'edit-brief', { brief: briefText.value });
+    if (asked !== generation) return;
+    busy = null;
+    if (result?.ok) {
+      loadBrief();
+      return closeBriefEditor(briefForm.contains(document.activeElement));
+    }
+    if (result) briefMessage.textContent = `Edit brief refused: ${result.error}`;
+    renderActions();
+    renderBriefEditor();
+  });
 
   // Opens the drawer on `next`, a task of the run `sel`, on `nextTab`; without one, a drawer already open
   // keeps its tab.
@@ -399,12 +482,16 @@ export function createDrawer(root, { onClose, onAction }) {
       retryForm.hidden = true;
       retryNote.value = '';
       retryMessage.textContent = '';
+      briefForm.hidden = true;
+      briefView.hidden = false;
+      briefText.value = '';
+      briefMessage.textContent = '';
       reportKey = null;
       groups = new Map();
       following = true;
       feed.replaceChildren();
       panels.report.replaceChildren();
-      setHtml(panels.brief, '');
+      setHtml(briefView, '');
       stopFeed = readFeed(selection, next.id, onFeed);
     }
     task = next;

@@ -185,7 +185,8 @@ function writeControl(runDir, control) {
 function writeWhole(file, text) {
     const temp = `${file}.${process.pid}.tmp`;
     fs.writeFileSync(temp, text);
-    withRetry(() => fs.renameSync(temp, file));
+    try { withRetry(() => fs.renameSync(temp, file)); }
+    catch (err) { fs.rmSync(temp, { force: true }); throw err; }
 }
 
 function stamp(date = new Date()) {
@@ -488,15 +489,16 @@ function snapshotOf(runDir, queue) {
 const FINISHED = new Set(['done', 'finished-with-skips']);
 
 // Why a task action is not allowed now, or null when it is. Skip needs a task that has not started, in no
-// group that has started; un-skip a task marked to be skipped that has no SKIPPED report yet; retry a failed
-// or stopped task while no runner is alive (`busy` says why one is, as for Continue).
+// group that has started, and so does a brief edit; un-skip a task marked to be skipped that has no SKIPPED
+// report yet; retry a failed or stopped task while no runner is alive (`busy` says why one is, as for Continue).
 function taskRefusal(action, task, finished, control, busy) {
     if (finished) return 'the run is finished';
     if (action === 'retry') return !['failed', 'stopped'].includes(task.state) ? 'the task has not failed or stopped' : busy;
     if (task.state === 'skipped') return 'the task is skipped: it has its SKIPPED report';
     const marked = skipList(control).includes(task.id);
     if (action === 'unskip') return marked ? null : 'the task is not marked to be skipped';
-    if (marked) return 'the task is already marked to be skipped';
+    // A task marked to be skipped can still have its brief edited.
+    if (marked && action === 'skip') return 'the task is already marked to be skipped';
     if (task.state !== 'pending') return 'the task has started';
     if (task.groupStarted) return "the task's group has started";
     return null;
@@ -661,7 +663,7 @@ function moduleFile(pathname) {
 // --- Admin actions: POST /api/admin { project, run, action }, with `task` for a task action. ---
 
 const RUN_ACTIONS = ['stop', 'pause', 'cancel-pause', 'continue'];
-const TASK_ACTIONS = ['skip', 'unskip', 'retry'];
+const TASK_ACTIONS = ['skip', 'unskip', 'retry', 'edit-brief'];
 const RETRY_MODES = ['resume', 'fresh'];
 const NOTE_MAX = 4000;
 
@@ -704,30 +706,32 @@ async function handleAdmin(req, res) {
     let body;
     try { body = JSON.parse(text); } catch { return send(res, 400, { error: 'the request is not JSON' }); }
     if (!body || typeof body !== 'object') return send(res, 400, { error: 'the request is not a JSON object' });
-    const { project, run, action, task, mode, note = '' } = body;
+    const { project, run, action, task, mode, note = '', brief } = body;
     if (typeof project !== 'string' || typeof run !== 'string' || !NAME_RE.test(project) || !NAME_RE.test(run)) return send(res, 400, { error: 'no valid project and run' });
     const forTask = TASK_ACTIONS.includes(action);
     if (!forTask && !RUN_ACTIONS.includes(action)) return send(res, 400, { error: `unknown action '${String(action)}'` });
     if (forTask && (typeof task !== 'string' || !TASK_ID_RE.test(task))) return send(res, 400, { error: 'no valid task' });
     if (action === 'retry' && !RETRY_MODES.includes(mode)) return send(res, 400, { error: 'no valid retry mode: resume or fresh' });
     if (action === 'retry' && (typeof note !== 'string' || note.length > NOTE_MAX)) return send(res, 400, { error: `the note is not text of at most ${NOTE_MAX} characters` });
+    if (action === 'edit-brief' && typeof brief !== 'string') return send(res, 400, { error: 'the brief is not text' });
+    if (action === 'edit-brief' && !brief.trim()) return send(res, 400, { error: 'the brief is empty' });
     const runDir = runDirFrom(new URLSearchParams({ project, run }));
     if (!runDir) return send(res, 404, { error: 'unknown run' });
     const queue = readQueue(runDir);
     if (!queue) return send(res, 404, { error: 'unreadable queue.json' });
     if (forTask && !(queue.tasks || []).some(t => t.id === task)) return send(res, 400, { error: `unknown task '${task}'` });
-    return inTurn(runDir, () => applyAdmin(res, runDir, queue, action, task, forTask, { mode, note: note.trim() }));
+    return inTurn(runDir, () => applyAdmin(res, runDir, queue, action, task, forTask, { mode, note: note.trim(), brief }));
 }
 
-// `retry` is a retry's `{ mode, note }`.
-async function applyAdmin(res, runDir, queue, action, task, forTask, retry) {
+// `extra` is a retry's `{ mode, note }` and an edit's `brief`.
+async function applyAdmin(res, runDir, queue, action, task, forTask, extra) {
     await refreshLiveness();
     const { lines, control, problem, detail, admin } = snapshotOf(runDir, queue);
     if (!admin.supported) return send(res, 409, { error: "this run folder's runner copy predates admin actions" });
     if (problem) appendProgress(runDir, `admin: control.json ignored (${problem})`);
     const target = forTask && detail.tasks.find(t => t.id === task);
     const refusal = forTask ? admin.taskRefusals[task][action]
-        || (action === 'retry' && retry.mode === 'resume' && !attemptSession(lines, target) ? 'the task has no session to resume' : null)
+        || (action === 'retry' && extra.mode === 'resume' && !attemptSession(lines, target) ? 'the task has no session to resume' : null)
         : admin.refusals[action];
     if (refusal) {
         appendProgress(runDir, `admin: ${action} refused (${forTask ? `task ${task}: ` : ''}${refusal})`);
@@ -753,7 +757,12 @@ async function applyAdmin(res, runDir, queue, action, task, forTask, retry) {
         writeControl(runDir, { ...control, skip: skipList(control).filter(id => id !== task) });
         appendProgress(runDir, `admin: unskip requested (task ${task})`);
     } else if (action === 'retry') {
-        retryTask(runDir, lines, control, target, retry);
+        retryTask(runDir, lines, control, target, extra);
+    } else if (action === 'edit-brief') {
+        // Stored as typed. The runner reads the brief when it starts the task, so the check above and this
+        // write leave a window of milliseconds in which a start misses the edit: accepted (spec, Further Notes).
+        writeWhole(path.join(runDir, 'tasks', `${task}.md`), extra.brief);
+        appendProgress(runDir, `admin: brief edited (task ${task})`);
     }
     return send(res, 200, { ok: true, action });
 }

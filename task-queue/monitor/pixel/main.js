@@ -42,7 +42,7 @@ const drawer = createDrawer(document.getElementById('drawer'), {
     if (hadFocus && opener?.isConnected) opener.focus();
     opener = null;
   },
-  // Skip asks for confirmation first; Un-skip and Retry do not. The page then shows what happened from its
+  // Skip asks for confirmation first; Un-skip, Retry and Edit brief do not. The page then shows what happened from its
   // next poll.
   async onAction(selection, task, action, extra = {}) {
     if (action === 'skip' && !await confirmAction({

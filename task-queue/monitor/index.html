@@ -201,10 +201,15 @@ pre.plain { margin: 0; max-height: 50vh; overflow: auto; padding: 8px 10px; back
 .retry-form fieldset { display: grid; gap: 2px; margin: 0; padding: 0; border: 0; min-width: 0; }
 .retry-form legend { padding: 0; margin-bottom: 4px; font: 700 11px/1.4 var(--mono); text-transform: uppercase; letter-spacing: .05em; }
 .retry-mode { display: flex; gap: 6px; align-items: baseline; font-size: 13px; cursor: pointer; }
-.retry-note-label { font-size: 13px; font-weight: 600; }
+.retry-note-label, .brief-text-label { font-size: 13px; font-weight: 600; }
 .retry-form textarea { width: 100%; min-height: 4.5em; resize: vertical; padding: 4px 6px; font: 13px/1.4 "Segoe UI", system-ui, sans-serif;
   color: var(--text); background: var(--panel); border: 2px solid var(--frame); }
 .retry-hint { margin: 0; font-size: 12px; }
+/* The brief editor, in the Brief tab: the brief as text, then Save and Cancel. */
+.brief-bar { display: flex; justify-content: flex-end; margin-bottom: 6px; }
+.brief-editor { display: grid; gap: 6px; }
+.brief-editor textarea { width: 100%; min-height: 12em; resize: vertical; padding: 4px 6px; font: 12px/1.45 var(--mono);
+  color: var(--text); background: var(--panel); border: 2px solid var(--frame); }
 
 /* The confirmation dialog, in the page's pixel style. */
 .confirm { max-width: min(420px, calc(100vw - 32px)); padding: 14px 16px; color: var(--text); background: var(--panel);
@@ -328,7 +333,19 @@ details.agent > summary { cursor: pointer; font-size: 12px; color: var(--muted);
     </div>
     <div class="tab-panel feed" id="panel-activity" role="tabpanel" aria-labelledby="tab-activity" tabindex="0"></div>
     <div class="tab-panel" id="panel-report" role="tabpanel" aria-labelledby="tab-report" tabindex="0" hidden></div>
-    <div class="tab-panel" id="panel-brief" role="tabpanel" aria-labelledby="tab-brief" tabindex="0" hidden></div>
+    <div class="tab-panel" id="panel-brief" role="tabpanel" aria-labelledby="tab-brief" tabindex="0" hidden>
+      <div class="brief-bar" hidden><button type="button" class="btn brief-edit" aria-controls="brief-editor" aria-expanded="false">Edit</button></div>
+      <div class="brief-view"></div>
+      <form class="brief-editor" id="brief-editor" aria-labelledby="brief-text-label" hidden>
+        <label class="brief-text-label" id="brief-text-label" for="brief-text">Brief <span class="muted">(markdown)</span></label>
+        <textarea id="brief-text" rows="14" spellcheck="false"></textarea>
+        <div class="control-buttons">
+          <button type="submit" class="btn">Save</button>
+          <button type="button" class="btn brief-cancel">Cancel</button>
+        </div>
+        <p class="admin-msg" role="status"></p>
+      </form>
+    </div>
   </section>
   <dialog class="confirm" id="confirm" aria-labelledby="confirm-title" aria-describedby="confirm-text">
     <form method="dialog">
