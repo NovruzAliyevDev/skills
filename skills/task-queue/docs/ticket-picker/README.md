@@ -14,4 +14,4 @@ Tickets 02 and 03 do not depend on each other. Both touch `new-queue` and the pi
 
 ## Status
 
-01 is done. Its last criterion is only partly met: the picker queue ran to the end with the stub, but the earlier specs' checks could not be re-run, because their scripts and run folders in `%TEMP%	ask-queue-monitor-fixtures` are gone and were not rebuilt.
+01 is done. Its last criterion is only partly met: the picker queue ran to the end with the stub, but the earlier specs' checks could not be re-run, because their scripts and run folders in `%TEMP%\task-queue-monitor-fixtures` are gone and were not rebuilt.
