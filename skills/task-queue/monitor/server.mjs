@@ -99,26 +99,48 @@ function ensureLiveness() {
     if (Date.now() - liveness.at > LIVENESS_MS) refreshLiveness();
 }
 
-// The runner runs each task of a parallel group in a child process, `run.ps1 ... -ParallelTask "<id>"`.
-const PARALLEL_TASK_RE = /-ParallelTask\s+"?([A-Za-z0-9_-]+)"?/i;
+// The runner runs each task of a parallel group in a child process: the Node runner as
+// `run.mjs ... --parallel-task <id>`, a legacy one as `run.ps1 ... -ParallelTask "<id>"`.
+const PARALLEL_TASK_RE = /(?:--parallel-task|-ParallelTask)\s+"?([A-Za-z0-9_-]+)"?/i;
+
+// Command lines and paths compare as the platform's file system compares names.
+const CASELESS = process.platform === 'win32' || process.platform === 'darwin';
+const fold = text => (CASELESS ? text.toLowerCase() : text);
+
+// The processes that run a run folder's runner file, its parallel children included: `node` running its
+// `run.mjs`, or, on Windows, PowerShell running a legacy `run.ps1`.
+function runnerProcesses(processes, runDir) {
+    const node = fold(path.join(runDir, 'run.mjs'));
+    const legacy = fold(path.join(runDir, 'run.ps1'));
+    return processes.filter(p => (/^node(\.exe)?$/i.test(p.name) && fold(p.commandLine).includes(node)) ||
+        (process.platform === 'win32' && /^(powershell|pwsh)\.exe$/i.test(p.name) && fold(p.commandLine).includes(legacy)));
+}
+
+// A session is a `claude` process, or a Node process running Claude Code's npm package.
+const isSession = p => /^claude(\.exe)?$/i.test(p.name) || /@anthropic-ai[\\/]claude-code/i.test(p.commandLine);
+
+// Whether a session process is alive below `parent`, at most two levels down: `claude.cmd` puts a cmd.exe
+// between the runner and the session.
+function sessionBelow(processes, parent) {
+    const children = processes.filter(p => p.ppid === parent);
+    return children.some(isSession) || children.some(c => processes.some(p => p.ppid === c.pid && isSession(p)));
+}
 
 // The run's runner process, and which tasks have a session process alive: a session of the runner itself
 // belongs to the sequential task it runs (`main`), one of a parallel task's child process to that task
 // (`tasks`). `tasks` lists the parallel tasks whose child process lives, each with whether its session does.
 // Only the first four fields are answered by the API.
-// A runner with the run lock (`locked`) is the process its lock names: the window the skill opens outlives
-// the script in it (-NoExit), but the script removes its lock when it ends.
+// A runner with the run lock (`locked`) is the process its lock names: the window that runs it outlives
+// the script in it (cmd /k), but the script removes its lock when it ends.
 function runnerOf(runDir, locked = false) {
     if (!liveness.at) return { known: false };
-    const script = path.join(runDir, 'run.ps1').toLowerCase();
-    const isShell = p => /^(powershell|pwsh)\.exe$/i.test(p.name);
-    const scripts = liveness.processes.filter(p => isShell(p) && p.commandLine.toLowerCase().includes(script));
+    const scripts = runnerProcesses(liveness.processes, runDir);
     const holder = locked ? lockHolder(runDir) : null;
     const runner = locked
         ? scripts.find(p => p.pid === holder && !PARALLEL_TASK_RE.test(p.commandLine))
         : scripts.find(p => !PARALLEL_TASK_RE.test(p.commandLine));
     if (!runner) return { known: true, alive: false };
-    const sessionOf = parent => liveness.processes.some(p => /^claude\.exe$/i.test(p.name) && p.ppid === parent);
+    const sessionOf = parent => sessionBelow(liveness.processes, parent);
     const main = sessionOf(runner.pid);
     const tasks = new Map();
     for (const child of scripts) {
@@ -137,10 +159,13 @@ const publicRunner = ({ known, alive, session, pid }) => ({ known, alive, sessio
 
 // The control contract this server speaks; a run folder whose runner copy names it gets admin actions.
 const CONTROL_VERSION = 1;
-const MARKER_RE = /^# task-queue control contract: (\d+)\s*$/m;
+const MARKER_RE = /^(?:#|\/\/) task-queue control contract: (\d+)\s*$/m;
+
+// The run folder's runner file: `run.mjs`, or the `run.ps1` of a legacy run folder.
+const runnerFileOf = runDir => (statOrNull(path.join(runDir, 'run.mjs')) ? 'run.mjs' : 'run.ps1');
 
 function supportsAdmin(runDir) {
-    const runner = readText(path.join(runDir, 'run.ps1'));
+    const runner = readText(path.join(runDir, runnerFileOf(runDir)));
     return Number(MARKER_RE.exec(runner || '')?.[1]) === CONTROL_VERSION;
 }
 
@@ -210,19 +235,25 @@ function starting(runDir, runner, lines) {
     return false;
 }
 
-// Why the run folder's runner cannot be launched on this computer, or null. A run folder's runner is still the
-// PowerShell `run.ps1`, which only Windows runs.
+// Why the run folder's runner cannot be launched on this computer, or null. A legacy run folder's runner is
+// the PowerShell `run.ps1`, which only Windows runs.
 function launchRefusal(runDir) {
-    return process.platform === 'win32' ? null : "this run folder's runner is a PowerShell script";
+    if (runnerFileOf(runDir) === 'run.mjs' || process.platform === 'win32') return null;
+    return "this run folder's runner is a PowerShell script";
 }
 
-// Opens the run folder's runner in a new visible window, as the skill does, and counts it as starting.
-// Rejects with the reason when the window could not be opened; the caller writes the admin line.
+// Opens the run folder's runner in a new visible window, as the skill does, and counts it as starting:
+// `node run.mjs`, or a legacy folder's `run.ps1` through powershell.exe. Rejects with the reason when the
+// window could not be opened; the caller writes the admin line.
 async function launchRunner(runDir) {
     const refusal = launchRefusal(runDir);
     if (refusal) throw new Error(refusal);
-    await openWindow({ title: `Task queue: ${path.basename(runDir)}`, cwd: runDir, command: 'powershell.exe',
-        args: ['-NoProfile', '-File', path.join(runDir, 'run.ps1')] });
+    const title = `Task queue: ${path.basename(runDir)}`;
+    if (runnerFileOf(runDir) === 'run.mjs') {
+        await openWindow({ title, cwd: runDir, command: process.execPath, args: [path.join(runDir, 'run.mjs')] });
+    } else {
+        await openWindow({ title, cwd: runDir, command: 'powershell.exe', args: ['-NoProfile', '-File', path.join(runDir, 'run.ps1')] });
+    }
     launches.set(runDir, Date.now());
 }
 
@@ -762,7 +793,7 @@ async function applyAdmin(res, runDir, queue, action, task, forTask, extra) {
     } else if (action === 'continue') {
         // The new runner must not pause at once on a pause the user asked of the one before.
         if (control.pause) writeControl(runDir, { ...control, pause: false });
-        appendProgress(runDir, 'admin: continue - run.ps1 launched in a new window');
+        appendProgress(runDir, `admin: continue - ${runnerFileOf(runDir)} launched in a new window`);
         if (!(await launchOrAnswer(res, runDir))) return;
     } else if (action === 'skip') {
         writeControl(runDir, { ...control, skip: [...skipList(control), task] });
@@ -1373,7 +1404,9 @@ async function newQueue(res, repo, keys, settings) {
         const { project, permissionMode, model, effort } = settings;
         // Written whole: the monitor lists any folder with a queue.json as a run.
         writeWhole(path.join(runDir, 'queue.json'), JSON.stringify({ project, workDir: repo.path, permissionMode, model, effort, tasks }, null, 2));
-        fs.copyFileSync(path.join(HERE, '..', 'runner.ps1'), path.join(runDir, 'run.ps1'));
+        // The run folder works without the skill folder: the runner imports the platform module beside it.
+        fs.copyFileSync(path.join(HERE, '..', 'runner.mjs'), path.join(runDir, 'run.mjs'));
+        fs.copyFileSync(path.join(HERE, '..', 'platform.mjs'), path.join(runDir, 'platform.mjs'));
         const queue = readQueue(runDir);
         if (!queue || !statOrNull(queue.workDir)?.isDirectory()) throw new Error('queue.json does not read back with an existing workDir');
         const missing = queue.tasks.find(t => !statOrNull(path.join(runDir, 'tasks', `${t.id}.md`)));
@@ -1528,9 +1561,11 @@ server.listen(PORT, HOST, () => {
 setInterval(async () => {
     if (Date.now() - lastRequestAt < IDLE_EXIT_MS) return;
     await refreshLiveness();
-    const root = ROOT.toLowerCase();
-    const anyRunner = liveness.processes.some(p => /^(powershell|pwsh)\.exe$/i.test(p.name) &&
-        p.commandLine.toLowerCase().includes(root) && /run\.ps1/i.test(p.commandLine));
+    // A Node runner or, on Windows, a legacy one, of a run folder under the queue root.
+    const root = fold(ROOT);
+    const anyRunner = liveness.processes.some(p => fold(p.commandLine).includes(root) &&
+        ((/^node(\.exe)?$/i.test(p.name) && /run\.mjs/i.test(p.commandLine)) ||
+         (process.platform === 'win32' && /^(powershell|pwsh)\.exe$/i.test(p.name) && /run\.ps1/i.test(p.commandLine))));
     if (!anyRunner) {
         console.log('Idle for 2 hours with no running queue; exiting.');
         process.exit(0);
