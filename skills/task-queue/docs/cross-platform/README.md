@@ -83,3 +83,62 @@ For `check-picker.mjs` on a Mac, only its register, reading, refusal and monitor
   - Two full runs of `check-parity.mjs` failed `git status` in two or three parallel scenarios: a merged file listed as modified in one runner's repository, sometimes the `run.ps1` one, sometimes the `run.mjs` one, and clean when run alone. This machine has `core.autocrlf=true`: the merge wrote the files with CRLF while the index kept the LF size, and whether `git status` saw that depended on timing. The check now sets `core.autocrlf false` in its throwaway repositories, and 426 of 426 pass. It was never a difference between the runners.
   - On a Mac, a session started through an npm-installed `claude` runs as `node <bin>/claude`, whose command line may not name `@anthropic-ai/claude-code` (the bin is a link). The monitor may then show such sessions as `no-session`, as it shows the picker's stub. Ticket 05 should look at it.
   - On a Mac, killing a runner leaves its Terminal window open; the checks cannot close those windows by killing processes.
+
+05: the Windows part ran on 2026-10-17 with real sessions; see "Real check (ticket 05)" below. It stays `in-progress`: the macOS part has not run, and nobody looked at the Windows runner window's colours.
+
+- Ran on Windows: the ticket picker's real check (three tickets, all `done`), a chat-flow queue with one parallel group of two tasks (both merged, worktrees and branches removed), the runner window's title by process information, and a legacy `run.ps1` run folder shown, stopped and continued through the monitor with the stub.
+- No bug of the plugin was found.
+- Not done: the runner window's colours were not looked at, because the screenshot of Windows Terminal was refused. Everything on macOS: the steps are listed at the end of the section below.
+
+## Real check (ticket 05)
+
+### Windows
+
+Run on 2026-10-17 on Windows 11 with Claude Code 2.1.302, the plugin at 2.0.0 run from this repository's `skills` folder (not installed through `claude plugin install`, so that the user's installed plugin stayed as it was). Real sessions: model `sonnet` (the preflight read `claude-sonnet-5-5`), mode `auto`, effort unset. Everything ran under `%TEMP%\cross-platform-real-check`, with `TASK_QUEUE_ROOT` set to its `root` folder and `TASK_QUEUE_MONITOR_PORT=4870`, so `~/.claude-queues` and port 4747 were not touched. The pages were read and driven in Claude's browser pane; the pane was hidden at the time, so the work went by page text and element references, not by sight.
+
+**The ticket picker.** The scratch repository `CrossPlatformPicker` is the starting commit of the ticket picker's real check: a tiny Node.js library (`add` and one `node --test` test), a `CLAUDE.md` asking for a test per function and one commit per task with the ticket file included, and `.scratch` holding `math` (01 `multiply`; 02 `divide`, `Blocked by: 01`) and `text` (01 `shout`), all `ready-for-agent`.
+
+- The skill's steps by hand: `git rev-parse --show-toplevel`; `register.mjs` printed `CrossPlatformPicker`; `ensure-monitor.mjs` without `--open` printed `Started the monitor (version 6) on port 4870.`; the picker was opened at `#new:CrossPlatformPicker` in the browser pane.
+- Picking `math 02` alone showed `math 02 is blocked by math 01 Multiply, which is neither picked nor done.` and Start was refused. With all three picked, the order read `01 math 01 Multiply`, `02 math 02 Divide`, `03 text 01 Shout`. Model `sonnet` typed, then Start.
+- At once: the run folder `CrossPlatformPicker\20261017-0325` with `run.mjs`, `platform.mjs`, `ticket` fields and no groups, the three tickets `queued` in the state file, `.scratch/queue-state.json*` in `.git/info/exclude`, `git status` clean. The runner ran as `cmd.exe /d /s /k "node.exe …\run.mjs"`, and its Windows Terminal window was titled `Task queue: CrossPlatformPicker (3 tasks)`.
+- `All 3 tasks DONE` in 1 minute 20 seconds. The state file said `done` for all three, each still tied to its run and task, in two-space JSON. Each ticket file said `Status: done` with no criterion left unticked. `git status` was clean, and the history held `Add multiply`, `Add divide` and `Add shout` over the starting commit. `node --test` passed 5 of 5. The run view showed `DONE`, 3 commits, cost $0.36. The picker then showed the three `DONE` with the run's name, and no checkbox enabled.
+
+Cost: $0.36 ($0.12, $0.12, $0.12).
+
+**The chat flow.** The scratch repository `CrossPlatformChat`: `add.js` and `add.test.js`, and a `CLAUDE.md` asking for a test next to each function and one commit per task. Following `task-queue` steps 4 and 5 by hand, the run folder `root\CrossPlatformChat\20261017-0331` got two briefs (01 `subtract` in `subtract.js`, 02 `negate` in `negate.js`, each with its test and touching no other file) and a `queue.json` with `parallel: [["01", "02"]]`, `maxParallel` 5, model `sonnet`, and `workDir` with doubled backslashes. No `run.mjs` was written.
+
+- `launch.mjs --check` printed `workDir`, `exists: true` and `2 task(s), each with its brief.`, exit 0. `launch.mjs` copied `runner.mjs` and `platform.mjs` in, opened the runner window, found the monitor running and exited 0. It was run with `ComSpec` pointing at `check-launch.mjs`'s shim (`%TEMP%\task-queue-monitor-fixtures\launch\comspec-shim.exe`), so that the monitor's page did not open in the user's real browser. The shim's log shows the window's `start "Task queue: 20261017-0331" …` line and the browser's `start "" "http://127.0.0.1:4870/"` line.
+- While the group ran: the runner, a `node run.mjs --parallel-task 01` and a `--parallel-task 02` child, and a `claude.exe` session below each child. The window was titled `Task queue: CrossPlatformChat (2 tasks)`, and the run view showed `runner pid …, session alive` and `MERGE 01-02 · WAITING`.
+- Both tasks `DONE`, then `merged 01`, `merged 02`, `merge DONE`, and `All 2 tasks DONE`. The history: `Add subtract` on `main`, `Add negate` on its branch, and a merge commit. No `queue/…` branch and no worktree were left, `git status` was clean, and `node --test` passed 3 of 3. The run view showed `DONE`, `MERGE 01-02 · MERGED`, cost $0.30.
+
+Cost: $0.30 ($0.14, $0.16). It took 10 minutes 40 seconds instead of under a minute, because of the shim (see Unexpected).
+
+**The window.** Both runner windows opened as tabs of Windows Terminal, titled `Task queue: <project> (<n> tasks)`, as the PowerShell runner's were. The colours were not seen. The screenshot needs access to Windows Terminal, and that request was refused, so nobody looked at the window.
+
+**A legacy run folder** (stub, no real session). The run folder `legacy-root\LegacyCheck\20261001-1200` held `run.ps1` copied from `fixtures\legacy\runner.ps1`, a `queue.json` and one brief with `STUB-HOLD`. The monitor ran on port 4871 with the fixtures' parity stub first on its `PATH`.
+
+- The monitor showed it `NOT STARTED`, with its Stop, Pause and Continue buttons.
+- Continue: `admin: continue - run.ps1 launched in a new window`, `cmd.exe /k "powershell.exe -NoProfile -File …\run.ps1"`, the window titled `Task queue: LegacyCheck (1 tasks)`, and the run view showing `runner pid …, session alive`.
+- Stop, confirmed in the dialog: `the runner (process …) and its sessions were killed`, `task 01 cut off, to resume on Continue (session s01-1, …)`, `Queue - STOPPED (by the user)`. The runner and the stub's processes were gone.
+- With the hold released, Continue: `resume applied`, the stub called with `--resume s01-1`, `All 1 tasks DONE`, and the run view showed `DONE`.
+
+Afterwards, every runner window and both monitors were closed, and the browser pane's tab too. The scratch folders are left in `%TEMP%\cross-platform-real-check`.
+
+Unexpected:
+
+- In the chat flow, `npm test` did not work in either session: it printed `Microsoft Windows [Version …]` and waited at a `cmd` prompt. From Bash it hung until the tool's timeout. Both sessions then ran `node --test` (which passed), said so in their reports, and committed. The cause is the check's own set-up, not the plugin. `launch.mjs` passes its environment on to the runner window, so the sessions' `ComSpec` was the shim. npm treats a script shell not named `cmd.exe` as a POSIX shell and runs it with `-c "node --test"`, and the shim hands that to `cmd.exe`, which ignores `-c` and stays interactive. The picker's queue, started without the shim, ran `npm test` normally. `check-launch.mjs`'s runner inherits the shim the same way; its stub never runs npm, so nothing shows there. A later run of this part should leave `ComSpec` alone and stop the browser some other way, or accept that the page opens once.
+- One session wrote `npmtest.log` into the run folder's `wt` folder, outside its worktree. The runner removed both worktrees but left `wt` with that file in it. This is expected, since the runner removes only what it made.
+- The sessions also ran the user's own Claude Code hook (`claude-hook.cmd` from the user's settings) through `ComSpec`: real sessions bring the user's settings with them.
+- With the browser pane hidden, a click in the page took a few seconds to show. The Stop dialog's button looked as if it had done nothing, until the processes were checked again.
+- On Windows Terminal, the window title belongs to the active tab, so process information shows only the newest runner's title when several are open.
+
+### macOS: still to run
+
+On a Mac with Node.js, git and `claude` on the `PATH`, and this repository at `~/Development/Skills` on the commit that holds 01 to 04:
+
+1. Install the plugin from the repository: `claude plugin marketplace add ~/Development/Skills`, then `claude plugin install novruzaliyev-skills@novruzaliyev`, and start a new session.
+2. The picker: make the same scratch repository, for example by copying `CrossPlatformPicker`'s first commit (`git archive`). Run `/ticket-queue` in it, the real way, with `--open`, so the Automation prompt and the browser come up. Refuse the Automation prompt once, press Start or Continue, and check that the monitor's answer names the Automation error. Then allow it in System Settings > Privacy & Security > Automation, and check that Continue works. Pick all three tickets, model `sonnet`, Start. Check the Terminal window's title (`Task queue: <project> (3 tasks)`) and its coloured lines, the state file (`done` ×3), the ticket files (`Status: done`), `git status` clean, and the three commits.
+3. The chat flow: in a second scratch repository, run `/task-queue` with two small tasks and the notation `[[1,2]]`, model `sonnet`. Check `launch.mjs` opening Terminal (and the second Automation prompt, for the terminal or Claude Code), both tasks merged, and no `wt/` worktree or `queue/…` branch left.
+4. Look at whether the monitor shows the sessions as alive while they run. On a Mac a session may run as `node <bin>/claude`, and the run view may show `no-session` (ticket 04's surprise).
+5. Record the date, the model, the cost per task and anything unexpected here, tick the criteria, and set the ticket's status.
+6. The stub checks of tickets 01 to 04 run on the Mac too: `SKILLS_DIR=~/Development/Skills/skills node check-platform.mjs --windows` (the flag opens a real terminal window), `check-picker.mjs`, `check-node-parallel.mjs` and the `--check` part of `check-launch.mjs`, from a copy of `%TEMP%\task-queue-monitor-fixtures`.

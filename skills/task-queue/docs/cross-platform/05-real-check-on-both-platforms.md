@@ -8,7 +8,9 @@ Read [spec.md](spec.md) first: "Testing Decisions", the manual checks and the re
 
 **Blocked by:** 04
 
-**Status:** ready-for-agent
+**Status:** in-progress
+
+The Windows part ran on 2026-10-17; see "Real check (ticket 05)" in [README.md](README.md). Every criterion below names macOS or both platforms, so none is ticked yet. On Windows, everything in them was met except that nobody looked at the runner window's colours, because no screenshot of it could be taken.
 
 - [ ] On each platform, the plugin is installed from this repository, a scratch repository is made (as in the ticket picker's real check: two features, three tickets, one blocked by another), and `/ticket-queue` opens the picker. All three tickets are started with model `sonnet`. At the end, the state file says `done` for all three, each ticket file says `Status: done`, `git status` is clean, and the tasks' commits are in the history.
 - [ ] On each platform, a chat-flow `/task-queue` with one parallel group of two tasks runs to the end: both merged, worktrees and branches removed.
