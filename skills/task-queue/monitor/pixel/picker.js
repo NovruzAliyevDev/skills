@@ -7,7 +7,6 @@ const NAME_RE = /^[A-Za-z0-9._-]+$/;
 const LAST_REPO = 'task-queue-picker-repo';
 // A status line that is neither of these is shown as a warning; the ticket can still be picked.
 const KNOWN_STATUS = new Set(['ready-for-agent', 'done']);
-
 const two = n => String(n).padStart(2, '0');
 // The task's title as the server makes it: `<feature> <NN> <title>`, without double quotes, at most 60 characters.
 const taskTitle = t => `${t.feature} ${two(t.number)} ${t.title}`.replace(/"/g, '').replace(/\s+/g, ' ').slice(0, 60).trim();
@@ -56,6 +55,11 @@ export function createPicker(root, { onProject, onStarted }) {
   function renderWarnings() {
     const list = [];
     if (!repo().exists) list.push('The repository folder is gone. Forget it, or run the ticket-queue skill again where it now is.');
+    const stateFile = tickets?.stateFile;
+    if (stateFile?.status === 'unreadable') {
+      list.push(`The ticket state file .scratch/queue-state.json is unreadable: ${stateFile.reason}. The tickets follow their Status lines, and nothing writes the file until it is fixed by hand.`);
+    }
+    if (stateFile?.problem) list.push(`${stateFile.problem}.`);
     setHtml(warnings, list.map(w => `<p class="warning">${esc(w)}</p>`).join(''));
   }
 
@@ -68,10 +72,14 @@ export function createPicker(root, { onProject, onStarted }) {
         const warn = t.status && !KNOWN_STATUS.has(t.status)
           ? ` <span class="badge s-warn" title="Its Status line says ${esc(t.status)}, not ready-for-agent">status: ${esc(t.status)}</span>`
           : !t.status ? ' <span class="badge s-warn" title="It has no Status line">no status</span>' : '';
+        // A ticket tied to a run links to it.
+        const held = t.run
+          ? ` <a class="ticket-run" href="#${esc(encodeURIComponent(t.run))}" aria-label="${esc(`${f.name} ${two(t.number)}: ${t.state} in run ${t.run}, task ${t.task}`)}">${esc(t.run.split('/')[1])}</a>`
+          : '';
         return `<li class="ticket-row${selectable ? '' : ' unselectable'}">
           <input type="checkbox" id="${id}" data-key="${esc(t.key)}"${picked.has(t.key) ? ' checked' : ''}${selectable ? '' : ' disabled'}>
           <label for="${id}"><span class="sr-only">${esc(f.name)} </span><b class="num">${two(t.number)}</b> <span class="ticket-title">${esc(t.title)}</span></label>
-          <span class="ticket-badges">${badge(t.state)}${warn}</span></li>`;
+          <span class="ticket-badges">${badge(t.state)}${warn}${held}</span></li>`;
       }).join('');
       return `<section class="feature" aria-labelledby="feature-${fi}"><h3 id="feature-${fi}">${esc(f.name)}</h3>${
         f.tickets.length ? `<ul class="tickets">${rows}</ul>` : '<p class="no-tickets">no tickets</p>'}</section>`;
@@ -154,7 +162,7 @@ export function createPicker(root, { onProject, onStarted }) {
     if (project !== asked) return;
     if (!result.ok) { message.textContent = `Start refused: ${result.error}`; renderOrder(); return; }
     picked = new Set();
-    onStarted({ project: result.project, run: result.run });
+    onStarted({ project: result.project, run: result.run, warning: result.warning });
   });
 
   return {

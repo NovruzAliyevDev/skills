@@ -280,6 +280,9 @@ details.agent > summary { cursor: pointer; font-size: 12px; color: var(--muted);
 .no-tickets { margin: 0 0 6px; color: var(--muted); font-style: italic; }
 .s-todo { background: var(--idle); }
 .s-warn { background: var(--warn); }
+/* A queued ticket waits in a run: outlined in the running colour. */
+.s-queued { background: var(--panel); color: var(--accent); border-color: var(--accent); }
+.ticket-run { font: 700 11px/1.6 var(--mono); color: var(--accent); }
 .picker-settings { display: flex; flex-wrap: wrap; gap: 4px 16px; margin: 14px 0 0; padding: 8px 10px; border: 2px solid var(--line); min-width: 0; }
 .picker-settings input[type="text"] { width: min(12em, 100%); }
 .picker-order { margin: 0 0 10px; padding-left: 0; list-style: none; font-size: 13px; }

@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url';
 
 // The server's version, answered by /api/health. The ticket-queue skill compares it with the server.mjs it
 // ships and replaces a monitor that answers an older one; raise it with every change a skill relies on.
-const VERSION = 2;
+const VERSION = 3;
 const HOST = '127.0.0.1';
 const PORT = Number(process.env.TASK_QUEUE_MONITOR_PORT || 4747);
 const ROOT = process.env.TASK_QUEUE_ROOT || path.join(os.homedir(), '.claude-queues');
@@ -935,11 +935,26 @@ async function hardStop(res, runDir, queue) {
         stopLines.push(`admin: stop - task ${t.id} cut off, to resume on Continue (session ${session}, entry ${resume[t.id].id})`);
     }
     for (const c of conflicts) stopLines.push(`admin: stop - conflict session of group ${c.group} cut off; Continue tries the merge again`);
+    // The tickets of a picker queue's tasks cut off turn failed: no session works on them any more.
+    const ticketOf = new Map((queue.tasks || []).filter(t => typeof t.ticket === 'string').map(t => [t.id, t.ticket]));
+    const cutTickets = cutOff.filter(t => ticketOf.has(t.id));
+    let warning = null;
+    if (cutTickets.length && queue.workDir) {
+        try {
+            await writeState(queue.workDir, entries => {
+                for (const t of cutTickets) entries[ticketOf.get(t.id)] = tiedEntry('failed', runKeyOf(runDir), t.id);
+                return true;
+            });
+        } catch (err) {
+            warning = `the ticket state file could not be updated (${err.message})`;
+            stopLines.push(`admin: stop - ticket state: could not update ${cutTickets.map(t => ticketOf.get(t.id)).join(', ')} (${err.message})`);
+        }
+    }
     writeControl(runDir, { ...control, resume });
     const undone = merging && queue.workDir ? await undoMerge(queue.workDir) : null;
     if (undone) stopLines.push(undone);
     for (const line of [...stopLines, STOPPED_LINE]) appendProgress(runDir, line);
-    return send(res, 200, { ok: true, action: 'stop' });
+    return send(res, 200, { ok: true, action: 'stop', ...(warning ? { warning } : {}) });
 }
 
 // --- Ticket picker: the repository register, a repository's .scratch tickets, and the repository actions. ---
@@ -980,17 +995,14 @@ function safeFiles(dir) {
     catch { return []; }
 }
 
-// A ticket's title is its first `# ` heading without a leading `NN:`, or its file name's slug.
+// A ticket's title is its first `# ` heading without a leading `NN:`, or its file name's slug. Its state is
+// left to ticketsOf.
 function readTicket(feature, issuesDir, name) {
     const [, number, slug] = TICKET_FILE_RE.exec(name);
     const text = readText(path.join(issuesDir, name)) ?? '';
     const heading = /^# (.+)$/m.exec(text)?.[1].replace(/^\d+\s*:\s*/, '').trim();
     const status = STATUS_RE.exec(text)?.[1] ?? null;
-    const state = status === 'done' ? 'done' : 'todo';
-    return {
-        key: `${feature}/issues/${name}`, feature, file: path.join(issuesDir, name), number: Number(number),
-        title: heading || slug, status, state, actions: state === 'todo' ? ['select'] : [],
-    };
+    return { key: `${feature}/issues/${name}`, feature, file: path.join(issuesDir, name), number: Number(number), title: heading || slug, status };
 }
 
 // The repository's features, alphabetically, each with its tickets by number. Read on every call.
@@ -1005,8 +1017,161 @@ function readTickets(repoPath) {
     });
 }
 
-// What /api/tickets answers of a ticket.
-const publicTicket =({ key, number, title, status, state, actions }) => ({ key, number, title, status, state, actions });
+// --- The ticket state file, .scratch/queue-state.json: the server and the runner write it under its lock. ---
+
+const TICKET_STATES = ['todo', 'queued', 'running', 'done', 'failed', 'skipped'];
+// Done, queued and running tickets cannot be picked.
+const SELECTABLE = new Set(['todo', 'failed', 'skipped']);
+const STATE_LOCK_WAIT_MS = 10_000;
+const STATE_LOCK_STALE_MS = 60_000;
+// Covers the lock and the temporary files beside the state file too.
+const EXCLUDE_LINE = '.scratch/queue-state.json*';
+
+const stateFileOf = repoPath => path.join(repoPath, '.scratch', 'queue-state.json');
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+const isObject = value => !!value && typeof value === 'object' && !Array.isArray(value);
+
+// The state file as `{ status, reason, doc }`: `missing`, `valid`, or `unreadable` with the reason. Only a JSON
+// object is valid.
+function readStateFile(repoPath) {
+    const text = readText(stateFileOf(repoPath));
+    if (text === null) return { status: 'missing', reason: null, doc: null };
+    let doc;
+    try { doc = JSON.parse(text); } catch (err) { return { status: 'unreadable', reason: `it is not valid JSON (${err.message})`, doc: null }; }
+    if (!isObject(doc)) return { status: 'unreadable', reason: 'it is not a JSON object', doc: null };
+    return { status: 'valid', reason: null, doc };
+}
+
+// The entries that count, by ticket key: an entry whose state is not a known one counts as none.
+function stateEntries(read) {
+    return Object.fromEntries(Object.entries(isObject(read.doc?.tickets) ? read.doc.tickets : {})
+        .filter(([, e]) => isObject(e) && TICKET_STATES.includes(e.state)));
+}
+
+// An entry with `run` and `task` is tied to that run's task; one without them is manual.
+const isTied = e => typeof e.run === 'string' && typeof e.task === 'string';
+const tiedEntry = (state, run, task) => ({ state, run, task, updatedAt: new Date().toISOString() });
+const runKeyOf = runDir => `${path.basename(path.dirname(runDir))}/${path.basename(runDir)}`;
+
+// How old a lock is: by the time it holds, or its file's time when it holds none.
+function lockAge(lockFile, text) {
+    let time = NaN;
+    try { time = Date.parse(JSON.parse(text).time); } catch { /* no time in it */ }
+    if (Number.isNaN(time)) time = statOrNull(lockFile)?.mtimeMs ?? Date.now();
+    return Date.now() - time;
+}
+
+// Takes the state file's lock: created only if absent, retried for up to 10 s, and taken over when older than
+// 60 s. Answers the lock's text, by which unlockState knows its own lock.
+async function lockState(lockFile) {
+    const mine = JSON.stringify({ pid: process.pid, time: new Date().toISOString(), id: crypto.randomBytes(4).toString('hex') });
+    const until = Date.now() + STATE_LOCK_WAIT_MS;
+    for (;;) {
+        try { fs.writeFileSync(lockFile, mine, { flag: 'wx' }); return mine; }
+        catch (err) { if (!['EEXIST', 'EPERM', 'EACCES'].includes(err.code)) throw err; }
+        const held = readText(lockFile);
+        if (held !== null && lockAge(lockFile, held) > STATE_LOCK_STALE_MS) {
+            // Removed only while it still is the lock judged stale: another writer may have taken it over.
+            if (readText(lockFile) === held) fs.rmSync(lockFile, { force: true });
+            continue;
+        }
+        if (Date.now() >= until) throw new Error('its lock file is held by another writer');
+        await sleep(100);
+    }
+}
+
+function unlockState(lockFile, mine) {
+    if (readText(lockFile) === mine) fs.rmSync(lockFile, { force: true });
+}
+
+// Adds the exclude line to the repository's info/exclude when it is not there yet. A folder that is not a git
+// repository gets none.
+async function excludeStateFile(repoPath) {
+    const found = await runCommand('git', ['-C', repoPath, 'rev-parse', '--git-path', 'info/exclude']);
+    if (!found.ok || !found.out) return;
+    const file = path.resolve(repoPath, found.out.split(/\r?\n/)[0]);
+    const text = readText(file) ?? '';
+    if (text.split(/\r?\n/).some(l => l.trim() === EXCLUDE_LINE)) return;
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.appendFileSync(file, `${text && !text.endsWith('\n') ? '\n' : ''}${EXCLUDE_LINE}\n`);
+}
+
+// Changes the state file under its lock: `change(tickets)` edits the entries in place and answers whether it
+// changed any. The file is read under the lock, so the other writers' entries are kept; a file that is not
+// readable is left as it is. The writer that creates the file first keeps it out of git.
+async function writeState(repoPath, change) {
+    const file = stateFileOf(repoPath), lockFile = `${file}.lock`;
+    const mine = await lockState(lockFile);
+    try {
+        const read = readStateFile(repoPath);
+        if (read.status === 'unreadable') throw new Error(`the state file is unreadable (${read.reason}); it was left as it is`);
+        const doc = read.doc || { version: 1, tickets: {} };
+        if (!isObject(doc.tickets)) doc.tickets = {};
+        if (!change(doc.tickets)) return;
+        if (read.status === 'missing') await excludeStateFile(repoPath);
+        writeWhole(file, `${JSON.stringify(doc, null, 2)}\n`);
+    } finally { unlockState(lockFile, mine); }
+}
+
+// A run's task state as a ticket state. A task pending in a stopped, paused or interrupted run stays queued.
+const TICKET_STATE_OF_TASK = {
+    pending: 'queued', running: 'running', 'no-session': 'running', done: 'done',
+    failed: 'failed', stopped: 'failed', interrupted: 'failed', skipped: 'skipped',
+};
+
+// The ticket state of a tied entry's task in its run; null when the run folder or the task is gone.
+// `tasksByRun` keeps each run folder's derived tasks for one request.
+function tiedState(entry, tasksByRun) {
+    const [project, run, ...rest] = entry.run.split('/');
+    if (rest.length || !NAME_RE.test(project || '') || !NAME_RE.test(run || '')) return null;
+    const runDir = path.join(ROOT, project, run);
+    if (!tasksByRun.has(runDir)) {
+        const queue = readQueue(runDir);
+        tasksByRun.set(runDir, queue ? snapshotOf(runDir, queue).detail.tasks : null);
+    }
+    const task = tasksByRun.get(runDir)?.find(t => t.id === entry.task);
+    return task ? TICKET_STATE_OF_TASK[task.state] ?? null : null;
+}
+
+// The repository's features, each ticket with its effective state: a tied entry follows its run's task while
+// the run folder exists, any other entry is taken as it is, and with no entry the Status line decides. Tied
+// entries the runs contradict are rewritten; `stateFile` says how the file read, and why a rewrite failed.
+async function ticketsOf(repoPath) {
+    const features = readTickets(repoPath);
+    const read = readStateFile(repoPath);
+    const entries = stateEntries(read);
+    const tasksByRun = new Map(), corrections = [];
+    for (const t of features.flatMap(f => f.tickets)) {
+        const e = entries[t.key];
+        const fromRun = e && isTied(e) ? tiedState(e, tasksByRun) : null;
+        if (fromRun) {
+            Object.assign(t, { state: fromRun, run: e.run, task: e.task });
+            if (fromRun !== e.state) corrections.push({ key: t.key, was: e, state: fromRun });
+        }
+        else t.state = e ? e.state : t.status === 'done' ? 'done' : 'todo';
+        t.actions = SELECTABLE.has(t.state) ? ['select'] : [];
+    }
+    const stateFile = { status: read.status, ...(read.reason ? { reason: read.reason } : {}) };
+    // Rewritten only while the entry still is the one judged: a writer may have changed it since.
+    if (corrections.length) {
+        try {
+            await writeState(repoPath, tickets => {
+                let changed = false;
+                for (const { key, was, state } of corrections) {
+                    const now = tickets[key];
+                    if (!isObject(now) || now.state !== was.state || now.run !== was.run || now.task !== was.task) continue;
+                    tickets[key] = { ...now, ...tiedEntry(state, was.run, was.task) };
+                    changed = true;
+                }
+                return changed;
+            });
+        } catch (err) { stateFile.problem = `the state file could not be corrected: ${err.message}`; }
+    }
+    return { features, stateFile };
+}
+
+// What /api/tickets answers of a ticket; `run` and `task` only when its entry is tied to a run that exists.
+const publicTicket = ({ key, number, title, status, state, actions, run, task }) => ({ key, number, title, status, state, actions, ...(run ? { run, task } : {}) });
 
 const REPO_ACTIONS = ['new-queue', 'forget-repo'];
 const PERMISSION_MODES = ['auto', 'acceptEdits', 'bypassPermissions'];
@@ -1073,16 +1238,18 @@ function makeRunFolder(project) {
 // Writes a run folder from the picked tickets and launches its runner, as the task-queue skill's chat flow
 // does. A failure before the launch removes the run folder.
 async function newQueue(res, repo, keys, settings) {
-    const all = readTickets(repo.path).flatMap(f => f.tickets);
+    const all = (await ticketsOf(repo.path)).features.flatMap(f => f.tickets);
     const byKey = new Map(all.map(t => [t.key, t]));
     const unknown = keys.find(k => !byKey.has(k));
     if (unknown) return send(res, 400, { error: `unknown ticket '${unknown}'` });
-    const done = keys.find(k => byKey.get(k).state === 'done');
-    if (done) return send(res, 409, { error: `ticket ${done} is done` });
+    const held = keys.map(k => byKey.get(k)).find(t => !SELECTABLE.has(t.state));
+    if (held) return send(res, 409, { error: `ticket ${held.key} is ${held.state}${held.run ? ` in run ${held.run}` : ''}` });
     // Features alphabetically, then by number: the order readTickets gives.
     const picked = all.filter(t => keys.includes(t.key));
 
-    let runDir = null, newProject = false;
+    // `queuedIn` is the run whose queued entries were written, `replaced` the entries they replaced.
+    let runDir = null, newProject = false, queuedIn = null;
+    const replaced = {};
     try {
         const made = makeRunFolder(settings.project);
         const { run } = made;
@@ -1104,12 +1271,37 @@ async function newQueue(res, repo, keys, settings) {
         if (!queue || !statOrNull(queue.workDir)?.isDirectory()) throw new Error('queue.json does not read back with an existing workDir');
         const missing = queue.tasks.find(t => !statOrNull(path.join(runDir, 'tasks', `${t.id}.md`)));
         if (missing) throw new Error(`task ${missing.id} has no brief`);
+        // The queue starts even when its tickets cannot be marked queued; the answer says why.
+        let warning = null;
+        try {
+            await writeState(repo.path, entries => {
+                for (const t of tasks) {
+                    replaced[t.ticket] = entries[t.ticket];
+                    entries[t.ticket] = tiedEntry('queued', runKeyOf(runDir), t.id);
+                }
+                return true;
+            });
+            queuedIn = runKeyOf(runDir);
+        } catch (err) { warning = `the ticket state file could not be updated: ${err.message}`; }
         appendProgress(runDir, `admin: queue created from the ticket picker (${tasks.length} tickets)`);
+        if (warning) appendProgress(runDir, `admin: ${warning}`);
         launchRunner(runDir);
-        return send(res, 200, { ok: true, project, run });
+        return send(res, 200, { ok: true, project, run, ...(warning ? { warning } : {}) });
     } catch (err) {
         if (runDir) fs.rmSync(runDir, { recursive: true, force: true });
         if (newProject) fs.rmSync(path.join(ROOT, settings.project), { recursive: true, force: true });
+        // Entries tied to the removed run would hold their tickets queued for good: each ticket gets back the
+        // entry it had, unless another writer has changed it since.
+        if (queuedIn) {
+            await writeState(repo.path, entries => {
+                const ours = Object.keys(replaced).filter(k => entries[k]?.run === queuedIn);
+                for (const k of ours) {
+                    if (replaced[k] === undefined) delete entries[k];
+                    else entries[k] = replaced[k];
+                }
+                return ours.length > 0;
+            }).catch(() => {});
+        }
         return send(res, 500, { error: `the queue could not be written: ${err.message}` });
     }
 }
@@ -1151,8 +1343,9 @@ async function handle(req, res) {
         const repo = repoOf(url.searchParams.get('project'));
         if (!repo) return send(res, 400, { error: 'not a registered repository' });
         const exists = !!statOrNull(repo.path)?.isDirectory();
-        const features = exists ? readTickets(repo.path).map(({ tickets, ...f }) => ({ ...f, tickets: tickets.map(publicTicket) })) : [];
-        return send(res, 200, { project: repo.project, path: repo.path, exists, features });
+        const read = exists ? await ticketsOf(repo.path) : { features: [], stateFile: { status: 'missing' } };
+        const features = read.features.map(({ tickets, ...f }) => ({ ...f, tickets: tickets.map(publicTicket) }));
+        return send(res, 200, { project: repo.project, path: repo.path, exists, stateFile: read.stateFile, features });
     }
 
     const runDir = runDirFrom(url.searchParams);

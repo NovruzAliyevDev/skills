@@ -220,6 +220,120 @@ function Test-Done($task) {
     return $true
 }
 
+# The repository's ticket state file, .scratch/queue-state.json under workDir. A task whose queue.json entry has
+# `ticket` (a picker queue's) gets its ticket's state written there: `running` at its starting line, `done` or
+# `failed` with its verdict, `skipped` when a skip is applied. The runner, like the monitor, writes under the
+# file's lock and changes only its own entry. A -ParallelTask child writes nothing. A failure to write is logged
+# to progress.log only, and the queue goes on.
+$ticketExcludeLine = '.scratch/queue-state.json*'
+$stateLockWaitSeconds = 10
+$stateLockStaleSeconds = 60
+
+# How many seconds old a state lock is: by the time it holds, or its file's time when it holds none.
+function Get-LockAge([string]$lockFile, [string]$text) {
+    $time = $null
+    try {
+        $value = ($text | ConvertFrom-Json).time
+        if ($value -is [datetime]) { $time = $value }
+        elseif ($value) { $time = [datetime]::Parse("$value", [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind) }
+    }
+    catch { }
+    if (-not $time) {
+        try { $time = [System.IO.File]::GetLastWriteTimeUtc($lockFile) } catch { return 0 }
+    }
+    return ((Get-Date).ToUniversalTime() - $time.ToUniversalTime()).TotalSeconds
+}
+
+# Takes the state lock: created only if absent, retried for up to 10 s, and taken over when older than 60 s.
+# Returns the lock's text, by which the writer knows its own lock.
+function Lock-State([string]$lockFile) {
+    $mine = [ordered]@{ pid = $PID; time = (Get-Date).ToUniversalTime().ToString('o'); id = [guid]::NewGuid().ToString('N').Substring(0, 8) } | ConvertTo-Json -Compress
+    $until = (Get-Date).AddSeconds($stateLockWaitSeconds)
+    while ($true) {
+        try {
+            $stream = [System.IO.FileStream]::new($lockFile, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write)
+            try { $bytes = $utf8.GetBytes($mine); $stream.Write($bytes, 0, $bytes.Length) } finally { $stream.Dispose() }
+            return $mine
+        }
+        catch [System.IO.DirectoryNotFoundException] { throw 'its folder is missing' }
+        catch [System.IO.IOException], [System.UnauthorizedAccessException] { }
+        $held = $null
+        try { $held = [System.IO.File]::ReadAllText($lockFile) } catch { }
+        if ($null -ne $held -and (Get-LockAge $lockFile $held) -gt $stateLockStaleSeconds) {
+            # Removed only while it still is the lock judged stale: another writer may have taken it over.
+            Unlock-State $lockFile $held
+            continue
+        }
+        if ((Get-Date) -ge $until) { throw 'its lock file is held by another writer' }
+        Start-Sleep -Milliseconds 100
+    }
+}
+
+# Removes the lock while it holds $text.
+function Unlock-State([string]$lockFile, [string]$text) {
+    try { if ([System.IO.File]::ReadAllText($lockFile) -eq $text) { Remove-Item -Force -LiteralPath $lockFile } } catch { }
+}
+
+# Adds the exclude line to the repository's info/exclude when it is not there yet. A folder that is not a git
+# repository gets none.
+function Add-TicketExclude {
+    $found = @(Run-Git $queue.workDir @('rev-parse', '--git-path', 'info/exclude'))
+    if ($script:gitExit -ne 0 -or -not $found.Count) { return }
+    $file = "$($found[0])"
+    if (-not [System.IO.Path]::IsPathRooted($file)) { $file = Join-Path $queue.workDir $file }
+    $text = ''
+    if (Test-Path -LiteralPath $file) { $text = [System.IO.File]::ReadAllText($file) }
+    if (@($text -split "`r?`n" | Where-Object { $_.Trim() -eq $ticketExcludeLine }).Count) { return }
+    New-Item -ItemType Directory -Force (Split-Path -Parent $file) | Out-Null
+    $lead = ''
+    if ($text -and -not $text.EndsWith("`n")) { $lead = "`n" }
+    [System.IO.File]::AppendAllText($file, "$lead$ticketExcludeLine`n", $utf8)
+}
+
+# Writes the task's ticket state, tied to this run and the task's id; see above.
+function Write-TicketState($task, [string]$state) {
+    if ($ParallelTask -or -not $task.ticket -or -not $queue.workDir) { return }
+    $key = "$($task.ticket)"
+    $stateFile = Join-Path $queue.workDir '.scratch\queue-state.json'
+    $lockFile = "$stateFile.lock"
+    try {
+        $mine = Lock-State $lockFile
+        try {
+            if (Test-Path -LiteralPath $stateFile) {
+                $doc = $null
+                try { $doc = [System.IO.File]::ReadAllText($stateFile, $utf8) | ConvertFrom-Json } catch { throw 'the state file is not valid JSON; it was left as it is' }
+                if ($doc -isnot [System.Management.Automation.PSCustomObject]) { throw 'the state file is not a JSON object; it was left as it is' }
+            }
+            else {
+                Add-TicketExclude
+                $doc = [pscustomobject][ordered]@{ version = 1; tickets = [pscustomobject]@{} }
+            }
+            if ($doc.tickets -isnot [System.Management.Automation.PSCustomObject]) { $doc | Add-Member -Force -NotePropertyName tickets -NotePropertyValue ([pscustomobject]@{}) }
+            $run = "$(Split-Path -Leaf (Split-Path -Parent $root))/$(Split-Path -Leaf $root)"
+            $entry = [pscustomobject][ordered]@{ state = $state; run = $run; task = "$($task.id)"; updatedAt = (Get-Date).ToUniversalTime().ToString('o') }
+            $doc.tickets | Add-Member -Force -NotePropertyName $key -NotePropertyValue $entry
+            # Written whole: a temporary file beside it, renamed over it. A reader may hold the file a moment.
+            $temp = "$stateFile.$PID.tmp"
+            [System.IO.File]::WriteAllText($temp, ($doc | ConvertTo-Json -Depth 20), $utf8)
+            for ($attempt = 1; ; $attempt++) {
+                try {
+                    # [NullString]: a plain $null reaches .NET as an empty path, which Replace refuses.
+                    if (Test-Path -LiteralPath $stateFile) { [System.IO.File]::Replace($temp, $stateFile, [NullString]::Value) } else { [System.IO.File]::Move($temp, $stateFile) }
+                    break
+                }
+                catch {
+                    if ($attempt -ge 20) { Remove-Item -Force -LiteralPath $temp -ErrorAction SilentlyContinue; throw }
+                    Start-Sleep -Milliseconds 50
+                }
+            }
+        }
+        finally { Unlock-State $lockFile $mine }
+    }
+    catch {
+        Append-Line $progressLog "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  ticket state: could not update $key ($($_.Exception.Message))"
+    }
+}
+
 # A task the user skipped has a report whose first line is SKIPPED; it counts as finished, as DONE does.
 function Test-Skipped($task) { return (Read-Status (Result-Of $task)) -eq 'SKIPPED' }
 
@@ -237,6 +351,7 @@ function Skip-Task($task, $control) {
     [System.IO.File]::WriteAllText($resultFile, "SKIPPED`r`n`r`nSkipped by the user from the monitor, before the queue reached this task. The task was not run.`r`n", $utf8)
     Say "admin: skip applied (task $($task.id))" 'Yellow'
     Say "$label - SKIPPED (by the user)" 'Yellow'
+    Write-TicketState $task 'skipped'
     return $true
 }
 
@@ -467,6 +582,7 @@ $closing
     }
 
     Say "$label - starting" 'Cyan'
+    Write-TicketState $task 'running'
     $script:cost = $null
     $reason = Run-Session $label $prompt $cliArgs $dirArgs $logFile $resultFile $sessionDir ([bool]$group)
     if (-not $reason -and $group) {
@@ -475,6 +591,7 @@ $closing
     }
     if ($reason) {
         Say "$label - STOPPED ($reason)" 'Red'
+        Write-TicketState $task 'failed'
         if (Test-Path $resultFile) { Say "Report: $resultFile" 'Red' }
         Say "Log: $logFile" 'Red'
         if ($script:sessionId) { Say "Open the session: cd `"$sessionDir`"; claude --resume $($script:sessionId)" 'Yellow' }
@@ -482,6 +599,7 @@ $closing
     }
 
     Say "$label - DONE ($(Session-Note))" 'Green'
+    Write-TicketState $task 'done'
     return $true
 }
 

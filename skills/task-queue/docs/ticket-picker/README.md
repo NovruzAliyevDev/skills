@@ -15,3 +15,5 @@ Tickets 02 and 03 do not depend on each other. Both touch `new-queue` and the pi
 ## Status
 
 01 is done. Its last criterion is only partly met: the picker queue ran to the end with the stub, but the earlier specs' checks could not be re-run, because their scripts and run folders in `%TEMP%\task-queue-monitor-fixtures` are gone and were not rebuilt.
+
+02 is done. Its last criterion is only partly met, for the same reason as 01's: every stub scenario it names passes in `check-picker.mjs` (failure, skip, hard stop, retry, plus conflict, locks, an unreadable file, chat-flow and parallel runs and a folder outside git), but the earlier specs' checks are still gone and were not re-run.

@@ -48,8 +48,10 @@ function pickerHash() {
 // The ticket picker takes the run view's place while it is open.
 const picker = createPicker(document.getElementById('picker'), {
   onProject: project => { location.hash = `new:${encodeURIComponent(project)}`; },
-  onStarted(run) {
+  // A queue that started although its tickets could not be marked queued says so in the run view.
+  onStarted({ warning, ...run }) {
     select(run);
+    if (warning) adminMessage.textContent = `Started, but ${warning}.`;
     runsPoll.refresh();
   },
 });
@@ -222,6 +224,7 @@ onRunControl(controlButtons, async action => {
   if (selected !== asked) return;
   busyAction = null;
   if (!result.ok) adminMessage.textContent = `${ACTION_LABEL[action]} refused: ${result.error}`;
+  else if (result.warning) adminMessage.textContent = `${ACTION_LABEL[action]} done, but ${result.warning}.`;
   renderRunControls(controls, controlButtons, detail, busyAction);
   runPoll.refresh();
   runsPoll.refresh();
