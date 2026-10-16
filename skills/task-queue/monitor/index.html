@@ -258,6 +258,35 @@ details.agent > summary { cursor: pointer; font-size: 12px; color: var(--muted);
 .md h1, .md h2, .md h3 { font: 600 15px/1.3 "Segoe UI", system-ui, sans-serif; text-transform: none; letter-spacing: 0; margin: 12px 0 6px; }
 .md img { max-width: 100%; }
 
+/* The ticket picker. */
+.new-queue-btn { margin: 0 16px 12px; }
+.picker h3 { font: 700 12px/1.4 var(--mono); text-transform: uppercase; letter-spacing: .05em; margin: 14px 0 6px; }
+.field { display: grid; gap: 2px; margin-bottom: 8px; }
+.field label, .picker-settings legend { font-size: 12px; font-weight: 700; }
+.field-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.picker select, .picker input[type="text"] { min-width: 0; max-width: 100%; padding: 3px 6px; font: inherit; color: var(--text);
+  background: var(--panel); border: 2px solid var(--frame); }
+.picker input[type="text"] { width: min(24em, 100%); }
+.picker-path { margin: -4px 0 8px; font-size: 12px; overflow-wrap: anywhere; }
+.hint { font-size: 12px; }
+.feature { border-top: 2px solid var(--line); }
+.tickets { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; }
+.ticket-row { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 8px; align-items: baseline; padding: 3px 4px; }
+.ticket-row:hover { background: var(--hover); }
+.ticket-row label { cursor: pointer; overflow-wrap: anywhere; }
+.ticket-row.unselectable label { color: var(--muted); cursor: default; }
+.ticket-badges { display: flex; flex-wrap: wrap; gap: 4px; justify-content: flex-end; }
+.num { font-family: var(--mono); }
+.no-tickets { margin: 0 0 6px; color: var(--muted); font-style: italic; }
+.s-todo { background: var(--idle); }
+.s-warn { background: var(--warn); }
+.picker-settings { display: flex; flex-wrap: wrap; gap: 4px 16px; margin: 14px 0 0; padding: 8px 10px; border: 2px solid var(--line); min-width: 0; }
+.picker-settings input[type="text"] { width: min(12em, 100%); }
+.picker-order { margin: 0 0 10px; padding-left: 0; list-style: none; font-size: 13px; }
+.picker-order li { padding: 1px 0; overflow-wrap: anywhere; }
+.picker-start { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; margin-top: 8px; }
+.picker-start .muted { font-size: 13px; }
+
 @media (max-width: 1199px) {
   .layout.drawer-open { grid-template-columns: minmax(0, 1fr) clamp(340px, 40vw, 440px); }
   .layout.drawer-open > aside { display: none; }
@@ -271,6 +300,9 @@ details.agent > summary { cursor: pointer; font-size: 12px; color: var(--muted);
   .commit { grid-template-columns: 70px minmax(0, 1fr); }
   .commit .date { display: none; }
   .drawer { position: fixed; inset: 0; z-index: 30; height: auto; border-left: 0; }
+  /* A ticket's badges go under its title. */
+  .ticket-row { grid-template-columns: auto minmax(0, 1fr); }
+  .ticket-badges { grid-column: 2; justify-content: flex-start; }
 }
 </style>
 <script type="module" src="/pixel/main.js"></script>
@@ -280,11 +312,62 @@ details.agent > summary { cursor: pointer; font-size: 12px; color: var(--muted);
   <aside>
     <h1>Task queues</h1>
     <div class="root" id="root"></div>
+    <button type="button" class="btn new-queue-btn" id="new-queue-btn">New queue</button>
     <button type="button" class="btn notify-btn" id="notify-btn" hidden>Enable notifications</button>
     <nav class="runs" id="runs" aria-label="Runs"></nav>
   </aside>
   <main>
     <div class="offline" id="offline" role="status"></div>
+    <section class="panel picker" id="picker" aria-labelledby="picker-title" hidden>
+      <h2 id="picker-title">New queue</h2>
+      <p class="empty" id="picker-empty" hidden>No repository is registered yet. Run the ticket-queue skill in a Claude Code session inside a repository to add it here.</p>
+      <div id="picker-body" hidden>
+        <div class="picker-repo">
+          <div class="field">
+            <label for="picker-repo">Repository</label>
+            <div class="field-row">
+              <select id="picker-repo"></select>
+              <button type="button" class="btn" id="picker-forget">Forget</button>
+            </div>
+          </div>
+          <p class="picker-path muted" id="picker-path"></p>
+          <div class="field">
+            <label for="picker-project">Project name</label>
+            <input id="picker-project" type="text" spellcheck="false" autocomplete="off" aria-describedby="picker-project-hint">
+            <span class="muted hint" id="picker-project-hint">The run folder and the session names use it.</span>
+          </div>
+        </div>
+        <div id="picker-warnings"></div>
+        <div class="features" id="picker-features"></div>
+        <fieldset class="picker-settings">
+          <legend>Settings</legend>
+          <div class="field">
+            <label for="picker-mode">Permission mode</label>
+            <select id="picker-mode">
+              <option value="auto" selected>auto</option>
+              <option value="acceptEdits">acceptEdits</option>
+              <option value="bypassPermissions">bypassPermissions</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="picker-model">Model</label>
+            <input id="picker-model" type="text" spellcheck="false" autocomplete="off" placeholder="unset">
+          </div>
+          <div class="field">
+            <label for="picker-effort">Effort</label>
+            <input id="picker-effort" type="text" spellcheck="false" autocomplete="off" placeholder="unset">
+          </div>
+        </fieldset>
+        <h3 class="order-title" id="picker-order-title">Order</h3>
+        <ol class="picker-order" id="picker-order" aria-labelledby="picker-order-title"></ol>
+        <p class="admin-msg" id="picker-msg" role="status"></p>
+        <div class="picker-start">
+          <button type="button" class="btn" id="picker-start" aria-disabled="true" aria-describedby="picker-start-why">Start</button>
+          <span class="muted" id="picker-start-why"></span>
+        </div>
+      </div>
+    </section>
+    <div id="run-view">
     <section class="panel" aria-label="Run">
       <div id="head"><p class="empty">Select a run.</p></div>
       <div class="run-controls" id="run-controls" hidden>
@@ -304,6 +387,7 @@ details.agent > summary { cursor: pointer; font-size: 12px; color: var(--muted);
       <summary>progress.log <span class="muted" id="progress-note"></span></summary>
       <div class="section-body"><pre class="plain" id="progress"></pre></div>
     </details>
+    </div>
   </main>
   <section class="drawer" id="drawer" role="dialog" aria-labelledby="drawer-title" tabindex="-1" hidden>
     <div class="drawer-head">

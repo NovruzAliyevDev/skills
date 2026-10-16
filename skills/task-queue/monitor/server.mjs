@@ -9,6 +9,9 @@ import path from 'node:path';
 import { execFile, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
+// The server's version, answered by /api/health. The ticket-queue skill compares it with the server.mjs it
+// ships and replaces a monitor that answers an older one; raise it with every change a skill relies on.
+const VERSION = 2;
 const HOST = '127.0.0.1';
 const PORT = Number(process.env.TASK_QUEUE_MONITOR_PORT || 4747);
 const ROOT = process.env.TASK_QUEUE_ROOT || path.join(os.homedir(), '.claude-queues');
@@ -707,6 +710,7 @@ async function handleAdmin(req, res) {
     try { body = JSON.parse(text); } catch { return send(res, 400, { error: 'the request is not JSON' }); }
     if (!body || typeof body !== 'object') return send(res, 400, { error: 'the request is not a JSON object' });
     const { project, run, action, task, mode, note = '', brief } = body;
+    if (REPO_ACTIONS.includes(action)) return handleRepoAction(res, body);
     if (typeof project !== 'string' || typeof run !== 'string' || !NAME_RE.test(project) || !NAME_RE.test(run)) return send(res, 400, { error: 'no valid project and run' });
     const forTask = TASK_ACTIONS.includes(action);
     if (!forTask && !RUN_ACTIONS.includes(action)) return send(res, 400, { error: `unknown action '${String(action)}'` });
@@ -938,6 +942,178 @@ async function hardStop(res, runDir, queue) {
     return send(res, 200, { ok: true, action: 'stop' });
 }
 
+// --- Ticket picker: the repository register, a repository's .scratch tickets, and the repository actions. ---
+
+// repos.json in the queue root, which the ticket-queue skill's register.ps1 writes.
+const REGISTER_FILE = path.join(ROOT, 'repos.json');
+
+// The register as written, or null when it is not valid JSON; a missing file is an empty register.
+function readRegisterFile() {
+    const text = readText(REGISTER_FILE);
+    if (text === null) return { version: 1, repos: [] };
+    try {
+        const register = text.trim() ? JSON.parse(text) : {};
+        return register && typeof register === 'object' && !Array.isArray(register) ? register : null;
+    } catch { return null; }
+}
+
+const usableRepo = r => r && typeof r.project === 'string' && NAME_RE.test(r.project) && typeof r.path === 'string';
+
+// The register's usable entries as `{ repos }`, or null when the file is not valid JSON.
+function readRegister() {
+    const register = readRegisterFile();
+    return register && { repos: (Array.isArray(register.repos) ? register.repos : []).filter(usableRepo) };
+}
+
+// The registered repository with this project name, or null.
+function repoOf(project) {
+    return (typeof project === 'string' && readRegister()?.repos.find(r => r.project === project)) || null;
+}
+
+// A ticket is `.scratch/<feature>/issues/NN-slug.md`; its key is that path relative to `.scratch`.
+const TICKET_FILE_RE = /^(\d{2})-(.+)\.md$/;
+const STATUS_RE = /^\*\*Status:\*\*[ \t]*([^\s*]+)/m;
+
+// The names of the files in a folder; none when it is missing.
+function safeFiles(dir) {
+    try { return fs.readdirSync(dir, { withFileTypes: true }).filter(d => d.isFile()).map(d => d.name); }
+    catch { return []; }
+}
+
+// A ticket's title is its first `# ` heading without a leading `NN:`, or its file name's slug.
+function readTicket(feature, issuesDir, name) {
+    const [, number, slug] = TICKET_FILE_RE.exec(name);
+    const text = readText(path.join(issuesDir, name)) ?? '';
+    const heading = /^# (.+)$/m.exec(text)?.[1].replace(/^\d+\s*:\s*/, '').trim();
+    const status = STATUS_RE.exec(text)?.[1] ?? null;
+    const state = status === 'done' ? 'done' : 'todo';
+    return {
+        key: `${feature}/issues/${name}`, feature, file: path.join(issuesDir, name), number: Number(number),
+        title: heading || slug, status, state, actions: state === 'todo' ? ['select'] : [],
+    };
+}
+
+// The repository's features, alphabetically, each with its tickets by number. Read on every call.
+function readTickets(repoPath) {
+    const scratch = path.join(repoPath, '.scratch');
+    return safeReaddir(scratch).sort((a, b) => a.localeCompare(b, 'en')).map(name => {
+        const issuesDir = path.join(scratch, name, 'issues');
+        const hasIssues = !!statOrNull(issuesDir)?.isDirectory();
+        const tickets = safeFiles(issuesDir).filter(f => TICKET_FILE_RE.test(f)).map(f => readTicket(name, issuesDir, f))
+            .sort((a, b) => a.number - b.number || a.key.localeCompare(b.key));
+        return { name, hasIssues, hasSpec: !!statOrNull(path.join(scratch, name, 'spec.md'))?.isFile(), tickets };
+    });
+}
+
+// What /api/tickets answers of a ticket.
+const publicTicket =({ key, number, title, status, state, actions }) => ({ key, number, title, status, state, actions });
+
+const REPO_ACTIONS = ['new-queue', 'forget-repo'];
+const PERMISSION_MODES = ['auto', 'acceptEdits', 'bypassPermissions'];
+// A model or effort setting reaches the runner's command line, so it is one word.
+const SETTING_RE = /^[A-Za-z0-9._:[\]-]{1,100}$/;
+const TITLE_MAX = 60;
+
+// Repository actions change the register or make run folders: one at a time.
+async function handleRepoAction(res, body) {
+    const { action, project } = body;
+    const repo = repoOf(project);
+    if (!repo) return send(res, 400, { error: `'${String(project)}' is not a registered repository` });
+    if (action === 'forget-repo') return inTurn('repos', () => forgetRepo(res, repo));
+    const { tickets, settings } = body;
+    if (!Array.isArray(tickets) || !tickets.length || !tickets.every(t => typeof t === 'string') || new Set(tickets).size !== tickets.length) {
+        return send(res, 400, { error: 'no valid list of tickets' });
+    }
+    if (!settings || typeof settings !== 'object') return send(res, 400, { error: 'no settings' });
+    const { permissionMode, projectName = null } = settings;
+    const model = settings.model || null, effort = settings.effort || null;
+    if (!PERMISSION_MODES.includes(permissionMode)) return send(res, 400, { error: `no valid permission mode: ${PERMISSION_MODES.join(', ')}` });
+    for (const [name, value] of [['model', model], ['effort', effort]]) {
+        if (value !== null && (typeof value !== 'string' || !SETTING_RE.test(value))) return send(res, 400, { error: `the ${name} is not one word of at most 100 characters` });
+    }
+    if (projectName !== null && (typeof projectName !== 'string' || !NAME_RE.test(projectName))) return send(res, 400, { error: 'the project name may hold only letters, digits, dots, dashes and underscores' });
+    return inTurn('repos', () => newQueue(res, repo, tickets, { permissionMode, model, effort, project: projectName || repo.project }));
+}
+
+// Removes the repository's entry and keeps everything else in the file as it was. Its run folders stay.
+async function forgetRepo(res, repo) {
+    const register = readRegisterFile();
+    if (!register) return send(res, 500, { error: 'repos.json is not valid JSON; it was left as it is' });
+    const repos = (Array.isArray(register.repos) ? register.repos : []).filter(r => !(usableRepo(r) && r.project === repo.project));
+    writeWhole(REGISTER_FILE, JSON.stringify({ ...register, repos }, null, 2));
+    return send(res, 200, { ok: true, project: repo.project });
+}
+
+// `<feature> <NN> <ticket title>`, without double quotes, at most TITLE_MAX characters.
+const taskTitle = t => `${t.feature} ${String(t.number).padStart(2, '0')} ${t.title}`.replace(/"/g, '').replace(/\s+/g, ' ').slice(0, TITLE_MAX).trim();
+
+function briefOf(repoPath, ticket, title, text) {
+    const spec = `${ticket.feature}/spec.md`;
+    const specLine = statOrNull(path.join(repoPath, '.scratch', spec))?.isFile() ? `Feature spec: .scratch/${spec}\n` : '';
+    return `# ${title}\n\nTicket file: .scratch/${ticket.key}\n${specLine}\n` +
+        'Work this ticket. Read the feature spec for the context it points to. When the ticket is done,\n' +
+        'set its **Status:** line in the ticket file to `done` and tick the acceptance criteria you met.\n\n' +
+        `## The ticket, as written\n\n${text}`;
+}
+
+// The run folder `<root>\<project>\<yyyyMMdd-HHmm>`, with -2, -3 ... when that one exists. Answers its name,
+// and whether the project folder was made for it.
+function makeRunFolder(project) {
+    const projectDir = path.join(ROOT, project);
+    const newProject = fs.mkdirSync(projectDir, { recursive: true }) !== undefined;
+    const d = new Date(), p = n => String(n).padStart(2, '0');
+    const base = `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`;
+    for (let n = 1; ; n++) {
+        const run = n === 1 ? base : `${base}-${n}`;
+        try { fs.mkdirSync(path.join(projectDir, run)); return { run, newProject }; }
+        catch (err) { if (err.code !== 'EEXIST') throw err; }
+    }
+}
+
+// Writes a run folder from the picked tickets and launches its runner, as the task-queue skill's chat flow
+// does. A failure before the launch removes the run folder.
+async function newQueue(res, repo, keys, settings) {
+    const all = readTickets(repo.path).flatMap(f => f.tickets);
+    const byKey = new Map(all.map(t => [t.key, t]));
+    const unknown = keys.find(k => !byKey.has(k));
+    if (unknown) return send(res, 400, { error: `unknown ticket '${unknown}'` });
+    const done = keys.find(k => byKey.get(k).state === 'done');
+    if (done) return send(res, 409, { error: `ticket ${done} is done` });
+    // Features alphabetically, then by number: the order readTickets gives.
+    const picked = all.filter(t => keys.includes(t.key));
+
+    let runDir = null, newProject = false;
+    try {
+        const made = makeRunFolder(settings.project);
+        const { run } = made;
+        newProject = made.newProject;
+        runDir = path.join(ROOT, settings.project, run);
+        fs.mkdirSync(path.join(runDir, 'tasks'));
+        const tasks = picked.map((t, i) => {
+            const id = String(i + 1).padStart(2, '0'), title = taskTitle(t);
+            const text = readText(t.file);
+            if (text === null) throw new Error(`ticket ${t.key} could not be read`);
+            fs.writeFileSync(path.join(runDir, 'tasks', `${id}.md`), briefOf(repo.path, t, title, text));
+            return { id, title, ticket: t.key };
+        });
+        const { project, permissionMode, model, effort } = settings;
+        // Written whole: the monitor lists any folder with a queue.json as a run.
+        writeWhole(path.join(runDir, 'queue.json'), JSON.stringify({ project, workDir: repo.path, permissionMode, model, effort, tasks }, null, 2));
+        fs.copyFileSync(path.join(HERE, '..', 'runner.ps1'), path.join(runDir, 'run.ps1'));
+        const queue = readQueue(runDir);
+        if (!queue || !statOrNull(queue.workDir)?.isDirectory()) throw new Error('queue.json does not read back with an existing workDir');
+        const missing = queue.tasks.find(t => !statOrNull(path.join(runDir, 'tasks', `${t.id}.md`)));
+        if (missing) throw new Error(`task ${missing.id} has no brief`);
+        appendProgress(runDir, `admin: queue created from the ticket picker (${tasks.length} tickets)`);
+        launchRunner(runDir);
+        return send(res, 200, { ok: true, project, run });
+    } catch (err) {
+        if (runDir) fs.rmSync(runDir, { recursive: true, force: true });
+        if (newProject) fs.rmSync(path.join(ROOT, settings.project), { recursive: true, force: true });
+        return send(res, 500, { error: `the queue could not be written: ${err.message}` });
+    }
+}
+
 async function handle(req, res) {
     const url = new URL(req.url, URL_BASE);
     const isAdmin = url.pathname === '/api/admin';
@@ -962,10 +1138,22 @@ async function handle(req, res) {
         return file ? send(res, 200, fs.readFileSync(file), 'text/javascript; charset=utf-8') : send(res, 404, { error: 'not found' });
     }
 
-    if (url.pathname === '/api/health') return send(res, 200, { ok: true, root: ROOT });
+    if (url.pathname === '/api/health') return send(res, 200, { ok: true, root: ROOT, version: VERSION });
 
     ensureLiveness();
     if (url.pathname === '/api/runs') return send(res, 200, { root: ROOT, livenessAt: liveness.at, runs: listRuns() });
+    if (url.pathname === '/api/repos') {
+        const register = readRegister();
+        return send(res, 200, { repos: (register?.repos || []).map(r => ({ project: r.project, path: r.path, exists: !!statOrNull(r.path)?.isDirectory() })),
+            ...(register ? {} : { problem: 'repos.json is not valid JSON' }) });
+    }
+    if (url.pathname === '/api/tickets') {
+        const repo = repoOf(url.searchParams.get('project'));
+        if (!repo) return send(res, 400, { error: 'not a registered repository' });
+        const exists = !!statOrNull(repo.path)?.isDirectory();
+        const features = exists ? readTickets(repo.path).map(({ tickets, ...f }) => ({ ...f, tickets: tickets.map(publicTicket) })) : [];
+        return send(res, 200, { project: repo.project, path: repo.path, exists, features });
+    }
 
     const runDir = runDirFrom(url.searchParams);
     if (!runDir) return send(res, 404, { error: 'unknown run' });

@@ -6,6 +6,7 @@ import { ACTION_LABEL, BAD, STATE_LABEL, confirmAction, createDrawer, entryOf, e
 import { resetSprites } from './sprites.js';
 import { createHelperList, createOffice, helperTasksOf } from './workers.js';
 import { createScene } from './scene.js';
+import { createPicker, lastRepo } from './picker.js';
 
 const layout = document.getElementById('layout');
 const runList = document.getElementById('runs');
@@ -21,6 +22,7 @@ const notifyButton = document.getElementById('notify-btn');
 const controls = document.getElementById('run-controls');
 const controlButtons = document.getElementById('control-buttons');
 const adminMessage = document.getElementById('admin-msg');
+const runView = document.getElementById('run-view');
 let busyAction = null;        // the queue control whose request is on its way
 let sceneBusy = false;        // whether a Skip or Un-skip of the scene's menu is on its way
 let runs = [];
@@ -34,6 +36,36 @@ let previousRuns = null;      // the run list of the poll before, to notice what
 
 function hashKey() {
   try { return decodeURIComponent(location.hash.slice(1)); } catch { return ''; }
+}
+
+// The project of a `#new:<Project>` hash ('' for none named), or null for any other hash. A colon never occurs
+// in a project or run name, so this hash never names a run.
+function pickerHash() {
+  const key = hashKey();
+  return key.startsWith('new:') ? key.slice(4) : null;
+}
+
+// The ticket picker takes the run view's place while it is open.
+const picker = createPicker(document.getElementById('picker'), {
+  onProject: project => { location.hash = `new:${encodeURIComponent(project)}`; },
+  onStarted(run) {
+    select(run);
+    runsPoll.refresh();
+  },
+});
+
+function openPicker(project) {
+  drawer.close();
+  picker.show(project);
+  runView.hidden = true;
+  renderRunList(runList, runs, null);
+  document.title = 'New queue · Task queues';
+}
+
+function closePicker() {
+  if (!picker.open) return;
+  picker.hide();
+  runView.hidden = false;
 }
 
 // Sends a task action, from the drawer or the scene's menu, and resolves to `{ ok, error }`, or to null when
@@ -94,7 +126,17 @@ function openTask(id, tab) {
 // Switching runs rebuilds the office and the scene, so workers of different runs never mix, and closes
 // the drawer.
 function select(run) {
-  if (selected && runKey(selected) === runKey(run)) return;
+  const same = selected && runKey(selected) === runKey(run);
+  const fromPicker = picker.open;
+  closePicker();
+  if (same) {
+    if (fromPicker) {
+      history.replaceState(null, '', `#${encodeURIComponent(runKey(selected))}`);
+      renderRunList(runList, runs, runKey(selected));
+      if (detail) updateTitle();
+    }
+    return;
+  }
   drawer.close();
   followDesks([]);
   selected = { project: run.project, run: run.run };
@@ -145,7 +187,7 @@ const runPoll = watchRun(() => selected, next => {
   drawer.update(detail);
   renderCommits(commits, commitsNote, detail.commits);
   renderProgress(progress, progressNote, detail.progress);
-  updateTitle();
+  if (!picker.open) updateTitle();
 });
 
 const runsPoll = watchRuns(data => {
@@ -153,8 +195,8 @@ const runsPoll = watchRuns(data => {
   runs = data.runs;
   notifyChanges(runs);
   // On load the run named in the URL wins, then a running one, then the newest.
-  if (!selected && runs.length) select(runs.find(r => runKey(r) === hashKey()) || runs.find(r => r.state === 'running') || runs[0]);
-  renderRunList(runList, runs, selected && runKey(selected));
+  if (!selected && !picker.open && runs.length) select(runs.find(r => runKey(r) === hashKey()) || runs.find(r => r.state === 'running') || runs[0]);
+  renderRunList(runList, runs, !picker.open && selected ? runKey(selected) : null);
 });
 
 onRunChosen(runList, key => {
@@ -186,9 +228,20 @@ onRunControl(controlButtons, async action => {
 });
 
 addEventListener('hashchange', () => {
+  const project = pickerHash();
+  if (project !== null) return openPicker(project);
   const run = runs.find(r => runKey(r) === hashKey());
   if (run) select(run);
 });
+
+// New queue opens the picker for the repository last picked, or the first registered one.
+document.getElementById('new-queue-btn').addEventListener('click', () => {
+  const hash = `#new:${encodeURIComponent(lastRepo())}`;
+  if (location.hash === hash) openPicker(pickerHash());
+  else location.hash = hash;
+});
+
+if (pickerHash() !== null) openPicker(pickerHash());
 
 // --- Tab title and notifications, as the old page had them. ---
 

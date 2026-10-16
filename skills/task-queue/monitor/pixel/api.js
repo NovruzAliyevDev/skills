@@ -67,8 +67,22 @@ export function watchRun(selected, onRun) {
 // The admin token this server start handed out with the page.
 const adminToken = document.querySelector('meta[name="admin-token"]')?.content || '';
 
-// Asks the server for an admin action on a run. Answers `{ ok: true }`, or `{ ok: false, error }` with the
-// reason the action was refused or failed. The page learns the result from its next poll, not from this.
+// The ticket picker's data, polled while the picker is open: the registered repositories, and the tickets
+// of the repository `project()` names when it is one of them. `onData({ repos, tickets })` gets both;
+// `tickets` is null when no registered repository is named. An answer for a project no longer named is dropped.
+export function watchPicker(project, onData) {
+  return poll(async () => {
+    const asked = project();
+    const { repos } = await getJson('/api/repos');
+    const known = repos.some(r => r.project === asked);
+    const tickets = known ? await getJson(`/api/tickets?${query({ project: asked })}`) : null;
+    if (project() === asked) onData({ repos, tickets });
+  }, RUN_EVERY_MS);
+}
+
+// Asks the server for an admin action: on a run (`selection` is `{ project, run }`), or a repository action
+// (`{ project }`). Answers `{ ok: true, ... }` with the server's answer, or `{ ok: false, error }` with the
+// reason the action was refused or failed. The page learns a run's state from its next poll, not from this.
 export async function postAdmin(selection, action, extra = {}) {
   let response;
   try {
@@ -80,7 +94,7 @@ export async function postAdmin(selection, action, extra = {}) {
   } catch {
     return { ok: false, error: 'the monitor server did not answer' };
   }
-  if (response.ok) return { ok: true };
+  if (response.ok) return { ...await response.json().catch(() => ({})), ok: true };
   if (response.status === 403) return { ok: false, error: 'the monitor server was restarted; reload the page' };
   const data = await response.json().catch(() => ({}));
   return { ok: false, error: data.error || `the server answered ${response.status}` };
