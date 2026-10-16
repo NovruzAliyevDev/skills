@@ -6,6 +6,7 @@ Each folder under `skills/` is one skill: a `SKILL.md` with its instructions, pl
 | Skill | What it does | How it starts |
 |---|---|---|
 | [task-queue](skills/task-queue/) | Runs a list of tasks in order, each in its own fresh, unattended Claude Code session, with tasks you mark as a group running in parallel, and shows the queue on a local web page. | You type `/novruzaliyev-skills:task-queue`. |
+| [ticket-queue](skills/ticket-queue/) | Opens the monitor's ticket picker for the repository you are in, where you tick its `.scratch` tickets and start them as a queue, and keeps a small state file of which tickets are done, queued, running, failed or skipped. | You type `/novruzaliyev-skills:ticket-queue`. |
 | [delegate](skills/delegate/) | Splits a big task into independent pieces, runs each in its own subagent, and keeps the main session's context light. | Claude uses it when you ask to delegate, split up, fan out or parallelize work; you can also type `/novruzaliyev-skills:delegate`. |
 | [queue-monitor](skills/queue-monitor/) | Starts the task-queue monitor again (it exits after two idle hours) and opens it in the browser. | You type `/novruzaliyev-skills:queue-monitor`. |
 
@@ -24,8 +25,8 @@ Or, inside a session: `/plugin marketplace add NovruzAliyevDev/skills`, then
 
 To update: `claude plugin marketplace update novruzaliyev`, then
 `claude plugin update novruzaliyev-skills@novruzaliyev`. Queues already written keep their own copy of
-the runner, so an update does not touch them; a monitor already running keeps its old code until it
-is started again with `/novruzaliyev-skills:queue-monitor`.
+the runner, so an update does not touch them; a monitor already running from an older version is
+replaced by the next `/novruzaliyev-skills:queue-monitor` or `/novruzaliyev-skills:ticket-queue`.
 
 ## task-queue
 
@@ -62,6 +63,10 @@ page shows how far the queue has got.
    each brief, the groups and the settings, and flags anything that cannot run unattended. Correct it
    until it is right, then confirm.
 4. Claude writes the run folder, starts the queue in its own PowerShell window, and opens the monitor.
+
+Tickets written by the `to-tickets` skill under `.scratch` need no list: start them from the ticket
+picker instead (see [ticket-queue](#ticket-queue)), which orders them by their `Blocked by` lines and
+uses each ticket as its task's brief.
 
 Leave the repository alone until the queue finishes: the sessions work in that same working tree, and
 the merge of a parallel group lands there too.
@@ -132,6 +137,65 @@ subfolder per installed version.
 
 `TASK_QUEUE_MONITOR_PORT` and `TASK_QUEUE_ROOT` change the port and the queue folder. The monitor's
 design record, a spec and three tickets, is in [skills/task-queue/docs/pixel-monitor](skills/task-queue/docs/pixel-monitor/).
+
+## ticket-queue
+
+Start a queue from a repository's tickets without typing them into a chat. The tickets are the files
+the `to-tickets` skill writes: `.scratch/<feature>/issues/NN-slug.md`, each with a `Blocked by` line, a
+`Status` line and acceptance criteria. Needs everything task-queue needs, and git for the state file.
+
+1. Open Claude Code in the repository and type `/novruzaliyev-skills:ticket-queue`. It registers the
+   repository with the monitor (once; the register is `repos.json` in the queue folder), starts the
+   monitor or replaces one from an older version (running queues are not touched), and opens the
+   picker at `http://127.0.0.1:4747/#new:<Project>`. It does nothing else in the chat.
+2. In the picker, tick tickets, check the order it shows, set the permission mode, model and effort as
+   for any queue, and press Start. The monitor writes the run folder, starts the runner in its own
+   window and switches to the run's view. **New queue** in the monitor's header opens the picker again
+   for any registered repository later; Forget takes one off the list (its runs and state file stay).
+
+### The picker
+
+- Tickets are grouped by feature, features in alphabetical order, tickets by number. A feature with no
+  tickets says so in a grey line; files in `issues` not named `NN-slug.md` are left out.
+- Done, queued and running tickets cannot be picked. A ticket whose `Status` line is neither
+  `ready-for-agent` nor `done` can, with a warning.
+- Start is blocked while a picked ticket waits on a ticket of its feature that is neither picked nor
+  done, and while a runner of another queue of this repository is alive. A `Blocked by` line it cannot
+  read, or an unfinished queue of this repository with no runner, gives a warning only.
+- The queue runs features alphabetically, each feature's tickets blockers first, one at a time in the
+  main checkout: never parallel groups. Each task's brief is the ticket's full text, naming the ticket
+  file and the feature's `spec.md`, and asks the session to set the ticket's `Status` line to `done`
+  and tick the criteria it met. Sessions are named `Project - <feature> <NN> <title>`.
+
+### The state file
+
+`.scratch/queue-state.json` holds one entry per ticket the picker, a queue or you have touched, with
+its state:
+
+| State | Meaning |
+|---|---|
+| `todo` | Not done; the state of every ticket with no entry, unless its file says `Status: done`. |
+| `queued` | Picked into a queue that has not reached it, or that stopped or paused before it. |
+| `running` | Its session is working, or was resumed or retried. |
+| `done` | Its session reported DONE, or you marked it done. |
+| `failed` | Its session reported FAILED, its runner died, or the queue was stopped from the monitor while it ran. |
+| `skipped` | Skipped from the monitor. |
+
+The monitor and the runner write it, under a lock, never half-written; a write that fails is noted in
+the run's `progress.log` and never stops the queue. An entry tied to a run follows that run: when the
+two disagree, the run wins. A file that is not valid JSON is reported in the picker and left alone.
+
+The file stays out of git without touching `.gitignore`: whoever creates it first adds
+`.scratch/queue-state.json*` to the repository's `.git/info/exclude`. It never dirties the working
+tree or lands in a task's commit.
+
+### Marking by hand
+
+Each ticket's Mark menu in the picker sets it to done (work finished outside a queue) or back to todo
+(to release it from a stopped queue you will not continue, so it can be picked again). It is offered
+neither while a live runner holds the ticket nor while the state file is unreadable. A marked entry is
+yours: no queue rewrites it until you pick the ticket into a new one. You can also edit the file by hand; the picker honours it. The design
+record is in [skills/task-queue/docs/ticket-picker](skills/task-queue/docs/ticket-picker/).
 
 ## delegate
 

@@ -8,7 +8,7 @@
     {
       "name": "novruzaliyev-skills",
       "source": "./",
-      "description": "task-queue, queue-monitor and delegate."
+      "description": "task-queue, ticket-queue, queue-monitor and delegate."
     }
   ]
 }
