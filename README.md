@@ -1,6 +1,7 @@
 # Skills
 
 Claude Code skills, packaged as one plugin, `novruzaliyev-skills`, in the marketplace `novruzaliyev`.
+They run on Windows and macOS.
 Each folder under `skills/` is one skill: a `SKILL.md` with its instructions, plus any files it needs.
 
 | Skill | What it does | How it starts |
@@ -15,7 +16,7 @@ Each folder under `skills/` is one skill: a `SKILL.md` with its instructions, pl
 The repository is private: install with a GitHub account that has access to it. Claude Code uses your
 git credentials (for example `gh auth login`).
 
-```powershell
+```sh
 claude plugin marketplace add NovruzAliyevDev/skills
 claude plugin install novruzaliyev-skills@novruzaliyev
 ```
@@ -36,11 +37,16 @@ page shows how far the queue has got.
 
 ### Requirements
 
-- Windows with Windows PowerShell 5.1: the runner is a PowerShell script.
+- Windows 10 or 11, or macOS 13 or later.
+- Node.js, on the PATH as `node`: the runner, the monitor and the helper scripts are Node.js scripts.
 - The Claude Code CLI on the PATH as `claude`.
-- Node.js, for the monitor.
 - git, for parallel groups and for the monitor's list of commits made during a run (optional without
   groups).
+
+On macOS the runner opens in a Terminal window, through AppleScript. The first time, macOS asks whether
+the program that starts it (your terminal or Claude Code for a new queue, `node` for the monitor's
+Continue, Retry and Start) may control Terminal. Allow it; if you refused, turn it on again in System
+Settings > Privacy & Security > Automation. Until then the launch fails with a line naming that setting.
 
 ### Run a queue
 
@@ -62,7 +68,8 @@ page shows how far the queue has got.
    quick look-up of the answer, to the queue's sessions. It shows the numbered titles, a summary of
    each brief, the groups and the settings, and flags anything that cannot run unattended. Correct it
    until it is right, then confirm.
-4. Claude writes the run folder, starts the queue in its own PowerShell window, and opens the monitor.
+4. Claude writes the run folder, starts the queue in its own window (a console window on Windows, a
+   Terminal window on macOS), and opens the monitor.
 
 Tickets written by the `to-tickets` skill under `.scratch` need no list: start them from the ticket
 picker instead (see [ticket-queue](#ticket-queue)), which orders them by their `Blocked by` lines and
@@ -74,15 +81,19 @@ the merge of a parallel group lands there too.
 ### The run folder
 
 ```
-%USERPROFILE%\.claude-queues\<Project>\<yyyyMMdd-HHmm>\
+~/.claude-queues/<Project>/<yyyyMMdd-HHmm>/
   queue.json       the settings and the task list
-  tasks\NN.md      one brief per task
-  run.ps1          the runner, a copy of task-queue\runner.ps1
+  tasks/NN.md      one brief per task
+  run.mjs          the runner, a copy of task-queue/runner.mjs
+  platform.mjs     what differs between Windows and macOS, a copy of task-queue/platform.mjs
   progress.log     the running record
-  results\NN.md    each task's report; its first line is DONE or FAILED
-  logs\NN.jsonl    each session's full event stream
-  wt\NN\           the worktree of a task in a parallel group, while the group runs
+  results/NN.md    each task's report; its first line is DONE or FAILED
+  logs/NN.jsonl    each session's full event stream
+  wt/NN/           the worktree of a task in a parallel group, while the group runs
 ```
+
+`~` is your home folder (`C:\Users\<you>` on Windows). Run folders written before version 2.0.0 have a
+`run.ps1` instead; on Windows the monitor still shows, stops and continues them.
 
 ### How a queue runs
 
@@ -90,8 +101,9 @@ the merge of a parallel group lands there too.
   task's brief, and nothing of the conversation that set the queue up.
 - The queue stops at the first task whose report does not start with `DONE`. The window then shows a
   red **STOPPED** line with the command that opens that session.
-- After a stop, fix the cause and continue the queue from the monitor (or run `run.ps1` again): finished
-  tasks are skipped, and the stopped one starts over with a pointer to its earlier report.
+- After a stop, fix the cause and continue the queue from the monitor (or run `node run.mjs` in the run
+  folder): finished tasks are skipped, and the stopped one starts over with a pointer to its earlier
+  report.
 - Sessions cannot run background commands, because a headless session's background commands die when
   it ends; slow commands such as a full test suite get up to 60 minutes instead. A session that ends
   without writing its report is resumed once to write it.
@@ -109,12 +121,12 @@ the merge of a parallel group lands there too.
 - If a task of a group fails, the others finish, nothing is merged and the queue stops. Continuing
   the queue continues the failed task in its own worktree.
 - While a group runs, the window shows only start and finish lines for its tasks; the monitor and
-  `logs\NN.jsonl` show the rest. The design record is in
+  `logs/NN.jsonl` show the rest. The design record is in
   [skills/task-queue/docs/parallel-tasks](skills/task-queue/docs/parallel-tasks/).
 
 ### The monitor
 
-A page at <http://127.0.0.1:4747/> for every queue under `%USERPROFILE%\.claude-queues`. Each
+A page at <http://127.0.0.1:4747/> for every queue under `~/.claude-queues`. Each
 task is a pixel-art worker in an office: waiting in line, typing at the desk, celebrating in the done
 zone, or in the red alert corner when it stops. The page also shows the running session's activity, the
 reports, the commits made during the run, and browser notifications when a task finishes or the queue
@@ -128,11 +140,11 @@ by hand: a run lock makes a second runner of the same run folder exit at once. T
 
 The queue starts the monitor by itself. To start it again, type `/novruzaliyev-skills:queue-monitor`, or by hand:
 
-```powershell
-node "<plugin folder>\skills\task-queue\monitor\server.mjs" --open
+```sh
+node "<plugin folder>/skills/ticket-queue/ensure-monitor.mjs" --open ""
 ```
 
-The plugin folder is under `%USERPROFILE%\.claude\plugins\cache\novruzaliyev\novruzaliyev-skills\`, one
+The plugin folder is under `~/.claude/plugins/cache/novruzaliyev/novruzaliyev-skills/`, one
 subfolder per installed version.
 
 `TASK_QUEUE_MONITOR_PORT` and `TASK_QUEUE_ROOT` change the port and the queue folder. The monitor's

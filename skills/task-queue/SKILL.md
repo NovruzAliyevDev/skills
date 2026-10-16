@@ -1,6 +1,6 @@
 ---
 name: task-queue
-description: Collect a list of tasks, then run them in order, each in its own fresh headless Claude Code session, from a generated PowerShell script. Tasks the user marks as a group run in parallel, in git worktrees.
+description: Collect a list of tasks, then run them in order, each in its own fresh headless Claude Code session, from a Node.js runner copied into the run folder. Tasks the user marks as a group run in parallel, in git worktrees.
 disable-model-invocation: true
 ---
 
@@ -8,7 +8,7 @@ You prepare and launch the queue; you never do any part of the tasks themselves.
 
 Talk to the user in their language. Everything written to disk is English, except task text the user wrote themselves, which is copied as written.
 
-Each task runs in a **fresh session**: it sees the repository, its `CLAUDE.md` and the task file, and nothing of this conversation. The runner (`runner.ps1` beside this file) runs the tasks in order and stops at the first one whose report does not start with `DONE`. Its sessions cannot run background commands, which would die when a headless session ends, and a session that ends without writing a report is resumed once to write it.
+Each task runs in a **fresh session**: it sees the repository, its `CLAUDE.md` and the task file, and nothing of this conversation. The runner (`runner.mjs` beside this file) runs the tasks in order and stops at the first one whose report does not start with `DONE`. Its sessions cannot run background commands, which would die when a headless session ends, and a session that ends without writing a report is resumed once to write it.
 
 A **group** is two or more consecutive tasks the user marked to run in parallel. The runner starts them together, each in its own git worktree and branch, and once all of them are `DONE` merges their branches into the queue's branch in task order. A merge conflict goes to a **conflict session**, a headless session of its own. Groups come only from the user's notation: never propose or create one.
 
@@ -56,9 +56,9 @@ Flag anything that looks like it cannot run unattended: a step only a person can
 
 ## 4. Write the run folder
 
-Create `%USERPROFILE%\.claude-queues\<ProjectName>\<yyyyMMdd-HHmm>\` holding:
+Create `~/.claude-queues/<ProjectName>/<yyyyMMdd-HHmm>/` (`~` is the user's home folder; write the path with the platform's own separator) holding:
 
-- `tasks\01.md`, `tasks\02.md`, ... : one brief each, headed by its title.
+- `tasks/01.md`, `tasks/02.md`, ... : one brief each, headed by its title.
 - `queue.json`, UTF-8:
   ```json
   {
@@ -76,42 +76,38 @@ Create `%USERPROFILE%\.claude-queues\<ProjectName>\<yyyyMMdd-HHmm>\` holding:
     ]
   }
   ```
-  `parallel` holds one list per group, its task ids in ascending order, and `maxParallel` the setting. When the list declares no groups, leave both fields out. Every backslash in `workDir` is doubled, as in the example: a single one is an invalid JSON escape, and the runner exits before its first line.
-- `run.ps1`: a copy of `runner.ps1` from this skill's folder, unchanged.
+  `workDir` is this session's working directory. On Windows every backslash in it is doubled, as in the example: a single one is an invalid JSON escape, and the runner exits before its first line. On macOS it is a plain path, such as `"workDir": "/Users/me/path/to/repo"`. `parallel` holds one list per group, its task ids in ascending order, and `maxParallel` the setting. When the list declares no groups, leave both fields out.
+- `run.mjs` and `platform.mjs`: copies of `runner.mjs` and `platform.mjs` from this skill's folder, unchanged. The launch in step 5 copies them in when they are missing, so you need not write them.
 
-Then read `queue.json` back the way the runner does, and fix the file until this prints the repository's path and `True`:
+Then read the run folder back the way the runner does. This prints `workDir` and whether it exists, and exits 1 naming each problem: a `queue.json` that does not read, a `workDir` that is not a folder, a task without its brief. It launches nothing. Fix the files and run it again until it exits 0:
 
-```powershell
-$q = Get-Content -Raw -Encoding UTF8 '<run folder>\queue.json' | ConvertFrom-Json; $q.workDir; Test-Path $q.workDir
+```sh
+node "<this skill's folder>/launch.mjs" --check "<run folder>"
 ```
 
-Done when that check passes, every task in `queue.json` has its `tasks\<id>.md`, and `parallel` holds exactly the groups the user confirmed.
+Done when that check passes and `parallel` holds exactly the groups the user confirmed.
 
 ## 5. Launch
 
-Start it in its own window, so it outlives this session and the user can watch it. The inner double quotes are needed: `Start-Process` joins the arguments without quoting them.
+Start the queue. The script checks the run folder again, copies in `run.mjs` and `platform.mjs` when they are missing, and opens the runner in a window of its own (a console window on Windows, a Terminal window on macOS), so it outlives this session and the user can watch it. It then starts the monitor, a web page for every queue under `~/.claude-queues` at `http://127.0.0.1:4747/`, replacing one left from an older version of the plugin (running queues are not touched), and opens it in the browser:
 
-```powershell
-Start-Process powershell.exe -ArgumentList '-NoExit', '-NoProfile', '-File', '"<run folder>\run.ps1"'
+```sh
+node "<this skill's folder>/launch.mjs" "<run folder>"
 ```
 
-Then start the monitor, a web page for every queue under `%USERPROFILE%\.claude-queues` at `http://127.0.0.1:4747/`. It opens the browser. If the monitor is already running, the new process only opens the browser and exits.
-
-```powershell
-Start-Process node -ArgumentList '"<this skill''s folder>\monitor\server.mjs"', '--open' -WindowStyle Hidden
-```
+On exit code 1, show the user the lines it printed and stop here. On macOS, the first launch may make macOS ask whether the terminal or Claude Code may control Terminal: the user allows it in that prompt, or later in System Settings > Privacy & Security > Automation, and you run the command again.
 
 Then tell the user, briefly:
 
-- the monitor at `http://127.0.0.1:4747/`: tasks and their states, the running session's activity, reports, commits, and browser notifications when a task finishes or the queue stops. For an unfinished queue it can also stop it (killing its sessions), pause it after the current task, continue it, skip a task not yet started, retry a failed or stopped task (resuming its session or starting over, with a note), and edit the brief of a task not yet started: buttons under the run header and in a task's panel, or a right-click on a worker. It runs only on this computer and stops by itself after two idle hours with no queue running. To start it again: `node "<this skill's folder>\monitor\server.mjs" --open`;
-- the run folder; `progress.log` there is the running record, `results\NN.md` each task's report, `logs\NN.jsonl` each session's full stream;
+- the monitor at `http://127.0.0.1:4747/`: tasks and their states, the running session's activity, reports, commits, and browser notifications when a task finishes or the queue stops. For an unfinished queue it can also stop it (killing its sessions), pause it after the current task, continue it, skip a task not yet started, retry a failed or stopped task (resuming its session or starting over, with a note), and edit the brief of a task not yet started: buttons under the run header and in a task's panel, or a right-click on a worker. It runs only on this computer and stops by itself after two idle hours with no queue running. To start it again: `/novruzaliyev-skills:queue-monitor`;
+- the run folder; `progress.log` there is the running record, `results/NN.md` each task's report, `logs/NN.jsonl` each session's full stream;
 - the window shows each session's messages and tool calls live, and a red **STOPPED** line with the resume command when a task fails;
-- after a stop: fix the cause, then continue the queue from the monitor (Continue, or Retry on the failed task) rather than running `run.ps1` by hand; finished tasks are skipped either way, and the run lock makes a second runner of the same run folder exit at once;
+- after a stop: fix the cause, then continue the queue from the monitor (Continue, or Retry on the failed task) rather than running `run.mjs` by hand; finished tasks are skipped either way, and the run lock makes a second runner of the same run folder exit at once;
 - the user leaves the repository alone until the queue finishes: the sessions work in this same working tree, and a group's merge lands there too.
 
 When there are groups, also tell them:
 
-- each task of a group works in its own worktree under `wt\` in the run folder, on its own branch; once the group is merged, its worktrees and branches are removed;
-- while a group runs, the window shows only start and finish lines for its tasks; the monitor shows the rest, and `logs\NN.jsonl` still holds each full stream;
-- a merge conflict starts a conflict session that resolves it, tests what it touched and commits the merge, reporting in `results\merge-<first id>-<last id>.md`. If it cannot, that merge is undone, the queue stops, and the branches and worktrees not yet merged are kept;
+- each task of a group works in its own worktree under `wt/` in the run folder, on its own branch; once the group is merged, its worktrees and branches are removed;
+- while a group runs, the window shows only start and finish lines for its tasks; the monitor shows the rest, and `logs/NN.jsonl` still holds each full stream;
+- a merge conflict starts a conflict session that resolves it, tests what it touched and commits the merge, reporting in `results/merge-<first id>-<last id>.md`. If it cannot, that merge is undone, the queue stops, and the branches and worktrees not yet merged are kept;
 - when a task of a group fails, the others finish, nothing is merged and the queue stops; continuing the queue from the monitor continues the failed task in its own worktree.
