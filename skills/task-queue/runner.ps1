@@ -290,6 +290,38 @@ function Add-TicketExclude {
     [System.IO.File]::AppendAllText($file, "$lead$ticketExcludeLine`n", $utf8)
 }
 
+# Lays out compact JSON with two-space indents, as the monitor's JSON.stringify(doc, null, 2) does: PS 5.1's
+# ConvertTo-Json indents wide and unevenly. Strings are copied as they are, escapes included.
+function Format-Json([string]$json) {
+    $out = [System.Text.StringBuilder]::new()
+    $depth = 0
+    $inString = $false
+    for ($i = 0; $i -lt $json.Length; $i++) {
+        $c = $json[$i]
+        if ($inString) {
+            [void]$out.Append($c)
+            if ($c -eq '\') { $i++; [void]$out.Append($json[$i]) }
+            elseif ($c -eq '"') { $inString = $false }
+            continue
+        }
+        switch ($c) {
+            '"' { $inString = $true; [void]$out.Append($c) }
+            { $_ -eq '{' -or $_ -eq '[' } {
+                $close = if ($c -eq '{') { '}' } else { ']' }
+                if ($i + 1 -lt $json.Length -and $json[$i + 1] -eq $close) { [void]$out.Append("$c$close"); $i++; break }
+                $depth++
+                [void]$out.Append("$c`n").Append('  ' * $depth)
+            }
+            { $_ -eq '}' -or $_ -eq ']' } { $depth--; [void]$out.Append("`n").Append('  ' * $depth).Append($c) }
+            ',' { [void]$out.Append(",`n").Append('  ' * $depth) }
+            ':' { [void]$out.Append(': ') }
+            { [char]::IsWhiteSpace($_) } { }
+            default { [void]$out.Append($c) }
+        }
+    }
+    return $out.ToString()
+}
+
 # Writes the task's ticket state, tied to this run and the task's id; see above.
 function Write-TicketState($task, [string]$state) {
     if ($ParallelTask -or -not $task.ticket -or -not $queue.workDir) { return }
@@ -314,7 +346,7 @@ function Write-TicketState($task, [string]$state) {
             $doc.tickets | Add-Member -Force -NotePropertyName $key -NotePropertyValue $entry
             # Written whole: a temporary file beside it, renamed over it. A reader may hold the file a moment.
             $temp = "$stateFile.$PID.tmp"
-            [System.IO.File]::WriteAllText($temp, ($doc | ConvertTo-Json -Depth 20), $utf8)
+            [System.IO.File]::WriteAllText($temp, "$(Format-Json ($doc | ConvertTo-Json -Depth 20 -Compress))`n", $utf8)
             for ($attempt = 1; ; $attempt++) {
                 try {
                     # [NullString]: a plain $null reaches .NET as an empty path, which Replace refuses.

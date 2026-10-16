@@ -37,4 +37,6 @@ Cost: $0.38 ($0.13, $0.13, $0.12).
 
 Unexpected: the runner writes the state file with Windows PowerShell's `ConvertTo-Json`, so after its first write the file has that cmdlet's wide, ragged indentation instead of the server's two spaces. It stays valid JSON and every reader takes it, but it reads less easily than user story 47 asks. Nothing else was unexpected.
 
+Fixed afterwards: the runner now writes `ConvertTo-Json -Compress` output through a small `Format-Json` that lays it out with two-space indents and a closing newline, the same bytes as the server's `JSON.stringify(doc, null, 2)`. The lock, the temp file and the rename are unchanged, and it runs on PowerShell 5.1. `node check-picker.mjs` passes all 167 checks against it, and a state file written by a real runner queue, with a backslash and a quote in its ticket keys, reads back as valid JSON identical to `JSON.stringify(doc, null, 2)`, with the backslashes escaped.
+
 All five tickets of this spec are done, with the gap noted for 01 to 04: the earlier specs' checks are still gone and were not re-run.
