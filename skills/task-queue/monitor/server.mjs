@@ -6,12 +6,13 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { execFile, spawn } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { processTable, killProcesses, openWindow, openUrl, samePath } from '../platform.mjs';
 
 // The server's version, answered by /api/health. The ticket-queue skill compares it with the server.mjs it
 // ships and replaces a monitor that answers an older one; raise it with every change a skill relies on.
-const VERSION = 5;
+const VERSION = 6;
 const HOST = '127.0.0.1';
 const PORT = Number(process.env.TASK_QUEUE_MONITOR_PORT || 4747);
 const ROOT = process.env.TASK_QUEUE_ROOT || path.join(os.homedir(), '.claude-queues');
@@ -86,21 +87,10 @@ let livenessPending = null;
 
 function refreshLiveness() {
     if (livenessPending) return livenessPending;
-    const script = "Get-CimInstance Win32_Process -Filter \"Name='powershell.exe' OR Name='pwsh.exe' OR Name='claude.exe'\" | " +
-        'Select-Object ProcessId, ParentProcessId, Name, CommandLine | ConvertTo-Json -Compress';
-    livenessPending = new Promise(resolve => {
-        execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script],
-            { windowsHide: true, maxBuffer: 16 * 1024 * 1024, timeout: 30_000 },
-            (err, stdout) => {
-                if (!err) {
-                    try {
-                        const parsed = stdout.trim() ? JSON.parse(stdout) : [];
-                        liveness = { at: Date.now(), processes: Array.isArray(parsed) ? parsed : [parsed] };
-                    } catch { /* keep the previous snapshot */ }
-                }
-                livenessPending = null;
-                resolve(liveness);
-            });
+    livenessPending = processTable().then(table => {
+        if (table) liveness = { at: Date.now(), processes: table };
+        livenessPending = null;
+        return liveness;
     });
     return livenessPending;
 }
@@ -121,23 +111,23 @@ const PARALLEL_TASK_RE = /-ParallelTask\s+"?([A-Za-z0-9_-]+)"?/i;
 function runnerOf(runDir, locked = false) {
     if (!liveness.at) return { known: false };
     const script = path.join(runDir, 'run.ps1').toLowerCase();
-    const isShell = p => /^(powershell|pwsh)\.exe$/i.test(p.Name);
-    const scripts = liveness.processes.filter(p => isShell(p) && (p.CommandLine || '').toLowerCase().includes(script));
+    const isShell = p => /^(powershell|pwsh)\.exe$/i.test(p.name);
+    const scripts = liveness.processes.filter(p => isShell(p) && p.commandLine.toLowerCase().includes(script));
     const holder = locked ? lockHolder(runDir) : null;
     const runner = locked
-        ? scripts.find(p => p.ProcessId === holder && !PARALLEL_TASK_RE.test(p.CommandLine))
-        : scripts.find(p => !PARALLEL_TASK_RE.test(p.CommandLine));
+        ? scripts.find(p => p.pid === holder && !PARALLEL_TASK_RE.test(p.commandLine))
+        : scripts.find(p => !PARALLEL_TASK_RE.test(p.commandLine));
     if (!runner) return { known: true, alive: false };
-    const sessionOf = parent => liveness.processes.some(p => /^claude\.exe$/i.test(p.Name) && p.ParentProcessId === parent);
-    const main = sessionOf(runner.ProcessId);
+    const sessionOf = parent => liveness.processes.some(p => /^claude\.exe$/i.test(p.name) && p.ppid === parent);
+    const main = sessionOf(runner.pid);
     const tasks = new Map();
     for (const child of scripts) {
-        if (child.ParentProcessId !== runner.ProcessId) continue;
-        const id = PARALLEL_TASK_RE.exec(child.CommandLine)?.[1];
-        if (id) tasks.set(id, tasks.get(id) || sessionOf(child.ProcessId));
+        if (child.ppid !== runner.pid) continue;
+        const id = PARALLEL_TASK_RE.exec(child.commandLine)?.[1];
+        if (id) tasks.set(id, tasks.get(id) || sessionOf(child.pid));
     }
     const session = main || [...tasks.values()].some(Boolean);
-    return { known: true, alive: true, session, pid: runner.ProcessId, main, tasks };
+    return { known: true, alive: true, session, pid: runner.pid, main, tasks };
 }
 
 // The runner facts /api/run answers, as before groups; the per-task facts show in the task states.
@@ -220,15 +210,33 @@ function starting(runDir, runner, lines) {
     return false;
 }
 
-// Opens the run folder's runner in a new visible window, as the skill does. The hidden PowerShell that
-// starts it ends at once. It must not be detached: without a console of its own, its Start-Process opens
-// nothing.
-function launchRunner(runDir) {
-    const script = path.join(runDir, 'run.ps1').replace(/'/g, "''");
-    const command = `Start-Process powershell.exe -ArgumentList '-NoExit', '-NoProfile', '-File', '"${script}"'`;
-    spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(command, 'utf16le').toString('base64')],
-        { stdio: 'ignore', windowsHide: true }).unref();
+// Why the run folder's runner cannot be launched on this computer, or null. A run folder's runner is still the
+// PowerShell `run.ps1`, which only Windows runs.
+function launchRefusal(runDir) {
+    return process.platform === 'win32' ? null : "this run folder's runner is a PowerShell script";
+}
+
+// Opens the run folder's runner in a new visible window, as the skill does, and counts it as starting.
+// Rejects with the reason when the window could not be opened; the caller writes the admin line.
+async function launchRunner(runDir) {
+    const refusal = launchRefusal(runDir);
+    if (refusal) throw new Error(refusal);
+    await openWindow({ title: `Task queue: ${path.basename(runDir)}`, cwd: runDir, command: 'powershell.exe',
+        args: ['-NoProfile', '-File', path.join(runDir, 'run.ps1')] });
     launches.set(runDir, Date.now());
+}
+
+// Launches the runner for an admin action; a failure is written to progress.log and answered with 500.
+// Answers whether the launch went.
+async function launchOrAnswer(res, runDir) {
+    try {
+        await launchRunner(runDir);
+        return true;
+    } catch (err) {
+        appendProgress(runDir, `admin: launch failed (${err.message})`);
+        send(res, 500, { error: `the runner could not be launched: ${err.message}` });
+        return false;
+    }
 }
 
 // --- progress.log -> run and task states. ---
@@ -525,11 +533,13 @@ function adminOf(runDir, supported, detail, runner, control, lines) {
     refuse('cancel-pause', finished ? 'the run is finished' : noRunner || (!control.pause ? 'no pause is asked for' : null));
     const busy = !runner.known && !launching ? 'the process check is still pending'
         : launching ? 'the runner is starting' : alive ? 'a runner of this run is alive' : null;
-    refuse('continue', finished ? 'the run is finished' : busy);
+    // A runner this computer cannot launch leaves Continue and Retry refused, whatever else holds.
+    const cannotLaunch = launchRefusal(runDir);
+    refuse('continue', finished ? 'the run is finished' : busy || cannotLaunch);
     const actions = RUN_ACTIONS.filter(a => !refusals[a]);
     const taskRefusals = {};
     for (const t of detail.tasks) {
-        taskRefusals[t.id] = Object.fromEntries(TASK_ACTIONS.map(a => [a, taskRefusal(a, t, finished, control, busy)]).filter(([, why]) => why));
+        taskRefusals[t.id] = Object.fromEntries(TASK_ACTIONS.map(a => [a, taskRefusal(a, t, finished, control, busy || cannotLaunch)]).filter(([, why]) => why));
         t.actions = TASK_ACTIONS.filter(a => !taskRefusals[t.id][a]);
         // A retry resumes the session of the task's last attempt, never an earlier attempt's that the user
         // left behind with a fresh retry: an attempt that died before naming a session can only start over.
@@ -753,7 +763,7 @@ async function applyAdmin(res, runDir, queue, action, task, forTask, extra) {
         // The new runner must not pause at once on a pause the user asked of the one before.
         if (control.pause) writeControl(runDir, { ...control, pause: false });
         appendProgress(runDir, 'admin: continue - run.ps1 launched in a new window');
-        launchRunner(runDir);
+        if (!(await launchOrAnswer(res, runDir))) return;
     } else if (action === 'skip') {
         writeControl(runDir, { ...control, skip: [...skipList(control), task] });
         appendProgress(runDir, `admin: skip requested (task ${task})`);
@@ -762,6 +772,7 @@ async function applyAdmin(res, runDir, queue, action, task, forTask, extra) {
         appendProgress(runDir, `admin: unskip requested (task ${task})`);
     } else if (action === 'retry') {
         retryTask(runDir, lines, control, target, extra);
+        if (!(await launchOrAnswer(res, runDir))) return;
     } else if (action === 'edit-brief') {
         // Stored as typed. The runner reads the brief when it starts the task, so the check above and this
         // write leave a window of milliseconds in which a start misses the edit: accepted (spec, Further Notes).
@@ -782,8 +793,8 @@ function unusedEntries(lines, control, key) {
     return Object.fromEntries(Object.entries(entries).filter(([, e]) => e && !entryUsed(lines, e.id)));
 }
 
-// Writes the task's `retry` entry, which replaces a `resume` entry a hard stop left it, then launches the
-// runner as Continue does. A fresh retry's note is first appended to the brief, under a heading with the
+// Writes the task's `retry` entry, which replaces a `resume` entry a hard stop left it; the caller then
+// launches the runner as Continue does. A fresh retry's note is first appended to the brief, under a heading with the
 // time; a resumed one's reaches the session through the entry. The session to resume is the last attempt's.
 function retryTask(runDir, lines, control, task, { mode, note }) {
     const id = crypto.randomBytes(6).toString('hex');
@@ -800,7 +811,6 @@ function retryTask(runDir, lines, control, task, { mode, note }) {
     writeControl(runDir, { ...control, pause: false, retry, resume });
     const oneLine = note.replace(/\s+/g, ' ');
     appendProgress(runDir, `admin: retry requested (task ${task.id}, mode ${mode}, entry ${id})${oneLine ? ` - note: ${oneLine}` : ''}`);
-    launchRunner(runDir);
 }
 
 // --- Hard stop: the runner's process tree is killed at once. ---
@@ -816,18 +826,8 @@ function runCommand(file, args, cwd) {
         (err, stdout, stderr) => resolve({ ok: !err, out: `${stdout || ''}${stderr || ''}`.trim() })));
 }
 
-// Every process now, with its creation time. The liveness snapshot lists only PowerShell and claude; a
-// session's own commands are other programs.
-async function processTable() {
-    const script = 'Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId, ' +
-        "@{ n = 'Created'; e = { $_.CreationDate.ToFileTimeUtc() } } | ConvertTo-Json -Compress";
-    const { ok, out } = await runCommand('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script]);
-    if (!ok) return null;
-    try { const parsed = JSON.parse(out); return Array.isArray(parsed) ? parsed : [parsed]; } catch { return null; }
-}
-
 // The processes of `roots` (pid -> creation time) and every process under them, by pid -> creation time.
-// Windows reuses process ids: a process is a child only when it was created after its parent, so a process
+// Process ids are reused: a process is a child only when it was created after its parent, so a process
 // whose parent id now names a newer process is not taken along.
 function descendants(table, roots) {
     const tree = new Map(roots);
@@ -835,9 +835,9 @@ function descendants(table, roots) {
     while (queue.length) {
         const parent = queue.shift();
         for (const p of table) {
-            if (p.ParentProcessId !== parent || tree.has(p.ProcessId) || p.Created < tree.get(parent)) continue;
-            tree.set(p.ProcessId, p.Created);
-            queue.push(p.ProcessId);
+            if (p.ppid !== parent || tree.has(p.pid) || p.created < tree.get(parent)) continue;
+            tree.set(p.pid, p.created);
+            queue.push(p.pid);
         }
     }
     return tree;
@@ -849,14 +849,14 @@ function descendants(table, roots) {
 // process table read; or null when the process table could not be read.
 async function killTree(runnerPid) {
     let table = await processTable();
-    const runner = table?.find(p => p.ProcessId === runnerPid);
+    const runner = table?.find(p => p.pid === runnerPid);
     if (!runner) return table && { gone: true, alive: [], table };
-    let tree = new Map([[runnerPid, runner.Created]]);
+    let tree = new Map([[runnerPid, runner.created]]);
     for (let pass = 1; pass <= 3; pass++) {
         tree = descendants(table, tree);
-        const alive = [...tree].filter(([pid, created]) => table.some(p => p.ProcessId === pid && p.Created === created)).map(([pid]) => pid);
+        const alive = [...tree].filter(([pid, created]) => table.some(p => p.pid === pid && p.created === created)).map(([pid]) => pid);
         if (!alive.length || pass === 3) return { alive, table };
-        await runCommand('taskkill', ['/F', ...alive.flatMap(pid => ['/PID', String(pid)])]);
+        await killProcesses(alive);
         table = await processTable();
         if (!table) return null;
     }
@@ -921,8 +921,8 @@ async function hardStop(res, runDir, queue) {
     // The page's next poll must not see the killed runner alive: the snapshot loses what the table lacks,
     // once a snapshot already on its way, taken before the kill, is in.
     await livenessPending;
-    const now = new Set(killed.table.map(p => p.ProcessId));
-    liveness = { ...liveness, processes: liveness.processes.filter(p => now.has(p.ProcessId)) };
+    const now = new Set(killed.table.map(p => p.pid));
+    liveness = { ...liveness, processes: liveness.processes.filter(p => now.has(p.pid)) };
 
     // An entry the runner applied is used; it is dropped, and a task cut off again gets a new one.
     const { control } = readControl(runDir);
@@ -959,7 +959,7 @@ async function hardStop(res, runDir, queue) {
 
 // --- Ticket picker: the repository register, a repository's .scratch tickets, and the repository actions. ---
 
-// repos.json in the queue root, which the ticket-queue skill's register.ps1 writes.
+// repos.json in the queue root, which the ticket-queue skill's register.mjs writes.
 const REGISTER_FILE = path.join(ROOT, 'repos.json');
 
 // The register as written, or null when it is not valid JSON; a missing file is an empty register.
@@ -1159,9 +1159,6 @@ function tiedState(entry, runs) {
     const state = task && TICKET_STATE_OF_TASK[task.state];
     return state ? { state, live: known.live } : null;
 }
-
-// Paths compared as Windows compares them: case-insensitively, without a trailing backslash.
-const samePath = (a, b) => path.resolve(a).replace(/\\+$/, '').toLowerCase() === path.resolve(b).replace(/\\+$/, '').toLowerCase();
 
 // The repository's runs: run folders whose queue.json `workDir` is the repository's path. `live` lists those
 // whose runner is alive or starting, `unfinished` the others that have not finished.
@@ -1395,7 +1392,13 @@ async function newQueue(res, repo, keys, settings) {
         } catch (err) { warning = `the ticket state file could not be updated: ${err.message}`; }
         appendProgress(runDir, `admin: queue created from the ticket picker (${tasks.length} tickets)`);
         if (warning) appendProgress(runDir, `admin: ${warning}`);
-        launchRunner(runDir);
+        // The run folder stays when only the launch fails: the queue is written, and Continue can start it.
+        let launchError = null;
+        try { await launchRunner(runDir); } catch (err) { launchError = err; }
+        if (launchError) {
+            appendProgress(runDir, `admin: launch failed (${launchError.message})`);
+            return send(res, 500, { error: `the runner could not be launched: ${launchError.message}`, project, run });
+        }
         return send(res, 200, { ok: true, project, run, ...(warning ? { warning } : {}) });
     } catch (err) {
         if (runDir) fs.rmSync(runDir, { recursive: true, force: true });
@@ -1497,7 +1500,7 @@ async function handle(req, res) {
 }
 
 function openBrowser() {
-    spawn('cmd.exe', ['/c', 'start', '""', URL_BASE], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
+    openUrl(URL_BASE).catch(err => console.log(`The browser could not be opened (${err.message}).`));
 }
 
 const server = http.createServer((req, res) => {
@@ -1526,8 +1529,8 @@ setInterval(async () => {
     if (Date.now() - lastRequestAt < IDLE_EXIT_MS) return;
     await refreshLiveness();
     const root = ROOT.toLowerCase();
-    const anyRunner = liveness.processes.some(p => /^(powershell|pwsh)\.exe$/i.test(p.Name) &&
-        (p.CommandLine || '').toLowerCase().includes(root) && /run\.ps1/i.test(p.CommandLine || ''));
+    const anyRunner = liveness.processes.some(p => /^(powershell|pwsh)\.exe$/i.test(p.name) &&
+        p.commandLine.toLowerCase().includes(root) && /run\.ps1/i.test(p.commandLine));
     if (!anyRunner) {
         console.log('Idle for 2 hours with no running queue; exiting.');
         process.exit(0);

@@ -85,7 +85,7 @@ Run folders made before this change still have a `run.ps1`. On Windows they keep
   - On macOS, the first call from a process makes the system ask whether that program may control Terminal. When `osascript` fails with error `-1743` (not authorised), the function throws `macOS did not allow <program> to control Terminal: System Settings > Privacy & Security > Automation`.
 - **`startHidden({ command, args, env })`** starts a process that outlives its parent, with no window, and resolves once it is spawned: `spawn(…, { detached: true, stdio: 'ignore', windowsHide: true }).unref()`. Used to start the monitor.
 - **`openUrl(url)`**: `cmd.exe /c start "" "<url>"` on Windows, `open <url>` on macOS.
-- **`claudeCommand()`** resolves to `{ file, prefixArgs, viaShell }` for running `claude`, found on `PATH`.
+- **`claudeCommand()`** returns `{ file, viaShell, argv(args), options }` for running `claude`, found on `PATH`: the caller spawns `file` with `argv(args)`, and merges `options` into its spawn options.
   - On Windows, `claude.exe` is preferred. When only `claude.cmd` or `claude.bat` is found, it is run through `cmd.exe /d /s /c`, with every argument quoted by cmd's rules: a `"` is doubled, and `%`, `^`, `&`, `|`, `<` and `>` are escaped. Without that quoting, a task title could break the command line.
   - On macOS, the `claude` found on `PATH`.
   - When none is found, it throws `claude was not found on the PATH`.

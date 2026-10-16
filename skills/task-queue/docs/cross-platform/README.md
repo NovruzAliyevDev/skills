@@ -16,4 +16,21 @@ Tickets 01 to 03 each end with a check on macOS. A queue running on Windows cann
 
 ## Status
 
-No ticket started yet.
+01 is built and checked on Windows. It stays `in-progress` until the macOS part is run, because no Mac was available.
+
+- `check-platform.mjs` (new, in `%TEMP%\task-queue-monitor-fixtures`): 21 of 21 pass on Windows with `--windows`. That covers the process table, killing, the port owner, `claude.exe` before `claude.cmd`, arguments with `"`, `%`, `&`, `^`, `|`, `<`, `>`, a trailing backslash and an empty string reaching a `.cmd` stub unchanged, a hidden process, `samePath`, and a real `cmd /k` window running its command in its folder.
+- `check-picker.mjs`, made to run `register.mjs`, `ensure-monitor.mjs` and the platform module: 167 of 167 pass on Windows, the same as before the change. The runner is still `runner.ps1`, launched through `openWindow` (`start` with `cmd.exe /k` around `powershell.exe -File run.ps1`), and no runner window was left open afterwards.
+- `server.mjs` calls no `powershell.exe`, `taskkill` or `cmd.exe` itself. The one remaining `powershell.exe` is the command of a legacy runner's window, given to `openWindow`.
+- Not run yet:
+  - `ensure-monitor.mjs --open`, because it opens the real default browser;
+  - every macOS branch: `ps` and `lsof` parsing, `osascript` and the Automation error, `open`, and the macOS refusal of Continue, Retry and Start for `run.ps1` folders.
+- Not in the spec: a launch failure in `new-queue` answers 500 but keeps the run folder, since the queue is written and Continue can start it. Only a failure before the launch removes it.
+- Changed from the spec: `claudeCommand()` returns `{ file, viaShell, argv(args), options }`. The spec now says so.
+
+To run the Mac part on a Mac with this repository at `~/Development/Skills`:
+
+```sh
+SKILLS_DIR=~/Development/Skills/skills node check-platform.mjs --windows
+```
+
+For `check-picker.mjs` on a Mac, only its register, reading, refusal and monitor-version scenarios apply until ticket 02. Its chat-flow scenarios still call `powershell.exe`.
