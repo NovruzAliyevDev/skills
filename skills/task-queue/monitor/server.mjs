@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url';
 
 // The server's version, answered by /api/health. The ticket-queue skill compares it with the server.mjs it
 // ships and replaces a monitor that answers an older one; raise it with every change a skill relies on.
-const VERSION = 3;
+const VERSION = 4;
 const HOST = '127.0.0.1';
 const PORT = Number(process.env.TASK_QUEUE_MONITOR_PORT || 4747);
 const ROOT = process.env.TASK_QUEUE_ROOT || path.join(os.homedir(), '.claude-queues');
@@ -988,6 +988,7 @@ function repoOf(project) {
 // A ticket is `.scratch/<feature>/issues/NN-slug.md`; its key is that path relative to `.scratch`.
 const TICKET_FILE_RE = /^(\d{2})-(.+)\.md$/;
 const STATUS_RE = /^\*\*Status:\*\*[ \t]*([^\s*]+)/m;
+const BLOCKED_BY_RE = /^\*\*Blocked by:\*\*(.*)$/m;
 
 // The names of the files in a folder; none when it is missing.
 function safeFiles(dir) {
@@ -1002,17 +1003,34 @@ function readTicket(feature, issuesDir, name) {
     const text = readText(path.join(issuesDir, name)) ?? '';
     const heading = /^# (.+)$/m.exec(text)?.[1].replace(/^\d+\s*:\s*/, '').trim();
     const status = STATUS_RE.exec(text)?.[1] ?? null;
-    return { key: `${feature}/issues/${name}`, feature, file: path.join(issuesDir, name), number: Number(number), title: heading || slug, status };
+    const blockedBy = BLOCKED_BY_RE.exec(text)?.[1].trim() ?? null;
+    return { key: `${feature}/issues/${name}`, feature, file: path.join(issuesDir, name), number: Number(number), title: heading || slug, status, blockedBy };
+}
+
+// A ticket's blockers are the one- or two-digit numbers in its Blocked by line that are tickets of its feature.
+// A line starting with None has none; a line with no such number is unread and blocks nothing. References to
+// other features are not followed: a number right after another feature's name (`beta 02`, `beta/issues/02-x`)
+// is that feature's, and is dropped.
+function blockersOf(blockedBy, numbers, own, otherFeatures) {
+    if (blockedBy === null || /^none\b/i.test(blockedBy)) return { blockers: [], unread: false };
+    const line = otherFeatures.reduce((text, name) => text.replace(
+        new RegExp(`${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:[\\s/#:]|issues/)*\\d{1,2}(?!\\d)`, 'gi'), ' '), blockedBy);
+    const found = (line.match(/(?<!\d)\d{1,2}(?!\d)/g) || []).map(Number).filter(n => numbers.has(n) && n !== own);
+    const blockers = [...new Set(found)].sort((a, b) => a - b);
+    return { blockers, unread: blockers.length === 0 };
 }
 
 // The repository's features, alphabetically, each with its tickets by number. Read on every call.
 function readTickets(repoPath) {
     const scratch = path.join(repoPath, '.scratch');
-    return safeReaddir(scratch).sort((a, b) => a.localeCompare(b, 'en')).map(name => {
+    const names = safeReaddir(scratch).sort((a, b) => a.localeCompare(b, 'en'));
+    return names.map(name => {
         const issuesDir = path.join(scratch, name, 'issues');
         const hasIssues = !!statOrNull(issuesDir)?.isDirectory();
         const tickets = safeFiles(issuesDir).filter(f => TICKET_FILE_RE.test(f)).map(f => readTicket(name, issuesDir, f))
             .sort((a, b) => a.number - b.number || a.key.localeCompare(b.key));
+        const numbers = new Set(tickets.map(t => t.number));
+        for (const t of tickets) Object.assign(t, blockersOf(t.blockedBy, numbers, t.number, names.filter(n => n !== name)));
         return { name, hasIssues, hasSpec: !!statOrNull(path.join(scratch, name, 'spec.md'))?.isFile(), tickets };
     });
 }
@@ -1171,7 +1189,38 @@ async function ticketsOf(repoPath) {
 }
 
 // What /api/tickets answers of a ticket; `run` and `task` only when its entry is tied to a run that exists.
-const publicTicket = ({ key, number, title, status, state, actions, run, task }) => ({ key, number, title, status, state, actions, ...(run ? { run, task } : {}) });
+const publicTicket = ({ key, number, title, status, blockers, unread, state, actions, run, task }) =>
+    ({ key, number, title, status, blockers, unread, state, actions, ...(run ? { run, task } : {}) });
+
+// The picked tickets in queue order: features alphabetically, then each feature's picked tickets with every
+// blocker first, ties broken by number. `problems` names each picked ticket whose blocker is neither picked
+// nor done, and the picked tickets that wait on each other; the picker's order panel does the same.
+function queueOrder(features, keys) {
+    const pickedKeys = new Set(keys), order = [], problems = [];
+    for (const f of features) {
+        const picked = f.tickets.filter(t => pickedKeys.has(t.key));
+        const waitsOn = new Map(picked.map(t => [t, []]));
+        for (const t of picked) {
+            for (const b of f.tickets.filter(x => t.blockers.includes(x.number))) {
+                if (pickedKeys.has(b.key)) waitsOn.get(t).push(b);
+                else if (b.state !== 'done') problems.push(`ticket ${t.key} is blocked by ${b.key}, which is neither picked nor done`);
+            }
+        }
+        const placed = new Set();
+        for (let left = picked; left.length;) {
+            // Tickets come by number, so the first one ready breaks the tie.
+            const next = left.find(t => waitsOn.get(t).every(b => placed.has(b)));
+            if (!next) {
+                problems.push(`tickets ${left.map(t => t.key).join(', ')} wait on each other`);
+                break;
+            }
+            placed.add(next);
+            order.push(next);
+            left = left.filter(t => t !== next);
+        }
+    }
+    return { order, problems };
+}
 
 const REPO_ACTIONS = ['new-queue', 'forget-repo'];
 const PERMISSION_MODES = ['auto', 'acceptEdits', 'bypassPermissions'];
@@ -1238,14 +1287,14 @@ function makeRunFolder(project) {
 // Writes a run folder from the picked tickets and launches its runner, as the task-queue skill's chat flow
 // does. A failure before the launch removes the run folder.
 async function newQueue(res, repo, keys, settings) {
-    const all = (await ticketsOf(repo.path)).features.flatMap(f => f.tickets);
-    const byKey = new Map(all.map(t => [t.key, t]));
+    const { features } = await ticketsOf(repo.path);
+    const byKey = new Map(features.flatMap(f => f.tickets).map(t => [t.key, t]));
     const unknown = keys.find(k => !byKey.has(k));
     if (unknown) return send(res, 400, { error: `unknown ticket '${unknown}'` });
     const held = keys.map(k => byKey.get(k)).find(t => !SELECTABLE.has(t.state));
     if (held) return send(res, 409, { error: `ticket ${held.key} is ${held.state}${held.run ? ` in run ${held.run}` : ''}` });
-    // Features alphabetically, then by number: the order readTickets gives.
-    const picked = all.filter(t => keys.includes(t.key));
+    const { order: picked, problems } = queueOrder(features, keys);
+    if (problems.length) return send(res, 409, { error: problems.join('; ') });
 
     // `queuedIn` is the run whose queued entries were written, `replaced` the entries they replaced.
     let runDir = null, newProject = false, queuedIn = null;

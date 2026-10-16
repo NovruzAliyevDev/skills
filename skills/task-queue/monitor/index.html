@@ -287,6 +287,8 @@ details.agent > summary { cursor: pointer; font-size: 12px; color: var(--muted);
 .picker-settings input[type="text"] { width: min(12em, 100%); }
 .picker-order { margin: 0 0 10px; padding-left: 0; list-style: none; font-size: 13px; }
 .picker-order li { padding: 1px 0; overflow-wrap: anywhere; }
+.picker-problems { margin: 0 0 10px; padding-left: 18px; color: var(--bad); font-size: 13px; font-weight: 600; }
+.picker-problems li { overflow-wrap: anywhere; }
 .picker-start { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; margin-top: 8px; }
 .picker-start .muted { font-size: 13px; }
 
@@ -363,6 +365,7 @@ details.agent > summary { cursor: pointer; font-size: 12px; color: var(--muted);
         </fieldset>
         <h3 class="order-title" id="picker-order-title">Order</h3>
         <ol class="picker-order" id="picker-order" aria-labelledby="picker-order-title"></ol>
+        <ul class="picker-problems" id="picker-problems" aria-label="Blocking problems" hidden></ul>
         <p class="admin-msg" id="picker-msg" role="status"></p>
         <div class="picker-start">
           <button type="button" class="btn" id="picker-start" aria-disabled="true" aria-describedby="picker-start-why">Start</button>

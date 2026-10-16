@@ -22,7 +22,7 @@ export function createPicker(root, { onProject, onStarted }) {
   const $ = id => root.querySelector(`#${id}`);
   const empty = $('picker-empty'), body = $('picker-body');
   const repoSelect = $('picker-repo'), path = $('picker-path'), forget = $('picker-forget'), projectName = $('picker-project');
-  const warnings = $('picker-warnings'), features = $('picker-features'), order = $('picker-order');
+  const warnings = $('picker-warnings'), features = $('picker-features'), order = $('picker-order'), problemList = $('picker-problems');
   const mode = $('picker-mode'), model = $('picker-model'), effort = $('picker-effort');
   const start = $('picker-start'), why = $('picker-start-why'), message = $('picker-msg');
 
@@ -72,6 +72,9 @@ export function createPicker(root, { onProject, onStarted }) {
         const warn = t.status && !KNOWN_STATUS.has(t.status)
           ? ` <span class="badge s-warn" title="Its Status line says ${esc(t.status)}, not ready-for-agent">status: ${esc(t.status)}</span>`
           : !t.status ? ' <span class="badge s-warn" title="It has no Status line">no status</span>' : '';
+        const unread = t.unread
+          ? ' <span class="badge s-warn" title="Its Blocked by line names no ticket of this feature, so it blocks nothing">blocked by: unread</span>'
+          : '';
         // A ticket tied to a run links to it.
         const held = t.run
           ? ` <a class="ticket-run" href="#${esc(encodeURIComponent(t.run))}" aria-label="${esc(`${f.name} ${two(t.number)}: ${t.state} in run ${t.run}, task ${t.task}`)}">${esc(t.run.split('/')[1])}</a>`
@@ -79,7 +82,7 @@ export function createPicker(root, { onProject, onStarted }) {
         return `<li class="ticket-row${selectable ? '' : ' unselectable'}">
           <input type="checkbox" id="${id}" data-key="${esc(t.key)}"${picked.has(t.key) ? ' checked' : ''}${selectable ? '' : ' disabled'}>
           <label for="${id}"><span class="sr-only">${esc(f.name)} </span><b class="num">${two(t.number)}</b> <span class="ticket-title">${esc(t.title)}</span></label>
-          <span class="ticket-badges">${badge(t.state)}${warn}${held}</span></li>`;
+          <span class="ticket-badges">${badge(t.state)}${warn}${unread}${held}</span></li>`;
       }).join('');
       return `<section class="feature" aria-labelledby="feature-${fi}"><h3 id="feature-${fi}">${esc(f.name)}</h3>${
         f.tickets.length ? `<ul class="tickets">${rows}</ul>` : '<p class="no-tickets">no tickets</p>'}</section>`;
@@ -88,19 +91,47 @@ export function createPicker(root, { onProject, onStarted }) {
     if (setHtml(features, html) && focused) [...features.querySelectorAll('input[data-key]')].find(i => i.dataset.key === focused)?.focus();
   }
 
-  // The picked tickets in queue order: features alphabetically, then by number, as the server orders them.
+  // The picked tickets in queue order, as the server orders them: features alphabetically, then each feature's
+  // picked tickets with every blocker first, ties broken by number. `problems` are what the server would refuse:
+  // a blocker neither picked nor done, and picked tickets that wait on each other.
   function queueOrder() {
-    return allTickets().filter(t => picked.has(t.key));
+    const list = [], problems = [];
+    const label = t => `${t.feature} ${two(t.number)}`;
+    for (const f of tickets?.features || []) {
+      const all = f.tickets.map(t => ({ ...t, feature: f.name }));
+      const pickedHere = all.filter(t => picked.has(t.key));
+      const waitsOn = new Map(pickedHere.map(t => [t.key, []]));
+      for (const t of pickedHere) {
+        for (const b of all.filter(x => t.blockers.includes(x.number))) {
+          if (picked.has(b.key)) waitsOn.get(t.key).push(b.key);
+          else if (b.state !== 'done') problems.push(`${label(t)} is blocked by ${label(b)} ${b.title}, which is neither picked nor done.`);
+        }
+      }
+      const placed = new Set();
+      for (let left = pickedHere; left.length;) {
+        // Tickets come by number, so the first one ready breaks the tie.
+        const next = left.find(t => waitsOn.get(t.key).every(k => placed.has(k)));
+        if (!next) { problems.push(`${left.map(label).join(', ')} wait on each other.`); break; }
+        placed.add(next.key);
+        list.push(next);
+        left = left.filter(t => t !== next);
+      }
+    }
+    return { list, problems };
   }
 
   function renderOrder() {
-    const list = queueOrder();
+    const { list, problems } = queueOrder();
     setHtml(order, list.length
       ? list.map((t, i) => `<li><b class="num">${two(i + 1)}</b> ${esc(taskTitle(t))}</li>`).join('')
       : '<li class="empty">No ticket picked yet.</li>');
+    setHtml(problemList, problems.map(p => `<li>${esc(p)}</li>`).join(''));
+    problemList.hidden = !problems.length;
     const reason = busy ? 'starting…'
       : !repo()?.exists ? 'the repository folder is gone'
-      : !list.length ? 'pick at least one ticket'
+      : !list.length && !problems.length ? 'pick at least one ticket'
+      : problems.length === 1 ? 'a picked ticket is blocked, as said under the order'
+      : problems.length ? `${problems.length} blocking problems, listed under the order`
       : !NAME_RE.test(projectName.value) ? 'the project name may hold only letters, digits, dots, dashes and underscores'
       : '';
     start.setAttribute('aria-disabled', String(!!reason));
@@ -155,7 +186,7 @@ export function createPicker(root, { onProject, onStarted }) {
     message.textContent = '';
     renderOrder();
     const result = await postAdmin({ project: asked }, 'new-queue', {
-      tickets: queueOrder().map(t => t.key),
+      tickets: queueOrder().list.map(t => t.key),
       settings: { permissionMode: mode.value, model: model.value.trim() || null, effort: effort.value.trim() || null, projectName: projectName.value },
     });
     busy = false;
