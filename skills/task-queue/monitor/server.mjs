@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url';
 
 // The server's version, answered by /api/health. The ticket-queue skill compares it with the server.mjs it
 // ships and replaces a monitor that answers an older one; raise it with every change a skill relies on.
-const VERSION = 4;
+const VERSION = 5;
 const HOST = '127.0.0.1';
 const PORT = Number(process.env.TASK_QUEUE_MONITOR_PORT || 4747);
 const ROOT = process.env.TASK_QUEUE_ROOT || path.join(os.homedir(), '.claude-queues');
@@ -1040,6 +1040,8 @@ function readTickets(repoPath) {
 const TICKET_STATES = ['todo', 'queued', 'running', 'done', 'failed', 'skipped'];
 // Done, queued and running tickets cannot be picked.
 const SELECTABLE = new Set(['todo', 'failed', 'skipped']);
+// The states the mark action sets.
+const MARKS = ['done', 'todo'];
 const STATE_LOCK_WAIT_MS = 10_000;
 const STATE_LOCK_STALE_MS = 60_000;
 // Covers the lock and the temporary files beside the state file too.
@@ -1137,18 +1139,47 @@ const TICKET_STATE_OF_TASK = {
     failed: 'failed', stopped: 'failed', interrupted: 'failed', skipped: 'skipped',
 };
 
-// The ticket state of a tied entry's task in its run; null when the run folder or the task is gone.
-// `tasksByRun` keeps each run folder's derived tasks for one request.
-function tiedState(entry, tasksByRun) {
+// Whether a runner of the run is alive or starting, from its snapshot.
+const runnerLive = (runDir, { runner, lines }) => starting(runDir, runner, lines) || (runner.known && runner.alive);
+
+// A tied entry's task in its run, as `{ state, live }`: its ticket state and whether a runner of the run is
+// alive or starting; null when the run folder or the task is gone. `runs` keeps each run folder's derived
+// tasks and liveness for one request.
+function tiedState(entry, runs) {
     const [project, run, ...rest] = entry.run.split('/');
     if (rest.length || !NAME_RE.test(project || '') || !NAME_RE.test(run || '')) return null;
     const runDir = path.join(ROOT, project, run);
-    if (!tasksByRun.has(runDir)) {
+    if (!runs.has(runDir)) {
         const queue = readQueue(runDir);
-        tasksByRun.set(runDir, queue ? snapshotOf(runDir, queue).detail.tasks : null);
+        const snapshot = queue && snapshotOf(runDir, queue);
+        runs.set(runDir, snapshot ? { tasks: snapshot.detail.tasks, live: runnerLive(runDir, snapshot) } : null);
     }
-    const task = tasksByRun.get(runDir)?.find(t => t.id === entry.task);
-    return task ? TICKET_STATE_OF_TASK[task.state] ?? null : null;
+    const known = runs.get(runDir);
+    const task = known?.tasks.find(t => t.id === entry.task);
+    const state = task && TICKET_STATE_OF_TASK[task.state];
+    return state ? { state, live: known.live } : null;
+}
+
+// Paths compared as Windows compares them: case-insensitively, without a trailing backslash.
+const samePath = (a, b) => path.resolve(a).replace(/\\+$/, '').toLowerCase() === path.resolve(b).replace(/\\+$/, '').toLowerCase();
+
+// The repository's runs: run folders whose queue.json `workDir` is the repository's path. `live` lists those
+// whose runner is alive or starting, `unfinished` the others that have not finished.
+function repoRuns(repoPath) {
+    const live = [], unfinished = [];
+    for (const project of safeReaddir(ROOT)) {
+        for (const run of safeReaddir(path.join(ROOT, project))) {
+            const runDir = path.join(ROOT, project, run);
+            const queue = readQueue(runDir);
+            if (typeof queue?.workDir !== 'string' || !samePath(queue.workDir, repoPath)) continue;
+            const snapshot = snapshotOf(runDir, queue);
+            const facts = { run: `${project}/${run}`, state: snapshot.detail.state };
+            if (runnerLive(runDir, snapshot)) live.push(facts);
+            else if (!FINISHED.has(facts.state)) unfinished.push(facts);
+        }
+    }
+    const byRun = (a, b) => a.run.localeCompare(b.run);
+    return { alive: live.length > 0, live: live.sort(byRun), unfinished: unfinished.sort(byRun) };
 }
 
 // The repository's features, each ticket with its effective state: a tied entry follows its run's task while
@@ -1158,16 +1189,19 @@ async function ticketsOf(repoPath) {
     const features = readTickets(repoPath);
     const read = readStateFile(repoPath);
     const entries = stateEntries(read);
-    const tasksByRun = new Map(), corrections = [];
+    const runs = new Map(), corrections = [];
     for (const t of features.flatMap(f => f.tickets)) {
         const e = entries[t.key];
-        const fromRun = e && isTied(e) ? tiedState(e, tasksByRun) : null;
+        const fromRun = e && isTied(e) ? tiedState(e, runs) : null;
         if (fromRun) {
-            Object.assign(t, { state: fromRun, run: e.run, task: e.task });
-            if (fromRun !== e.state) corrections.push({ key: t.key, was: e, state: fromRun });
+            Object.assign(t, { state: fromRun.state, run: e.run, task: e.task, heldByRunner: fromRun.live });
+            if (fromRun.state !== e.state) corrections.push({ key: t.key, was: e, state: fromRun.state });
         }
         else t.state = e ? e.state : t.status === 'done' ? 'done' : 'todo';
-        t.actions = SELECTABLE.has(t.state) ? ['select'] : [];
+        // A ticket can be marked to a state it is not in, unless a live runner holds it or the state file
+        // cannot be written.
+        const markable = !t.heldByRunner && read.status !== 'unreadable';
+        t.actions = [...(SELECTABLE.has(t.state) ? ['select'] : []), ...(markable ? MARKS.filter(m => m !== t.state).map(m => `mark-${m}`) : [])];
     }
     const stateFile = { status: read.status, ...(read.reason ? { reason: read.reason } : {}) };
     // Rewritten only while the entry still is the one judged: a writer may have changed it since.
@@ -1222,7 +1256,7 @@ function queueOrder(features, keys) {
     return { order, problems };
 }
 
-const REPO_ACTIONS = ['new-queue', 'forget-repo'];
+const REPO_ACTIONS = ['new-queue', 'mark', 'forget-repo'];
 const PERMISSION_MODES = ['auto', 'acceptEdits', 'bypassPermissions'];
 // A model or effort setting reaches the runner's command line, so it is one word.
 const SETTING_RE = /^[A-Za-z0-9._:[\]-]{1,100}$/;
@@ -1234,6 +1268,12 @@ async function handleRepoAction(res, body) {
     const repo = repoOf(project);
     if (!repo) return send(res, 400, { error: `'${String(project)}' is not a registered repository` });
     if (action === 'forget-repo') return inTurn('repos', () => forgetRepo(res, repo));
+    if (action === 'mark') {
+        const { ticket, state } = body;
+        if (typeof ticket !== 'string') return send(res, 400, { error: 'no valid ticket' });
+        if (!MARKS.includes(state)) return send(res, 400, { error: `no valid state: ${MARKS.join(' or ')}` });
+        return inTurn('repos', () => markTicket(res, repo, ticket, state));
+    }
     const { tickets, settings } = body;
     if (!Array.isArray(tickets) || !tickets.length || !tickets.every(t => typeof t === 'string') || new Set(tickets).size !== tickets.length) {
         return send(res, 400, { error: 'no valid list of tickets' });
@@ -1256,6 +1296,23 @@ async function forgetRepo(res, repo) {
     const repos = (Array.isArray(register.repos) ? register.repos : []).filter(r => !(usableRepo(r) && r.project === repo.project));
     writeWhole(REGISTER_FILE, JSON.stringify({ ...register, repos }, null, 2));
     return send(res, 200, { ok: true, project: repo.project });
+}
+
+// Sets a ticket to done or todo by hand: a manual entry, without the run and task of a tied one, which the
+// run reconciliation never rewrites. Refused while a live runner holds the ticket.
+async function markTicket(res, repo, key, state) {
+    await refreshLiveness();
+    const { features } = await ticketsOf(repo.path);
+    const ticket = features.flatMap(f => f.tickets).find(t => t.key === key);
+    if (!ticket) return send(res, 400, { error: `unknown ticket '${key}'` });
+    if (ticket.heldByRunner) return send(res, 409, { error: `ticket ${key} is ${ticket.state} in run ${ticket.run}, whose runner is alive or starting` });
+    try {
+        await writeState(repo.path, entries => {
+            entries[key] = { state, updatedAt: new Date().toISOString() };
+            return true;
+        });
+    } catch (err) { return send(res, 500, { error: `the ticket state file could not be updated: ${err.message}` }); }
+    return send(res, 200, { ok: true, project: repo.project, ticket: key, state });
 }
 
 // `<feature> <NN> <ticket title>`, without double quotes, at most TITLE_MAX characters.
@@ -1287,6 +1344,7 @@ function makeRunFolder(project) {
 // Writes a run folder from the picked tickets and launches its runner, as the task-queue skill's chat flow
 // does. A failure before the launch removes the run folder.
 async function newQueue(res, repo, keys, settings) {
+    await refreshLiveness();
     const { features } = await ticketsOf(repo.path);
     const byKey = new Map(features.flatMap(f => f.tickets).map(t => [t.key, t]));
     const unknown = keys.find(k => !byKey.has(k));
@@ -1295,6 +1353,9 @@ async function newQueue(res, repo, keys, settings) {
     if (held) return send(res, 409, { error: `ticket ${held.key} is ${held.state}${held.run ? ` in run ${held.run}` : ''}` });
     const { order: picked, problems } = queueOrder(features, keys);
     if (problems.length) return send(res, 409, { error: problems.join('; ') });
+    // Two queues never work in the same working tree.
+    const { live } = repoRuns(repo.path);
+    if (live.length) return send(res, 409, { error: `a runner of this repository is alive or starting: run ${live.map(r => r.run).join(', ')}` });
 
     // `queuedIn` is the run whose queued entries were written, `replaced` the entries they replaced.
     let runDir = null, newProject = false, queuedIn = null;
@@ -1392,9 +1453,11 @@ async function handle(req, res) {
         const repo = repoOf(url.searchParams.get('project'));
         if (!repo) return send(res, 400, { error: 'not a registered repository' });
         const exists = !!statOrNull(repo.path)?.isDirectory();
+        // The first request waits for a process check, so the runs' liveness is known.
+        if (!liveness.at) await refreshLiveness();
         const read = exists ? await ticketsOf(repo.path) : { features: [], stateFile: { status: 'missing' } };
         const features = read.features.map(({ tickets, ...f }) => ({ ...f, tickets: tickets.map(publicTicket) }));
-        return send(res, 200, { project: repo.project, path: repo.path, exists, stateFile: read.stateFile, features });
+        return send(res, 200, { project: repo.project, path: repo.path, exists, stateFile: read.stateFile, runs: repoRuns(repo.path), features });
     }
 
     const runDir = runDirFrom(url.searchParams);

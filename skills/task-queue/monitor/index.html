@@ -283,6 +283,12 @@ details.agent > summary { cursor: pointer; font-size: 12px; color: var(--muted);
 /* A queued ticket waits in a run: outlined in the running colour. */
 .s-queued { background: var(--panel); color: var(--accent); border-color: var(--accent); }
 .ticket-run { font: 700 11px/1.6 var(--mono); color: var(--accent); }
+/* A ticket's Mark menu: its button opens the marks under it. */
+.ticket-menu { position: relative; }
+.ticket-menu > summary { list-style: none; padding: 0 6px; line-height: 1.4; }
+.ticket-menu > summary::-webkit-details-marker { display: none; }
+.ticket-menu-items { position: absolute; right: 0; top: calc(100% + 4px); z-index: 5; display: grid; gap: 4px; padding: 6px;
+  background: var(--panel); border: 2px solid var(--frame); box-shadow: 2px 2px 0 var(--shadow); white-space: nowrap; }
 .picker-settings { display: flex; flex-wrap: wrap; gap: 4px 16px; margin: 14px 0 0; padding: 8px 10px; border: 2px solid var(--line); min-width: 0; }
 .picker-settings input[type="text"] { width: min(12em, 100%); }
 .picker-order { margin: 0 0 10px; padding-left: 0; list-style: none; font-size: 13px; }
@@ -308,6 +314,7 @@ details.agent > summary { cursor: pointer; font-size: 12px; color: var(--muted);
   /* A ticket's badges go under its title. */
   .ticket-row { grid-template-columns: auto minmax(0, 1fr); }
   .ticket-badges { grid-column: 2; justify-content: flex-start; }
+  .ticket-menu-items { right: auto; left: 0; }
 }
 </style>
 <script type="module" src="/pixel/main.js"></script>

@@ -29,6 +29,8 @@ export function createPicker(root, { onProject, onStarted }) {
   let project = null;           // the project named by the hash; '' asks for the last or first repository
   let repos = null, tickets = null;
   let picked = new Set();       // ticket keys
+  let openMenu = null;          // the key of the ticket whose Mark menu is open
+  let marking = false;
   let busy = false;
   let poller = null;
 
@@ -51,16 +53,40 @@ export function createPicker(root, { onProject, onStarted }) {
     renderOrder();
   }
 
-  // What keeps the repository from a queue; ticket 04 adds the runner guards here.
+  // A run of this repository as a link to its view.
+  const runLink = r => `<a href="#${esc(encodeURIComponent(r.run))}">${esc(r.run)}</a> (${esc(r.state)})`;
+  const runLinks = list => list.map(runLink).join(', ');
+
+  // What keeps the repository from a queue, as HTML: a live runner blocks Start; an unfinished run with no
+  // runner only warns, since its tickets may still be continued there.
   function renderWarnings() {
     const list = [];
-    if (!repo().exists) list.push('The repository folder is gone. Forget it, or run the ticket-queue skill again where it now is.');
+    if (!repo().exists) list.push(esc('The repository folder is gone. Forget it, or run the ticket-queue skill again where it now is.'));
+    const runs = tickets?.runs;
+    if (runs?.live.length) {
+      list.push(`A runner of this repository is alive or starting: ${runLinks(runs.live)}. Start waits until it ends, so that two queues never work in the same working tree.`);
+    }
+    if (runs?.unfinished.length) {
+      list.push(`${runs.unfinished.length === 1 ? 'A queue' : `${runs.unfinished.length} queues`} of this repository ${runs.unfinished.length === 1 ? 'is' : 'are'} unfinished, with no runner: ${runLinks(runs.unfinished)}. ` +
+        'A ticket picked here that such a queue still holds would run twice if that queue were continued.');
+    }
     const stateFile = tickets?.stateFile;
     if (stateFile?.status === 'unreadable') {
-      list.push(`The ticket state file .scratch/queue-state.json is unreadable: ${stateFile.reason}. The tickets follow their Status lines, and nothing writes the file until it is fixed by hand.`);
+      list.push(esc(`The ticket state file .scratch/queue-state.json is unreadable: ${stateFile.reason}. The tickets follow their Status lines, and nothing writes the file until it is fixed by hand.`));
     }
-    if (stateFile?.problem) list.push(`${stateFile.problem}.`);
-    setHtml(warnings, list.map(w => `<p class="warning">${esc(w)}</p>`).join(''));
+    if (stateFile?.problem) list.push(esc(`${stateFile.problem}.`));
+    setHtml(warnings, list.map(w => `<p class="warning">${w}</p>`).join(''));
+  }
+
+  // A ticket's Mark menu: the marks its state allows, none while a live runner holds it.
+  function markMenu(f, t) {
+    const marks = t.actions.filter(a => a.startsWith('mark-')).map(a => a.replace(/^mark-/, ''));
+    if (!marks.length) return '';
+    const name = `${f.name} ${two(t.number)}`;
+    return `<details class="ticket-menu"${openMenu === t.key ? ' open' : ''}>
+      <summary class="btn" data-key="${esc(t.key)}" data-focus="menu:${esc(t.key)}" aria-label="${esc(`Mark ${name}`)}">…</summary>
+      <div class="ticket-menu-items">${marks.map(m => `<button type="button" class="btn" data-mark="${esc(m)}" data-key="${esc(t.key)}" data-focus="mark-${esc(m)}:${esc(t.key)}"
+        aria-label="${esc(`Mark ${name} ${m}`)}">Mark ${m}</button>`).join('')}</div></details>`;
   }
 
   // A rewrite gives the focused checkbox its focus back, found by its ticket's key.
@@ -80,15 +106,23 @@ export function createPicker(root, { onProject, onStarted }) {
           ? ` <a class="ticket-run" href="#${esc(encodeURIComponent(t.run))}" aria-label="${esc(`${f.name} ${two(t.number)}: ${t.state} in run ${t.run}, task ${t.task}`)}">${esc(t.run.split('/')[1])}</a>`
           : '';
         return `<li class="ticket-row${selectable ? '' : ' unselectable'}">
-          <input type="checkbox" id="${id}" data-key="${esc(t.key)}"${picked.has(t.key) ? ' checked' : ''}${selectable ? '' : ' disabled'}>
+          <input type="checkbox" id="${id}" data-key="${esc(t.key)}" data-focus="pick:${esc(t.key)}"${picked.has(t.key) ? ' checked' : ''}${selectable ? '' : ' disabled'}>
           <label for="${id}"><span class="sr-only">${esc(f.name)} </span><b class="num">${two(t.number)}</b> <span class="ticket-title">${esc(t.title)}</span></label>
-          <span class="ticket-badges">${badge(t.state)}${warn}${unread}${held}</span></li>`;
+          <span class="ticket-badges">${badge(t.state)}${warn}${unread}${held}${markMenu(f, t)}</span></li>`;
       }).join('');
       return `<section class="feature" aria-labelledby="feature-${fi}"><h3 id="feature-${fi}">${esc(f.name)}</h3>${
         f.tickets.length ? `<ul class="tickets">${rows}</ul>` : '<p class="no-tickets">no tickets</p>'}</section>`;
     }).join('') : '<p class="empty">No features under .scratch in this repository.</p>';
-    const focused = features.contains(document.activeElement) ? document.activeElement.dataset.key : null;
-    if (setHtml(features, html) && focused) [...features.querySelectorAll('input[data-key]')].find(i => i.dataset.key === focused)?.focus();
+    const focused = features.contains(document.activeElement) ? document.activeElement : null;
+    if (setHtml(features, html) && focused) focusTicket(focused.dataset.key, focused.dataset.focus);
+  }
+
+  // Focuses the control `preferred` (a `data-focus` value) of the ticket `key`; when it is gone (a mark
+  // taken), its menu, then its checkbox.
+  function focusTicket(key, preferred) {
+    const all = [...features.querySelectorAll('[data-focus]')];
+    const find = id => all.find(e => e.dataset.focus === id);
+    (find(preferred) || find(`menu:${key}`) || find(`pick:${key}`))?.focus();
   }
 
   // The picked tickets in queue order, as the server orders them: features alphabetically, then each feature's
@@ -129,6 +163,7 @@ export function createPicker(root, { onProject, onStarted }) {
     problemList.hidden = !problems.length;
     const reason = busy ? 'starting…'
       : !repo()?.exists ? 'the repository folder is gone'
+      : tickets?.runs?.live.length ? 'a runner of this repository is alive or starting, as said above'
       : !list.length && !problems.length ? 'pick at least one ticket'
       : problems.length === 1 ? 'a picked ticket is blocked, as said under the order'
       : problems.length ? `${problems.length} blocking problems, listed under the order`
@@ -155,6 +190,51 @@ export function createPicker(root, { onProject, onStarted }) {
     message.textContent = '';
     renderFeatures();
     renderOrder();
+  });
+  // One menu open at a time; Escape closes it and gives the focus back to its button.
+  features.addEventListener('toggle', e => {
+    const menu = e.target;
+    if (!menu.classList?.contains('ticket-menu')) return;
+    const key = menu.querySelector('summary').dataset.key;
+    if (menu.open) {
+      openMenu = key;
+      for (const other of features.querySelectorAll('.ticket-menu[open]')) if (other !== menu) other.open = false;
+    } else if (openMenu === key) openMenu = null;
+  }, true);
+  features.addEventListener('keydown', e => {
+    const menu = e.target.closest?.('.ticket-menu[open]');
+    if (e.key !== 'Escape' || !menu) return;
+    // The page's own Escape (closing the drawer) waits for the next press.
+    e.stopPropagation();
+    menu.open = false;
+    menu.querySelector('summary').focus();
+  });
+  features.addEventListener('click', async e => {
+    const button = e.target.closest?.('button[data-mark]');
+    if (!button || marking) return;
+    const asked = project, key = button.dataset.key, state = button.dataset.mark;
+    const t = allTickets().find(x => x.key === key);
+    if (!t) return;
+    const name = `${t.feature} ${two(t.number)}`;
+    // A ticket tied to a run leaves it: say so before, and what Continue of that queue would still do.
+    const continued = ['queued', 'running'].includes(t.state) ? 'If that queue is continued, it still runs this ticket.'
+      : t.state === 'failed' ? 'If that queue is continued or this task retried, it runs this ticket again.'
+      : 'That queue does not run it again.';
+    if (t.run && !await confirmAction({
+      title: `Mark ${name} ${state}?`,
+      text: `It leaves run ${t.run}, where it is ${t.state}. ${continued}`,
+      ok: `Mark ${state}`,
+    })) return;
+    marking = true;
+    let result;
+    try { result = await postAdmin({ project: asked }, 'mark', { ticket: key, state }); } finally { marking = false; }
+    if (project !== asked) return;
+    message.textContent = result.ok ? `Marked ${name} ${state}.` : `Mark refused: ${result.error}`;
+    if (result.ok) openMenu = null;
+    // A poll during the dialog may have replaced the button the dialog gives the focus back to: the focus goes
+    // to the ticket's menu, or its checkbox, so the next rewrite keeps it on this ticket.
+    if (document.activeElement === document.body || features.contains(document.activeElement)) focusTicket(key, `menu:${key}`);
+    poller?.refresh();
   });
   repoSelect.addEventListener('change', () => onProject(repoSelect.value));
   projectName.addEventListener('input', renderOrder);
@@ -205,6 +285,7 @@ export function createPicker(root, { onProject, onStarted }) {
       if (next !== project) {
         project = next;
         picked = new Set();
+        openMenu = null;
         tickets = null;
         message.textContent = '';
         if (next) projectName.value = next;
