@@ -633,11 +633,240 @@ ${closing}`;
     return true;
 }
 
-// Parallel groups. Ticket 03 of docs/cross-platform ports runner.ps1's Skip-Members, Run-Group and
-// Resolve-Conflict here: the group's worktrees and branches, one --parallel-task child per task, the merge
-// step and the conflict session. Until then a queue stops at its first group, before anything of it runs.
-async function runGroupStep(group) {
-    stopQueue(`Group ${group.label} - STOPPED (this runner does not run parallel groups yet)`);
+function testMerging() {
+    runGit(queue.workDir, ['rev-parse', '--verify', '--quiet', 'MERGE_HEAD']);
+    return gitExit === 0;
+}
+
+// Has the group's conflict session resolve the conflict that merging a task's branch ran into; the
+// merge is in progress in the main checkout. A group has one conflict session, conflictSession, and a
+// later conflict of the group resumes it. Returns null when the merge is committed and the main
+// checkout clean; otherwise puts the main checkout back at its commit before this merge and returns
+// why the merge step stops.
+let conflictSession = null;
+async function resolveConflict(group, task) {
+    const label = `Group ${group.label} - conflict session`;
+    const branch = branchOf(task);
+    const named = `task ${position.get(text(task.id)) + 1} ('${text(task.title)}')`;
+    const resultFile = path.join(resultsDir, `merge-${group.label}.md`);
+    const previousFile = path.join(resultsDir, `merge-${group.label}.previous.md`);
+    const logFile = path.join(logsDir, `merge-${group.label}.jsonl`);
+    const dirArgs = ['--add-dir', root];
+    const headless = `This session is headless: it ends with your final answer, and nothing wakes it up again. Background commands are turned off, so run every command in the foreground and wait for it; give slow ones, such as a full test suite, a timeout of up to ${bashMaxMinutes} minutes.`;
+    // While the merge is in progress, HEAD is still the commit before it: what a failure goes back to.
+    const queueBranch = runGit(queue.workDir, ['symbolic-ref', '--short', 'HEAD'])[0];
+    const beforeMerge = runGit(queue.workDir, ['rev-parse', 'HEAD'])[0];
+
+    let prompt, cliArgs;
+    if (conflictSession) {
+        prompt = `The queue went on merging the group, and the next branch conflicts too: ${branch}, the branch of ${named}. Its merge is in progress in your working directory.
+
+Resolve this conflict as you did the earlier one: keep what every task intended, run the tests of what you touched, then commit the merge and leave nothing uncommitted. If it needs a decision only the user can make, or something blocks you, stop there instead of guessing and report FAILED.
+
+${headless}
+
+Before you finish, write ${resultFile} again, so that it covers this conflict and the earlier ones. Its first line is exactly DONE or FAILED.`;
+        cliArgs = sessionArgs(dirArgs, '', conflictSession);
+    }
+    else {
+        let retryNote = '';
+        if (fs.existsSync(resultFile)) fs.renameSync(resultFile, previousFile);
+        if (fs.existsSync(previousFile)) {
+            retryNote = `\nThe report of an earlier conflict session for this group is ${previousFile}.`;
+        }
+        const members = membersOf(group);
+        const beside = members.map(t => `task ${position.get(text(t.id)) + 1} ('${text(t.title)}')`).join(', ');
+        const briefs = members.map(t => '  ' + path.join(root, 'tasks', `${text(t.id)}.md`)).join('\n');
+        const reports = members.map(t => '  ' + resultOf(t)).join('\n');
+        const sessionName = `${text(queue.project)} - Merge ${group.label}`.replace(/"/g, "'");
+        prompt = `You are the conflict session of an unattended queue. Nobody is watching this session and nobody can answer a question. The session is already named '${sessionName}'.
+
+The queue ran ${beside} at the same time, each in its own git worktree and branch, and is now merging their branches into ${text(queueBranch)}, in task order. Merging ${branch}, the branch of ${named}, ran into a conflict. That merge is in progress in your working directory.
+
+What each task was asked to do:
+${briefs}
+What each task reports it did:
+${reports}${retryNote}
+
+Resolve the conflict so that what every task intended is kept, following this repository's own instructions (CLAUDE.md and what it points to). Run the tests of what you touched, then commit the merge and leave nothing uncommitted. If the conflict needs a decision only the user can make, or something blocks you, stop there instead of guessing and report FAILED: the queue then undoes the merge and keeps every branch.
+
+${headless}
+
+Before you finish, write ${resultFile}. Its first line is exactly DONE or FAILED. After it: which files conflicted, how you resolved each and why, how you verified it, and anything the next task or the user must know.`;
+        cliArgs = sessionArgs(dirArgs, sessionName);
+    }
+
+    say(`${label} - starting`, 'Cyan');
+    sessionId = conflictSession;
+    cost = null;
+    reportWritten = false;
+    // A merge left in progress would stop every later run, so a failure of the runner itself is a
+    // stop like any other: the merge is undone below.
+    let failure;
+    try { failure = await runSession(label, prompt, cliArgs, dirArgs, logFile, resultFile, text(queue.workDir), false); }
+    catch (err) {
+        if (err instanceof QueueExit) throw err;
+        failure = `the runner failed: ${err.message}`;
+    }
+    conflictSession = sessionId;
+    if (!failure) {
+        runGit(queue.workDir, ['merge-base', '--is-ancestor', branch, 'HEAD']);
+        const isMerged = gitExit === 0;
+        const left = uncommitted(queue.workDir).length;
+        if (testMerging()) failure = "report status 'DONE', but the merge is still in progress";
+        else if (!isMerged) failure = `report status 'DONE', but branch ${branch} is not merged`;
+        else if (left) failure = `report status 'DONE', but ${left} uncommitted change(s) left in the main checkout`;
+    }
+    if (!failure) {
+        say(`${label} - DONE (${sessionNote()})`, 'Green');
+        return null;
+    }
+
+    say(`${label} - STOPPED (${failure})`, 'Red');
+    // A report from an earlier conflict that was not written again is not this conflict's report.
+    if (reportWritten && fs.existsSync(resultFile)) say(`Report: ${resultFile}`, 'Red');
+    say(`Log: ${logFile}`, 'Red');
+
+    // The session may have left the merge in progress, committed it although it failed, or left
+    // files behind. The main checkout goes back to its commit before this merge, so that the kept
+    // branch is really unmerged and the next run can try the merge again. It was clean before the
+    // merge, so whatever is untracked now came from the merge or the session.
+    let ending = 'no merge was left to undo';
+    const head = runGit(queue.workDir, ['rev-parse', 'HEAD'])[0];
+    if (testMerging() || head !== beforeMerge || uncommitted(queue.workDir).length) {
+        const onBranch = runGit(queue.workDir, ['symbolic-ref', '--short', '--quiet', 'HEAD'])[0];
+        if (onBranch !== queueBranch) ending = `the merge could not be undone: the main checkout is no longer on ${text(queueBranch)}`;
+        else {
+            let undone = runGit(queue.workDir, ['reset', '--hard', beforeMerge]);
+            if (gitExit === 0) undone = runGit(queue.workDir, ['clean', '-fd']);
+            if (gitExit === 0) ending = 'the merge was undone';
+            else ending = `the merge could not be undone: ${undone.at(-1) ?? ''}`;
+        }
+    }
+    return `conflict merging task ${text(task.id)}, branch ${branch}; ${ending}`;
+}
+
+// Applies the user's skips to a group about to start, once: the tasks it lists that are not DONE get
+// their SKIPPED report. A group that started in an earlier run (a branch of it, or a report other than
+// SKIPPED) reads no skips again; its skipped tasks stay skipped. Returns the tasks left.
+async function skipMembers(group) {
+    const members = group.ids.map(id => tasks[position.get(id)]);
+    const started = members.filter(t => testBranch(t) || (readStatus(resultOf(t)) && !testSkipped(t))).length;
+    let control = null;
+    if (!started) control = readControl();
+    for (const id of group.ids) {
+        const task = tasks[position.get(id)];
+        if (!testDone(task)) await skipTask(task, control);
+    }
+    return membersOf(group);
+}
+
+// Runs the tasks in --parallel-task children of this file, started with this very node, at most
+// maxParallel at a time; resolves when the last one has ended. The children write to this window.
+function runChildren(todo) {
+    return new Promise((resolve, reject) => {
+        const waiting = [...todo];
+        let running = 0;
+        const next = () => {
+            while (waiting.length && running < maxParallel) {
+                const child = spawn(process.execPath, [SCRIPT, '--parallel-task', text(waiting.shift().id)],
+                    { stdio: ['ignore', 'inherit', 'inherit'], windowsHide: true });
+                running++;
+                child.once('error', reject);
+                child.once('exit', () => {
+                    running--;
+                    if (!waiting.length && !running) resolve();
+                    else next();
+                });
+            }
+        };
+        next();
+    });
+}
+
+// Runs a parallel group of two or more tasks the user did not skip, `members`: every task that is not done
+// yet in its own worktree and branch, at most maxParallel at a time, then the merge step. Returns when
+// the group is done and merged, and stops the queue otherwise.
+async function runGroup(group, members) {
+    const todo = members.filter(t => !testDone(t));
+    for (const task of members) {
+        if (!todo.includes(task)) say(`${labelOf(task)} - already DONE, skipped`, 'DarkGray');
+    }
+    if (!todo.length && !members.some(testBranch)) return;
+
+    // The group's worktrees start from the main checkout's commit and its branches are merged into
+    // the main checkout: uncommitted work there would be missing from the first and in the way of
+    // the second.
+    assertQueueBranch();
+    if (testMerging()) {
+        stopQueue(`Group ${group.label} - STOPPED (the main checkout ${text(queue.workDir)} has a merge in progress; commit it or run git merge --abort)`);
+    }
+    if (uncommitted(queue.workDir).length) {
+        stopQueue(`Group ${group.label} - STOPPED (the main checkout ${text(queue.workDir)} has uncommitted or untracked files; commit or remove them)`);
+    }
+
+    if (todo.length) {
+        say(`Group ${group.label} - starting (tasks ${members.map(t => text(t.id)).join(', ')})`, 'Cyan');
+        runGit(queue.workDir, ['worktree', 'prune']);
+        for (const task of todo) {
+            const worktree = worktreeOf(task);
+            if (fs.existsSync(worktree)) continue;
+            const added = testBranch(task)
+                ? runGit(queue.workDir, ['worktree', 'add', worktree, branchOf(task)])
+                : runGit(queue.workDir, ['worktree', 'add', '-b', branchOf(task), worktree, 'HEAD']);
+            if (gitExit !== 0) {
+                stopQueue(`Group ${group.label} - STOPPED (no worktree for task ${text(task.id)}: ${added.at(-1) ?? ''})`);
+            }
+        }
+
+        await runChildren(todo);
+
+        const notDone = members.filter(t => !testDone(t)).map(t => text(t.id));
+        if (notDone.length) {
+            say(`Group ${group.label} - STOPPED (not DONE: ${notDone.join(', ')}; nothing was merged)`, 'Red');
+            say('Fix the cause, then run this file again: finished tasks are skipped and the stopped ones continue in their worktrees.', 'Yellow');
+            quit(1);
+        }
+    }
+
+    // The merge step. A task is merged when its branch is gone.
+    say(`Group ${group.label} - merging`, 'Cyan');
+    const unmerged = members.filter(testBranch);
+    conflictSession = null;
+    for (const task of unmerged) {
+        const branch = branchOf(task);
+        const worktree = worktreeOf(task);
+        const merged = runGit(queue.workDir, ['merge', '--no-edit', branch]);
+        let reason = null;
+        if (gitExit !== 0) {
+            reason = `git merge of task ${text(task.id)}, branch ${branch}, failed: ${merged.at(-1) ?? ''}`;
+            if (testMerging()) {
+                say(`Group ${group.label} - conflict merging ${text(task.id)} (branch ${branch})`, 'Yellow');
+                reason = await resolveConflict(group, task);
+            }
+        }
+        if (reason) {
+            say(`Group ${group.label} - merge STOPPED (${reason})`, 'Red');
+            for (const kept of unmerged) {
+                if (testBranch(kept)) say(`Kept: task ${text(kept.id)}, branch ${branchOf(kept)}, worktree ${worktreeOf(kept)}`, 'Red');
+            }
+            if (conflictSession) say(`Open the conflict session: cd "${text(queue.workDir)}"; claude --resume ${conflictSession}`, 'Yellow');
+            say('Fix the cause, then run this file again: finished tasks are skipped and the merge is tried again.', 'Yellow');
+            quit(1);
+        }
+        // A file held open can keep git from deleting the folder. The work is merged either way, so
+        // the queue goes on and the leftovers are named.
+        if (fs.existsSync(worktree)) runGit(queue.workDir, ['worktree', 'remove', '--force', worktree]);
+        runGit(queue.workDir, ['worktree', 'prune']);
+        runGit(queue.workDir, ['branch', '-d', branch]);
+        if (fs.existsSync(worktree)) {
+            say(`Group ${group.label} - could not remove the worktree ${worktree}; remove it by hand`, 'Yellow');
+        }
+        say(`Group ${group.label} - merged ${text(task.id)} (branch ${branch})`, 'Green');
+    }
+    say(`Group ${group.label} - merge DONE`, 'Green');
+    const worktrees = path.join(root, 'wt');
+    try { if (!fs.readdirSync(worktrees).length) fs.rmdirSync(worktrees); } catch { /* none, or not empty */ }
 }
 
 // One session of a parallel group: the runner started this copy of the file for it. Answers the exit code.
@@ -746,7 +975,20 @@ async function runTasks() {
         const group = groupOf.get(text(task.id));
         if (group) {
             testPause(`before group ${group.label}`);
-            await runGroupStep(group);
+            // A group left with one task runs it as a sequential task, in the main checkout; a group left
+            // with none is passed over, with no merge step.
+            const left = await skipMembers(group);
+            if (left.length >= 2) await runGroup(group, left);
+            else if (left.length === 1) {
+                const alone = left[0];
+                groupOf.delete(text(alone.id));
+                if (testDone(alone)) say(`${labelOf(alone)} - already DONE, skipped`, 'DarkGray');
+                else if (!(await runTask(alone))) {
+                    say('Fix the cause, then run this file again: finished tasks are skipped and this one starts over.', 'Yellow');
+                    quit(1);
+                }
+            }
+            else say(`Group ${group.label} - passed over (all its tasks skipped)`, 'DarkGray');
             testPause(`after group ${group.label}`);
             i += group.ids.length - 1;
             continue;

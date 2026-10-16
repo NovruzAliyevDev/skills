@@ -23,10 +23,10 @@ Build it on the same seam, against the parallel-task checks of the earlier specs
 
 **Blocked by:** 02
 
-**Status:** ready-for-agent
+**Status:** in-progress
 
-- [ ] A group's tasks run in worktrees under `wt/<id>` in the run folder, on `queue/<run folder>/<id>`, each in a `node run.mjs --parallel-task <id>` child started with `process.execPath`, at most `maxParallel` at a time. The session folder inside a worktree matches the queue's folder in the repository.
-- [ ] For each parallel scenario of the earlier checks (all DONE then merged, one FAILED with nothing merged, uncommitted work left in a worktree, a conflict resolved, a conflict failed and undone, a second conflict resuming the conflict session, a group reduced to one task by skips, a group fully skipped, a bad `parallel` entry, a hard stop during the merge step), the Node runner gives the same `progress.log` messages (timestamps removed), reports, branches, worktrees and git history as `runner.ps1` on Windows.
-- [ ] A child writes no ticket state. A queue with groups still gets the commit note in its prompts.
+- [x] A group's tasks run in worktrees under `wt/<id>` in the run folder, on `queue/<run folder>/<id>`, each in a `node run.mjs --parallel-task <id>` child started with `process.execPath`, at most `maxParallel` at a time. The session folder inside a worktree matches the queue's folder in the repository.
+- [x] For each parallel scenario of the earlier checks (all DONE then merged, one FAILED with nothing merged, uncommitted work left in a worktree, a conflict resolved, a conflict failed and undone, a second conflict resuming the conflict session, a group reduced to one task by skips, a group fully skipped, a bad `parallel` entry, a hard stop during the merge step), the Node runner gives the same `progress.log` messages (timestamps removed), reports, branches, worktrees and git history as `runner.ps1` on Windows.
+- [x] A child writes no ticket state. A queue with groups still gets the commit note in its prompts.
 - [ ] The monitor shows each parallel task's child and session alive and the merge state, and the hard stop kills the runner, its children and their sessions on both platforms.
 - [ ] The earlier parallel-task checks pass on Windows against the Node runner. On macOS, one queue with a group of two tasks and a forced conflict runs to the end with the stub. The macOS run is recorded in the README of these docs; if no Mac was available, it says so.
