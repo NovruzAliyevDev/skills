@@ -10,6 +10,10 @@ Each folder under `skills/` is one skill: a `SKILL.md` with its instructions, pl
 | [ticket-queue](skills/ticket-queue/) | Opens the monitor's ticket picker for the repository you are in, where you tick its `.scratch` tickets and start them as a queue, and keeps a small state file of which tickets are done, queued, running, failed or skipped. | You type `/novruzaliyev-skills:ticket-queue`. |
 | [delegate](skills/delegate/) | Splits a big task into independent pieces, runs each in its own subagent, and keeps the main session's context light. | Claude uses it when you ask to delegate, split up, fan out or parallelize work; you can also type `/novruzaliyev-skills:delegate`. |
 | [queue-monitor](skills/queue-monitor/) | Starts the task-queue monitor again (it exits after two idle hours) and opens it in the browser. | You type `/novruzaliyev-skills:queue-monitor`. |
+| [architecture-review](skills/architecture-review/) | Reviews a diff or a path for structural problems: dependency direction, boundary leaks, shallow modules, cycles, decisions in the wrong place. | You type `/novruzaliyev-skills:architecture-review`. |
+| [security-review](skills/security-review/) | Reviews a diff or a path for vulnerabilities visible in the code, with a quoted hunk for every finding. | You type `/novruzaliyev-skills:security-review`. |
+| [code-quality-review](skills/code-quality-review/) | Reviews a diff or a path for what will cost the next reader or hide the next bug: swallowed failures, untested changes, dead code, loose types. | You type `/novruzaliyev-skills:code-quality-review`. |
+| [review-all](skills/review-all/) | Runs the three reviews above in parallel sub-agents and reports them side by side, one verdict per review. | You type `/novruzaliyev-skills:review-all`. |
 
 ## Install
 
@@ -223,6 +227,28 @@ says so. Subagents never spawn their own, agents that write get files of their o
 read-only), and a round has about 6 agents, at most 2 rounds.
 
 Ask Claude to delegate, split up, fan out or parallelize a task, or type `/novruzaliyev-skills:delegate`.
+
+## The reviewers
+
+Four skills that review and never fix. Each takes a fixed point (a branch, tag or commit, reviewed as
+the three-dot diff against its merge-base) or a path (reviewed as it is now); with no argument it uses
+`main`, else `master`. The reading happens in a sub-agent, so the main session stays light. Each review
+reads the repo's own rule files first (`CLAUDE.md`, `CONTEXT.md`, ADRs, `CODING_STANDARDS.md` and the
+like), and a documented repo decision always overrides the review's own lens.
+
+Every report has the same shape: findings sorted by severity (`blocker`, `should fix`, `nit`), each with
+`file:line`, what is wrong, why it matters, the direction of the fix, and the quoted evidence, then a
+verdict of **ship**, **fix first** or **rethink**. What each severity means is defined per review.
+
+- **architecture-review**: dependency direction, boundary leaks, shallow modules, mixed reasons to
+  change, cycles, decisions in the wrong place, speculative structure.
+- **security-review**: injection, missing authorization, secrets in code, sensitive data in logs or
+  errors, unvalidated input, unsafe deserialization, weak crypto, SSRF and open redirects, dependency
+  changes. A risk with no hunk to quote is not a finding.
+- **code-quality-review**: misleading names, oversized units, swallowed failures, dead code, comment
+  drift, untested changes, copied logic, loose types.
+- **review-all**: the three above as parallel sub-agents, presented under their own headings, never
+  merged or reranked across them.
 
 ## Adding a skill
 

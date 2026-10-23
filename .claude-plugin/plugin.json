@@ -1,7 +1,7 @@
 {
   "name": "novruzaliyev-skills",
-  "version": "2.0.0",
-  "description": "task-queue (run a list of tasks in fresh unattended sessions, with a local monitor), ticket-queue (pick a repository's .scratch tickets in that monitor and start them as a queue), queue-monitor (start that monitor again) and delegate (split big work across subagents). Runs on Windows and macOS.",
+  "version": "2.1.0",
+  "description": "task-queue (run a list of tasks in fresh unattended sessions, with a local monitor), ticket-queue (pick a repository's .scratch tickets in that monitor and start them as a queue), queue-monitor (start that monitor again) delegate (split big work across subagents), and four reviewers: architecture-review, security-review, code-quality-review and review-all (all three side by side). Runs on Windows and macOS.",
   "author": { "name": "Novruz Aliyev" },
   "repository": "https://github.com/NovruzAliyevDev/skills"
 }

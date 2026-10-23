@@ -8,8 +8,8 @@
     {
       "name": "novruzaliyev-skills",
       "source": "./",
-      "version": "2.0.0",
-      "description": "task-queue, ticket-queue, queue-monitor and delegate, on Windows and macOS."
+      "version": "2.1.0",
+      "description": "task-queue, ticket-queue, queue-monitor, delegate, and the architecture, security, code quality and review-all reviewers, on Windows and macOS."
     }
   ]
 }
